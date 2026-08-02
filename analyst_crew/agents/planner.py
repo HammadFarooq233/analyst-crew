@@ -6,6 +6,9 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.store.postgres import PostgresStore
+from langgraph.store.memory import InMemoryStore
+from langgraph.config import get_store
 from langfuse.langchain import CallbackHandler
 from pydantic import BaseModel, model_validator
 
@@ -70,6 +73,8 @@ Available Agents:
 - Critic: Reviews a draft report for uncited claims, missing caveats, and logical gaps.
 - Reporter: Writes the narrative report from findings and charts. Synthesizes results into prose, cites specific numbers.
 
+Before drafting the Plan, call search_memory to retrieve any relevant facts, preferences, or conventions the user has established in prior sessions. Incorporate these into your Plan decisions.
+
 Rules:
 1. Produce between 2 and 5 Steps.
 2. Each Step must have a unique step_id (snake_case string).
@@ -87,6 +92,7 @@ class PlannerAgent:
         model: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        store=None,
     ):
         self.model = model or str(config.get("llm.model", "gemini-2.0-flash-lite"))
         self.temperature = (
@@ -108,6 +114,13 @@ class PlannerAgent:
             temperature=self.temperature,
             max_output_tokens=self.max_tokens,
         )
+
+        if store is not None:
+            from analyst_crew.tools.memory import create_memory_tool
+
+            memory_tool = create_memory_tool(store)
+            self._llm = self._llm.bind_tools([memory_tool])
+
         self._chain = self._llm.with_structured_output(Plan)
 
     def generate_plan(self, question: str) -> Plan:
@@ -151,7 +164,8 @@ def planner_node(state: CrewState) -> dict[str, Any]:
     question = _extract_question(state)
 
     try:
-        agent = PlannerAgent()
+        store = get_store()
+        agent = PlannerAgent(store=store)
         plan = agent.generate_plan(question)
     except RuntimeError as e:
         return {
@@ -191,12 +205,12 @@ def get_langfuse_handler(
         return None
 
 
-def build_graph(checkpointer=None):
+def build_graph(checkpointer=None, store=None):
     graph = StateGraph(CrewState)
     graph.add_node("planner_node", planner_node)
     graph.add_edge(START, "planner_node")
     graph.add_edge("planner_node", END)
-    return graph.compile(checkpointer=checkpointer)
+    return graph.compile(checkpointer=checkpointer, store=store)
 
 
 def invoke(user_question: str, config: dict | None = None) -> CrewState:
@@ -219,13 +233,18 @@ def invoke(user_question: str, config: dict | None = None) -> CrewState:
 
     conn_string = os.getenv("POSTGRES_CONNECTION_STRING")
 
-    def _do_invoke(_state, _config, _checkpointer):
-        graph = build_graph(checkpointer=_checkpointer)
+    def _do_invoke(_state, _config, _checkpointer, _store):
+        graph = build_graph(checkpointer=_checkpointer, store=_store)
         return graph.invoke(_state, _config)
 
     if conn_string:
-        with PostgresSaver.from_conn_string(conn_string) as checkpointer:
+        with (
+            PostgresSaver.from_conn_string(conn_string) as checkpointer,
+            PostgresStore.from_conn_string(conn_string) as store,
+        ):
             checkpointer.setup()
-            return _do_invoke(state, config, checkpointer)
+            store.setup()
+            return _do_invoke(state, config, checkpointer, store)
 
-    return _do_invoke(state, config, None)
+    memory_store = InMemoryStore()
+    return _do_invoke(state, config, None, memory_store)

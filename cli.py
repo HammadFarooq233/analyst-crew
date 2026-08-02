@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 import uuid
 
@@ -25,11 +26,31 @@ def format_plan(result) -> str:
     return "\n".join(lines)
 
 
+def seed_memory_before_invoke(fact: str):
+    from analyst_crew.tools.memory import seed_memory
+
+    conn_string = os.getenv("POSTGRES_CONNECTION_STRING")
+    if conn_string:
+        from langgraph.store.postgres import PostgresStore
+
+        with PostgresStore.from_conn_string(conn_string) as store:
+            store.setup()
+            seed_memory(store, fact)
+    else:
+        print(
+            "Warning: POSTGRES_CONNECTION_STRING not set. "
+            "Seeded memory requires Postgres to persist across sessions. "
+            "Continuing without the seeded memory.",
+            file=sys.stderr,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyst Crew CLI")
     parser.add_argument("--question", type=str, default=None)
     parser.add_argument("--thread-id", type=str, default=None)
     parser.add_argument("--user-id", type=str, default="default")
+    parser.add_argument("--memory-seed", type=str, default=None)
     args = parser.parse_args()
 
     if args.thread_id is None:
@@ -42,6 +63,9 @@ def main() -> None:
     else:
         print("Error: --question is required or pipe input via stdin", file=sys.stderr)
         sys.exit(1)
+
+    if args.memory_seed is not None:
+        seed_memory_before_invoke(args.memory_seed)
 
     invoke_config = {
         "configurable": {
