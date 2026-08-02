@@ -1,0 +1,17 @@
+[analyst_crew]
+log_level = "INFO"
+
+[postgres]
+host = "localhost"
+port = 5432
+database = "analyst_crew"
+user = "analyst"
+password = "analyst"
+
+[langfuse]
+host = "http://localhost:3000"
+
+[llm]
+model = "gemini-2.0-flash-lite"
+temperature = 0.0
+max_tokens = 4096

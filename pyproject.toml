@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "analyst-crew"
+version = "0.1.0"
+description = "A multi-agent data analysis copilot"
+requires-python = ">=3.12"
+dependencies = [
+    "langgraph>=0.5.0",
+    "langchain-google-genai>=2.0.0",
+    "langmem>=0.0.30",
+    "langfuse>=2.0.0",
+    "psycopg2-binary>=2.9",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+    "deepeval>=2.0",
+    "pytest>=8.0",
+]
