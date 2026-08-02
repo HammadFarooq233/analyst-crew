@@ -6,6 +6,10 @@ from analyst_crew.agents import invoke
 
 
 def format_plan(result) -> str:
+    plan_error = result.get("artifacts", {}).get("plan_error")
+    if plan_error is not None:
+        return f"Error: {plan_error}"
+
     plan = result.get("artifacts", {}).get("plan")
     if plan is None:
         return "No plan found in result."
@@ -33,7 +37,12 @@ def main() -> None:
         print("Error: --question is required or pipe input via stdin", file=sys.stderr)
         sys.exit(1)
 
-    result = invoke(question)
+    try:
+        result = invoke(question)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     print(format_plan(result))
 
 

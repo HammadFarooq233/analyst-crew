@@ -18,3 +18,8 @@ dependencies = [
     "deepeval>=2.0",
     "pytest>=8.0",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "llm: tests that require a live LLM (API key and network)",
+]
