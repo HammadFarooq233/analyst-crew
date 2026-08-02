@@ -1,5 +1,6 @@
 import argparse
 import sys
+import uuid
 
 import config  # noqa: F401 — triggers load_dotenv()
 from analyst_crew.agents import invoke
@@ -27,7 +28,12 @@ def format_plan(result) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyst Crew CLI")
     parser.add_argument("--question", type=str, default=None)
+    parser.add_argument("--thread-id", type=str, default=None)
+    parser.add_argument("--user-id", type=str, default="default")
     args = parser.parse_args()
+
+    if args.thread_id is None:
+        args.thread_id = str(uuid.uuid4())
 
     if args.question:
         question = args.question
@@ -37,8 +43,15 @@ def main() -> None:
         print("Error: --question is required or pipe input via stdin", file=sys.stderr)
         sys.exit(1)
 
+    invoke_config = {
+        "configurable": {
+            "thread_id": args.thread_id,
+            "user_id": args.user_id,
+        }
+    }
+
     try:
-        result = invoke(question)
+        result = invoke(question, invoke_config)
     except RuntimeError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

@@ -1,8 +1,12 @@
 import os
+import uuid
 from typing import Any, Literal
 
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
+from langgraph.checkpoint.postgres import PostgresSaver
+from langfuse.langchain import CallbackHandler
 from pydantic import BaseModel, model_validator
 
 import config
@@ -110,8 +114,6 @@ class PlannerAgent:
         if not question.strip():
             raise ValueError("Question must not be empty.")
 
-        from langchain_core.messages import HumanMessage, SystemMessage
-
         messages = [
             SystemMessage(content=SYSTEM_PROMPT),
             HumanMessage(content=question),
@@ -163,17 +165,67 @@ def planner_node(state: CrewState) -> dict[str, Any]:
     }
 
 
-def build_graph() -> StateGraph:
+def get_langfuse_handler(
+    session_id: str | None = None,
+    tags: list[str] | None = None,
+    user_id: str | None = None,
+) -> CallbackHandler | None:
+    if not all(
+        [
+            os.getenv("LANGFUSE_PUBLIC_KEY"),
+            os.getenv("LANGFUSE_SECRET_KEY"),
+            os.getenv("LANGFUSE_HOST"),
+        ]
+    ):
+        return None
+    try:
+        kwargs = {}
+        if session_id is not None:
+            kwargs["session_id"] = session_id
+        if tags is not None:
+            kwargs["tags"] = tags
+        if user_id is not None:
+            kwargs["user_id"] = user_id
+        return CallbackHandler(**kwargs)
+    except Exception:
+        return None
+
+
+def build_graph(checkpointer=None):
     graph = StateGraph(CrewState)
     graph.add_node("planner_node", planner_node)
     graph.add_edge(START, "planner_node")
     graph.add_edge("planner_node", END)
-    return graph
+    return graph.compile(checkpointer=checkpointer)
 
 
-def invoke(user_question: str) -> CrewState:
-    from langchain_core.messages import HumanMessage
+def invoke(user_question: str, config: dict | None = None) -> CrewState:
+    if config is None:
+        config = {}
+    config.setdefault("configurable", {})
+    thread_id = config["configurable"].setdefault("thread_id", str(uuid.uuid4()))
+    user_id = config["configurable"].setdefault("user_id", "default")
 
-    graph = build_graph().compile()
-    result = graph.invoke({"messages": [HumanMessage(content=user_question)]})
-    return result
+    state = {"messages": [HumanMessage(content=user_question)]}
+
+    handler = get_langfuse_handler(
+        session_id=thread_id,
+        tags=["agent:Planner"],
+        user_id=user_id,
+    )
+    if handler is not None:
+        config.setdefault("callbacks", [])
+        config["callbacks"].append(handler)
+
+    conn_string = os.getenv("POSTGRES_CONNECTION_STRING")
+
+    def _do_invoke(_state, _config, _checkpointer):
+        graph = build_graph(checkpointer=_checkpointer)
+        return graph.invoke(_state, _config)
+
+    if conn_string:
+        with PostgresSaver.from_conn_string(conn_string) as checkpointer:
+            checkpointer.setup()
+            return _do_invoke(state, config, checkpointer)
+
+    return _do_invoke(state, config, None)

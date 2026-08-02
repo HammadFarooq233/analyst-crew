@@ -17,9 +17,12 @@ dependencies = [
     "python-dotenv>=1.0",
     "deepeval>=2.0",
     "pytest>=8.0",
+    "langgraph-checkpoint-postgres>=3.1.1",
+    "psycopg>=3.3.4",
 ]
 
 [tool.pytest.ini_options]
 markers = [
     "llm: tests that require a live LLM (API key and network)",
+    "integration: tests that require Docker services (Postgres, Langfuse) to be running",
 ]
