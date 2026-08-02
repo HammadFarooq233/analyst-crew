@@ -25,4 +25,5 @@ dependencies = [
 markers = [
     "llm: tests that require a live LLM (API key and network)",
     "integration: tests that require Docker services (Postgres, Langfuse) to be running",
+    "eval: DeepEval evaluation tests that validate pipeline quality (requires LLM)",
 ]
