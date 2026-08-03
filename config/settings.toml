@@ -3,7 +3,7 @@ log_level = "INFO"
 
 [postgres]
 host = "localhost"
-port = 5432
+port = 5434
 database = "analyst_crew"
 user = "analyst"
 password = "analyst"
