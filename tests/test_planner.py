@@ -5,12 +5,39 @@ from langchain_core.messages import HumanMessage
 
 from analyst_crew.agents import Plan, invoke
 from analyst_crew.state import CrewState
+from analyst_crew.agents.planner import Step
+
+
+def test_plan_accepts_openrouter_field_names():
+    plan = Plan.model_validate(
+        {
+            "user_question": "Compare this month's sales to last month",
+            "plan": [
+                {
+                    "step_id": "fetch_sales_data",
+                    "agent": "Fetcher",
+                    "description": "Retrieve monthly sales data.",
+                    "depends_on": [],
+                },
+                {
+                    "step_id": "report_sales_comparison",
+                    "agent": "Reporter",
+                    "description": "Write the comparison report.",
+                    "depends_on": ["fetch_sales_data"],
+                },
+            ],
+        }
+    )
+
+    assert isinstance(plan.steps[0], Step)
+    assert plan.steps[0].produces == "Retrieve monthly sales data."
+    assert set(plan.model_dump()) == {"steps", "user_question"}
 
 
 class TestStateShape:
     def test_state_shape(self):
-        if not os.getenv("GEMINI_API_KEY"):
-            pytest.skip("GEMINI_API_KEY not set")
+        if not os.getenv("OPENROUTER_API_KEY"):
+            pytest.skip("OPENROUTER_API_KEY not set")
 
         result = invoke("Compare this month's sales to last month")
 
@@ -42,8 +69,8 @@ class TestStateShape:
 @pytest.mark.llm
 class TestLLMIntegration:
     def test_llm_plan_valid(self):
-        if not os.getenv("GEMINI_API_KEY"):
-            pytest.skip("GEMINI_API_KEY not set")
+        if not os.getenv("OPENROUTER_API_KEY"):
+            pytest.skip("OPENROUTER_API_KEY not set")
 
         result = invoke("Compare revenue trends across Q1 and Q2")
 

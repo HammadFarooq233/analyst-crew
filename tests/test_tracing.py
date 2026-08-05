@@ -22,8 +22,8 @@ def _langfuse_available() -> bool:
         return False
 
 
-def _gemini_available() -> bool:
-    return bool(os.getenv("GEMINI_API_KEY"))
+def _openrouter_available() -> bool:
+    return bool(os.getenv("OPENROUTER_API_KEY"))
 
 
 @pytest.mark.integration
@@ -31,8 +31,8 @@ class TestTracing:
     def test_trace_exists(self):
         if not _langfuse_available():
             pytest.skip("Langfuse not available")
-        if not _gemini_available():
-            pytest.skip("GEMINI_API_KEY not set")
+        if not _openrouter_available():
+            pytest.skip("OPENROUTER_API_KEY not set")
 
         import uuid
 

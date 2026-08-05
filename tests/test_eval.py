@@ -5,21 +5,22 @@ import pytest
 from deepeval import assert_test
 from deepeval.metrics import GEval
 from deepeval.models import DeepEvalBaseLLM
-from deepeval.test_case import LLMTestCase
+from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 from langchain_core.messages import HumanMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from langgraph.store.memory import InMemoryStore
 
 from analyst_crew.agents.planner import PlannerAgent
 from analyst_crew.tools.memory import clear_namespace, seed_memory
 
 
-class GeminiEvaluator(DeepEvalBaseLLM):
-    def __init__(self, model_name: str = "gemini-2.0-flash-lite"):
+class OpenRouterEvaluator(DeepEvalBaseLLM):
+    def __init__(self, model_name: str = "google/gemma-4-26b-a4b-it:free"):
         self._model_name = model_name
-        self._model = ChatGoogleGenerativeAI(
+        self._model = ChatOpenAI(
             model=model_name,
-            google_api_key=os.getenv("GEMINI_API_KEY"),
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+            base_url="https://openrouter.ai/api/v1",
             temperature=0.0,
         )
 
@@ -60,8 +61,8 @@ def test_golden_plan_structure():
     4. Steps are ordered so dependencies precede dependents.
     5. At least one Step references Fetcher and at least one references Analyst.
     """
-    if not os.getenv("GEMINI_API_KEY"):
-        pytest.skip("GEMINI_API_KEY not set")
+    if not os.getenv("OPENROUTER_API_KEY"):
+        pytest.skip("OPENROUTER_API_KEY not set")
 
     store = InMemoryStore()
     clear_namespace(store)
@@ -73,16 +74,20 @@ def test_golden_plan_structure():
 
     actual_output = json.dumps(plan.model_dump(), indent=2)
 
-    evaluator = GeminiEvaluator()
+    evaluator = OpenRouterEvaluator()
 
     metric = GEval(
         name="Plan Structure",
-        criteria=[
+        criteria="\n".join([
             "The plan contains at least 2 steps — check that the 'steps' array has 2 or more items.",
             "Every step's 'agent' field is one of: Fetcher, Analyst, Visualizer, Critic, Reporter — check each step's agent value.",
             "No step's 'depends_on' array references its own 'step_id' — for each step, verify step_id is not in depends_on.",
             "Steps are ordered so dependencies come before dependents — for each step, all step_ids in depends_on must appear earlier in the steps array.",
             "At least one step uses Fetcher agent and at least one uses Analyst agent — verify presence of both agent types in the agent fields.",
+        ]),
+        evaluation_params=[
+            LLMTestCaseParams.INPUT,
+            LLMTestCaseParams.ACTUAL_OUTPUT,
         ],
         model=evaluator,
         threshold=0.8,

@@ -2,15 +2,15 @@ import os
 import uuid
 from typing import Any, Literal
 
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.store.postgres import PostgresStore
 from langgraph.store.memory import InMemoryStore
 from langgraph.config import get_store
 from langfuse.langchain import CallbackHandler
-from pydantic import BaseModel, model_validator
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 import config
 from analyst_crew.state import CrewState
@@ -19,7 +19,7 @@ from analyst_crew.state import CrewState
 class Step(BaseModel):
     step_id: str
     agent: Literal["Fetcher", "Analyst", "Visualizer", "Critic", "Reporter"]
-    produces: str
+    produces: str = Field(validation_alias=AliasChoices("produces", "description"))
     depends_on: list[str] = []
 
     @model_validator(mode="after")
@@ -32,7 +32,7 @@ class Step(BaseModel):
 
 
 class Plan(BaseModel):
-    steps: list[Step]
+    steps: list[Step] = Field(validation_alias=AliasChoices("steps", "plan"))
     user_question: str
 
     @model_validator(mode="after")
@@ -83,7 +83,9 @@ Rules:
 5. The Steps must form a valid dependency order — no cycles, no forward references.
 6. Think about the data flow: Fetcher provides data, Analyst computes on it, Visualizer creates charts, Reporter writes prose, Critic reviews.
 7. Every question should produce a Reporter Step as the final Step.
-8. Include the exact user_question text in the Plan."""
+8. Include the exact user_question text in the Plan.
+9. Use exactly these output keys: top-level `steps`, and for each Step `produces`.
+    Do not use `plan` or `description` as substitutes."""
 
 
 class PlannerAgent:
@@ -94,7 +96,7 @@ class PlannerAgent:
         max_tokens: int | None = None,
         store=None,
     ):
-        self.model = model or str(config.get("llm.model", "gemini-2.0-flash-lite"))
+        self.model = model or str(config.get("llm.model", "google/gemma-4-26b-a4b-it:free"))
         self.temperature = (
             temperature
             if temperature is not None
@@ -102,17 +104,22 @@ class PlannerAgent:
         )
         self.max_tokens = max_tokens or int(config.get("llm.max_tokens", 4096))
 
-        self._api_key = os.getenv("GEMINI_API_KEY")
+        self._api_key = os.getenv("OPENROUTER_API_KEY")
         if not self._api_key:
             raise RuntimeError(
-                "GEMINI_API_KEY is not set. Add it to your .env file or environment."
+                "OPENROUTER_API_KEY is not set. Add it to your .env file or environment."
             )
 
-        self._llm = ChatGoogleGenerativeAI(
+        self._llm = ChatOpenAI(
             model=self.model,
-            google_api_key=self._api_key,
+            api_key=self._api_key,
+            base_url="https://openrouter.ai/api/v1",
             temperature=self.temperature,
-            max_output_tokens=self.max_tokens,
+            max_tokens=self.max_tokens,
+            default_headers={
+                "HTTP-Referer": "https://github.com/analyst-crew",
+                "X-Title": "Analyst Crew",
+            },
         )
 
         if store is not None:
@@ -121,7 +128,10 @@ class PlannerAgent:
             memory_tool = create_memory_tool(store)
             self._llm = self._llm.bind_tools([memory_tool])
 
-        self._chain = self._llm.with_structured_output(Plan)
+        self._chain = self._llm.with_structured_output(
+            Plan,
+            method="json_mode",
+        )
 
     def generate_plan(self, question: str) -> Plan:
         if not question.strip():
@@ -138,7 +148,8 @@ class PlannerAgent:
             msg = str(e)
             if "quota" in msg.lower() or "429" in msg:
                 raise RuntimeError(
-                    "Gemini API quota exceeded. Check your usage limits or billing."
+                    "OpenRouter free-model quota or rate limit exceeded. "
+                    "Try again later or select another free model in config/settings.toml."
                 ) from e
             raise RuntimeError(f"Planner LLM call failed: {msg}") from e
 

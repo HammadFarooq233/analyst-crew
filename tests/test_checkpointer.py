@@ -19,8 +19,8 @@ def _postgres_available() -> bool:
         return False
 
 
-def _gemini_available() -> bool:
-    return bool(os.getenv("GEMINI_API_KEY"))
+def _openrouter_available() -> bool:
+    return bool(os.getenv("OPENROUTER_API_KEY"))
 
 
 @pytest.mark.integration
@@ -28,8 +28,8 @@ class TestStatePersistence:
     def test_state_persistence(self):
         if not _postgres_available():
             pytest.skip("Postgres not available")
-        if not _gemini_available():
-            pytest.skip("GEMINI_API_KEY not set")
+        if not _openrouter_available():
+            pytest.skip("OPENROUTER_API_KEY not set")
 
         thread_id = "test-state-persistence-thread-001"
         config = {

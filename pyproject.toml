@@ -9,7 +9,7 @@ description = "A multi-agent data analysis copilot"
 requires-python = ">=3.12"
 dependencies = [
     "langgraph>=0.5.0",
-    "langchain-google-genai>=2.0.0",
+    "langchain-openai>=0.3.0",
     "langmem>=0.0.30",
     "langfuse>=2.0.0",
     "psycopg2-binary>=2.9",
