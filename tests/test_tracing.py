@@ -1,6 +1,10 @@
 import os
+from urllib.request import urlopen
 
 import pytest
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 def _langfuse_available() -> bool:
@@ -8,16 +12,9 @@ def _langfuse_available() -> bool:
     if not all(os.getenv(k) for k in keys):
         return False
     try:
-        from langfuse import Langfuse
-
         host = os.getenv("LANGFUSE_HOST", "")
-        client = Langfuse(
-            public_key=os.getenv("LANGFUSE_PUBLIC_KEY", ""),
-            secret_key=os.getenv("LANGFUSE_SECRET_KEY", ""),
-            host=host,
-        )
-        client.auth_check()
-        return True
+        with urlopen(f"{host.rstrip('/')}/api/public/health", timeout=3) as response:
+            return response.status == 200
     except Exception:
         return False
 
@@ -56,10 +53,6 @@ class TestTracing:
         if plan_error is not None:
             pytest.skip(f"Skipping trace check — API error: {plan_error}")
 
-        import time
-
-        time.sleep(2)
-
         host = os.getenv("LANGFUSE_HOST", "")
         client = Langfuse(
             public_key=os.getenv("LANGFUSE_PUBLIC_KEY", ""),
@@ -67,11 +60,20 @@ class TestTracing:
             host=host,
         )
 
-        traces = client.api.trace.list(tags=["agent:Planner"])
-        trace_found = any(
-            hasattr(t, "session_id") and t.session_id == thread_id
-            for t in traces
-        )
+        import time
+
+        trace_found = False
+        # Self-hosted Langfuse v2 may take several seconds to index ingestion.
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not trace_found:
+            traces = client.api.trace.list(tags=["agent:Planner"])
+            trace_found = any(
+                hasattr(t, "session_id") and t.session_id == thread_id
+                for t in traces
+            )
+            if not trace_found:
+                time.sleep(1)
+
         assert trace_found, (
             f"No trace found for thread_id={thread_id} with tag agent:Planner"
         )

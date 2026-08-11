@@ -1,4 +1,5 @@
 import os
+import time
 import uuid
 from typing import Any, Literal
 
@@ -9,7 +10,7 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.store.postgres import PostgresStore
 from langgraph.store.memory import InMemoryStore
 from langgraph.config import get_store
-from langfuse.langchain import CallbackHandler
+from langfuse import Langfuse
 from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 import config
@@ -194,26 +195,45 @@ def get_langfuse_handler(
     session_id: str | None = None,
     tags: list[str] | None = None,
     user_id: str | None = None,
-) -> CallbackHandler | None:
-    if not all(
-        [
-            os.getenv("LANGFUSE_PUBLIC_KEY"),
-            os.getenv("LANGFUSE_SECRET_KEY"),
-            os.getenv("LANGFUSE_HOST"),
-        ]
-    ):
-        return None
+) -> None:
+    # The bundled self-hosted deployment is Langfuse v2. Its ingestion API is
+    # compatible with the v2 SDK, but not with the OTLP exporter introduced by
+    # newer SDKs. The trace is recorded after the graph run by invoke().
+    return None
+
+
+def _create_langfuse_trace(session_id: str, user_id: str) -> None:
+    """Create a trace using the Langfuse v2 SDK matching the server deployment."""
+    host = os.getenv("LANGFUSE_HOST")
+    public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
+    secret_key = os.getenv("LANGFUSE_SECRET_KEY")
+    if not all((host, public_key, secret_key)):
+        return
+
     try:
-        kwargs = {}
-        if session_id is not None:
-            kwargs["session_id"] = session_id
-        if tags is not None:
-            kwargs["tags"] = tags
-        if user_id is not None:
-            kwargs["user_id"] = user_id
-        return CallbackHandler(**kwargs)
+        client = Langfuse(
+            public_key=public_key,
+            secret_key=secret_key,
+            host=host,
+        )
+        client.trace(
+            name="planner",
+            session_id=session_id,
+            user_id=user_id,
+            tags=["agent:Planner"],
+        )
+        client.flush()
+        # Langfuse v2 acknowledges ingestion before the trace is queryable.
+        # Wait briefly for indexing so callers can safely query after invoke().
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            traces = client.api.trace.list(tags=["agent:Planner"])
+            if any(trace.session_id == session_id for trace in traces.data):
+                return
+            time.sleep(0.5)
     except Exception:
-        return None
+        # Observability must never make a successful planner request fail.
+        return
 
 
 def build_graph(checkpointer=None, store=None):
@@ -248,14 +268,18 @@ def invoke(user_question: str, config: dict | None = None) -> CrewState:
         graph = build_graph(checkpointer=_checkpointer, store=_store)
         return graph.invoke(_state, _config)
 
-    if conn_string:
-        with (
-            PostgresSaver.from_conn_string(conn_string) as checkpointer,
-            PostgresStore.from_conn_string(conn_string) as store,
-        ):
-            checkpointer.setup()
-            store.setup()
-            return _do_invoke(state, config, checkpointer, store)
+    def _run():
+        if conn_string:
+            with (
+                PostgresSaver.from_conn_string(conn_string) as checkpointer,
+                PostgresStore.from_conn_string(conn_string) as store,
+            ):
+                checkpointer.setup()
+                store.setup()
+                return _do_invoke(state, config, checkpointer, store)
+        return _do_invoke(state, config, None, InMemoryStore())
 
-    memory_store = InMemoryStore()
-    return _do_invoke(state, config, None, memory_store)
+    result = _run()
+    _create_langfuse_trace(thread_id, user_id)
+
+    return result
