@@ -205,7 +205,7 @@ progresses. Update this table, don't just the roadmap above.
 
 | Phase                       | Status      | Notes                                                     |
 | --------------------------- | ----------- | --------------------------------------------------------- |
-| 0 – Walking skeleton        | Not started | Planner only, full stack thin                             |
+| 0 – Walking skeleton        | Complete*   | Implemented across commits; infrastructure is runnable    |
 | 1 – Real tool use           | Not started | Fetcher + Analyst; `execute_python` registered but denied |
 | 2 – Full orchestration      | Not started | Visualizer, Critic, Reporter join                         |
 | 3 – Memory, deepened        | Not started |                                                           |
@@ -214,6 +214,10 @@ progresses. Update this table, don't just the roadmap above.
 | 6 – Safety/HITL             | Not started | `execute_python` moves to HITL-gated                      |
 | 7 – Deployment              | Not started |                                                           |
 | 8 – Interface               | Not started |                                                           |
+
+\* Phase 0 was previously exercised during development. A fresh full-suite rerun on 2026-08-25
+confirmed the Docker services start and the structural test passes; live Planner/eval tests were
+blocked by the configured OpenRouter free model being temporarily rate-limited upstream.
 
 ## 11. Locked Technical Stack
 
