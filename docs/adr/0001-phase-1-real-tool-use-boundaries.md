@@ -49,6 +49,18 @@ Testing is layered: offline deterministic tests cover Tools, policies, artifacts
 
 The primary demonstration uses deterministically generated synthetic data for a small multi-region home-and-office products retailer. It spans six months and roughly 25,000 to 50,000 orders, with controlled seasonal patterns, price and volume changes, discounts, returns, duplicates, invalid values, and known material drivers.
 
+The canonical sales schema also includes `sales_channel` and `customer_segment`. Analysis covers product, category, region, channel, and customer-segment drivers.
+
+Revenue is decomposed using gross revenue as quantity multiplied by unit price, return value as returned quantity multiplied by unit price, and net revenue as gross revenue less discount amount and return value. The bridge keeps volume, unit-price, interaction, discount, return, new-product, and discontinued-product effects separate.
+
+Unreadable sources and missing required columns fail. Invalid individual records are quarantined, later duplicate order identifiers are excluded, and impossible commercial values are quarantined. Analysis stops when quarantined records exceed 1% of source rows. Findings disclose included, excluded, and duplicate counts and calculable revenue impact.
+
+Postgres stores monthly targets at region and category grain with target net revenue and order count. FRED monthly CPI optionally supports an inflation-adjusted revenue comparison. CPI is contextual and must not be presented as causal evidence.
+
+Phase 1 does not autonomously re-plan after failure. Transient Tool failures receive bounded retries, optional Data Sources degrade gracefully, required-source failures stop execution, and invalid Agent output may be retried once with validation feedback.
+
+Checkpoint resume uses a Step execution key derived from the Step, analysis parameters, and input artifact hashes. Matching completed Steps are reused; changed sources or parameters invalidate downstream work; failed or interrupted Steps restart from their last safe boundary.
+
 ## Consequences
 
 - Phase 1 tests the Plan and Handoff contracts through actual multi-Agent execution.
