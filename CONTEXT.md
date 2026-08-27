@@ -50,6 +50,8 @@ _Avoid_: Task, job, node
 The Crew resolves a Step's dependencies into explicit input values and passes them to the target Agent. Agents are stateless — they only receive the inputs their Step declares.
 _Avoid_: Context injection, state sharing
 
+A Handoff contains the Step, resolved input artifact references, the user's question, and explicit analysis parameters. Secrets and unresolved source locations never belong in a Handoff.
+
 ## Tools
 
 **Tool**:
@@ -82,3 +84,19 @@ _Avoid_: Brief, output, response
 **Memory**:
 Facts, preferences, and session artifacts that persist across user sessions. Each Agent accesses it independently via a scoped `search_memory` tool, not through a central Planner-mediated fetch.
 _Avoid_: Context, history, long-term storage
+
+**Data Source**:
+An explicitly supplied location from which the Fetcher may retrieve data. The Crew receives a catalog describing available Data Sources; Agents must not invent file paths, database tables, or external series.
+_Avoid_: Input, dataset location, connector
+
+**Findings**:
+The Analyst's structured output containing computed metrics, comparisons, material changes, anomalies, and data-quality limitations. Findings are evidence for a later Report; they are not themselves polished narrative prose.
+_Avoid_: Report, answer, analysis text
+
+**Dataset Artifact**:
+A durable, content-addressed reference to normalized fetched data. It carries provenance, schema, profile, integrity hash, and storage location; full datasets do not live in CrewState.
+_Avoid_: Dataset, raw records, state payload
+
+**Material Change**:
+A change worth surfacing under explicit percentage and absolute-impact thresholds. Phase 1 defaults to at least 15% change and an absolute revenue impact of at least 5% of prior-period total revenue; explicit user instructions may override those defaults.
+_Avoid_: Significant change, important difference
