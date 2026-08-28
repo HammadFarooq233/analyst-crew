@@ -16,6 +16,7 @@ from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 import config
 from analyst_crew.state import CrewState
+from analyst_crew.tools.sales import FetcherAgent, production_fetcher_model
 
 
 AGENTS = ("Fetcher", "Analyst", "Visualizer", "Critic", "Reporter")
@@ -28,7 +29,9 @@ class SourceReference(BaseModel):
 
     @model_validator(mode="after")
     def validate_reference(self) -> "SourceReference":
-        if _contains_secret({"source_id": self.source_id}) or _contains_secret(self.reference) or _is_raw_location(self.reference):
+        catalogued_csv = isinstance(self.reference, Mapping) and self.reference.get("kind") == "CSV" and isinstance(self.reference.get("location"), str)
+        descriptor = {key: value for key, value in self.reference.items() if key != "location"} if catalogued_csv else self.reference
+        if _contains_secret({"source_id": self.source_id}) or _contains_secret(descriptor) or (_is_raw_location(self.reference) and not catalogued_csv):
             raise ValueError("SourceReference cannot contain an unresolved filesystem location")
         return self
 
@@ -162,9 +165,11 @@ class Handoff(BaseModel):
                              "analysis_parameters": self.analysis_parameters,
                              "input_artifacts": self.input_artifacts}):
             raise ValueError("Handoff contains a secret or unresolved location")
+        resolved_sources = {key: value.reference for key, value in self.source_values.items() if isinstance(value.reference, Mapping) and value.reference.get("kind") == "CSV"}
+        source_values = {key: value for key, value in self.source_values.items() if key not in resolved_sources}
         if (_is_raw_location(self.input_artifacts)
                 or _is_raw_location(self.analysis_parameters)
-                or _is_raw_location(self.source_values)):
+                or _is_raw_location(source_values)):
             raise ValueError("Handoff contains an unresolved filesystem location")
         return self
 
@@ -408,6 +413,26 @@ def planner_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
     }
 
 
+def fetcher_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
+    """Execute the first Fetcher Step through its resolved Handoff."""
+    plan = state.get("artifacts", {}).get("plan")
+    configurable = (config or {}).get("configurable", {})
+    catalog = configurable.get("data_sources", {})
+    if not isinstance(plan, Plan):
+        return {"current_step": "fetcher_node", "artifacts": {"fetcher_error": "No executable Plan"}}
+    fetch_step = next((step for step in plan.steps if step.agent == "Fetcher"), None)
+    if fetch_step is None:
+        return {"current_step": "fetcher_node"}
+    try:
+        crew = Crew(available_agents=configurable.get("available_agents", PHASE1_AGENTS), data_sources=catalog)
+        handoff = crew.resolve_handoff(fetch_step, plan, state.get("artifacts", {}).get("datasets", {}))
+        model = configurable.get("fetcher_model") or production_fetcher_model()
+        artifact = FetcherAgent(model).run(handoff, artifact_dir=configurable.get("artifact_dir", ".artifacts"))
+        return {"current_step": "fetcher_node", "steps_completed": [fetch_step.step_id], "artifacts": {"datasets": {artifact.artifact_id: artifact.as_reference()}, "dataset_profile": artifact.profile}}
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {"current_step": "fetcher_node", "artifacts": {"fetcher_error": str(exc), "terminal_failure": {"agent": "Fetcher", "required": True, "status": "failed"}}}
+
+
 def get_langfuse_handler(
     session_id: str | None = None,
     tags: list[str] | None = None,
@@ -453,11 +478,16 @@ def _create_langfuse_trace(session_id: str, user_id: str) -> None:
         return
 
 
-def build_graph(checkpointer=None, store=None):
+def build_graph(checkpointer=None, store=None, runtime_config: dict | None = None):
     graph = StateGraph(CrewState)
     graph.add_node("planner_node", planner_node)
+    graph.add_node("fetcher_node", lambda state, config=None: fetcher_node(state, {**(runtime_config or {}), **(config or {})}))
     graph.add_edge(START, "planner_node")
-    graph.add_edge("planner_node", END)
+    def next_node(state: CrewState) -> str:
+        plan = state.get("artifacts", {}).get("plan")
+        return "fetcher_node" if isinstance(plan, Plan) and any(step.agent == "Fetcher" for step in plan.steps) else END
+    graph.add_conditional_edges("planner_node", next_node, {"fetcher_node": "fetcher_node", END: END})
+    graph.add_edge("fetcher_node", END)
     return graph.compile(checkpointer=checkpointer, store=store)
 
 

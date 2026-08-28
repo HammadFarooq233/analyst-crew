@@ -51,7 +51,12 @@ def main() -> None:
     parser.add_argument("--thread-id", type=str, default=None)
     parser.add_argument("--user-id", type=str, default="default")
     parser.add_argument("--memory-seed", type=str, default=None)
+    parser.add_argument("--sales-csv", type=str, default=None)
+    parser.add_argument("--artifact-dir", type=str, default=".artifacts")
     args = parser.parse_args()
+
+    if not args.sales_csv:
+        parser.error("--sales-csv is required for Phase 1 execution")
 
     if args.thread_id is None:
         args.thread_id = str(uuid.uuid4())
@@ -73,6 +78,10 @@ def main() -> None:
             "user_id": args.user_id,
         }
     }
+    if args.sales_csv:
+        from analyst_crew.tools.sales import sales_data_source
+        invoke_config["configurable"]["data_sources"] = sales_data_source(args.sales_csv)
+        invoke_config["configurable"]["artifact_dir"] = args.artifact_dir
 
     try:
         result = invoke(question, invoke_config)
