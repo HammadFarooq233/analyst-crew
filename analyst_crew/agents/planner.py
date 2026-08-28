@@ -1,6 +1,7 @@
 import os
 import time
 import uuid
+from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -17,14 +18,92 @@ import config
 from analyst_crew.state import CrewState
 
 
+AGENTS = ("Fetcher", "Analyst", "Visualizer", "Critic", "Reporter")
+PHASE1_AGENTS = ("Fetcher", "Analyst")
+
+
+class SourceReference(BaseModel):
+    source_id: str
+    reference: Any = Field(description="Catalog-resolved source descriptor")
+
+    @model_validator(mode="after")
+    def validate_reference(self) -> "SourceReference":
+        if _contains_secret({"source_id": self.source_id}) or _contains_secret(self.reference) or _is_raw_location(self.reference):
+            raise ValueError("SourceReference cannot contain an unresolved filesystem location")
+        return self
+
+
+class ArtifactBinding(BaseModel):
+    artifact_id: str
+    reference: Any = None
+    status: Literal["resolved", "declared"] = "declared"
+
+    @model_validator(mode="after")
+    def validate_reference(self) -> "ArtifactBinding":
+        if _contains_secret({"artifact_id": self.artifact_id}) or _contains_secret(self.reference) or _is_raw_location(self.reference):
+            raise ValueError("ArtifactBinding cannot contain an unresolved filesystem location")
+        return self
+
+
+def _is_raw_location(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.startswith(("/", "~", "file://"))
+    if isinstance(value, Mapping):
+        return any(_is_raw_location(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_is_raw_location(item) for item in value)
+    return False
+
+
+def _contains_secret(value: Any, *, field_name: str = "") -> bool:
+    if isinstance(value, Mapping):
+        return any(_contains_secret(v, field_name=str(k)) for k, v in value.items())
+    if isinstance(value, (list, tuple, set)):
+        return any(_contains_secret(v, field_name=field_name) for v in value)
+    if not isinstance(value, str):
+        return False
+    lowered = value.lower()
+    credential_field = any(token in field_name.lower() for token in ("password", "secret", "api_key", "apikey", "token", "credential"))
+    # Contract IDs, prose, and artifact values may be arbitrary strings. Only
+    # credential-shaped content is rejected here; source locations are checked
+    # at the catalog boundary, where their field meaning is known.
+    location_field = any(token in field_name.lower() for token in ("source_location", "source_path", "source_uri", "location", "path", "uri"))
+    explicit_shape = any(token in lowered for token in ("password=", "secret=", "api_key=", "apikey=", "token="))
+    explicit_location = any(token in lowered for token in (
+        "location=", "path=", "uri=", "source_location=", "source_path=", "source_uri="
+    ))
+    return credential_field or explicit_shape or explicit_location or (location_field and value.startswith(("/", "~", "file://")))
+
+
 class Step(BaseModel):
     step_id: str
     agent: Literal["Fetcher", "Analyst", "Visualizer", "Critic", "Reporter"]
-    produces: str = Field(validation_alias=AliasChoices("produces", "description"))
-    depends_on: list[str] = []
+    objective: str = Field(validation_alias=AliasChoices("objective", "produces", "description"))
+    source_ids: list[str] = Field(default_factory=list, validation_alias=AliasChoices("source_ids", "data_source_ids"))
+    expected_output: str = Field(validation_alias=AliasChoices("expected_output", "produces", "description"))
+    declared_artifacts: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list)
+
+    @property
+    def produces(self) -> str:
+        """Phase 0 compatibility name for the expected output."""
+        return self.expected_output
+
+    @property
+    def data_source_ids(self) -> list[str]:
+        return self.source_ids
 
     @model_validator(mode="after")
     def validate_depends_on(self) -> "Step":
+        if not self.step_id.strip():
+            raise ValueError("Step step_id must not be empty")
+        if not self.objective.strip() or not self.expected_output.strip():
+            raise ValueError("Step objective and expected_output must not be empty")
+        if len(self.source_ids) != len(set(self.source_ids)):
+            raise ValueError(f"Step '{self.step_id}' has duplicate source_ids")
+        if _contains_secret({"objective": self.objective, "expected_output": self.expected_output,
+                             "source_ids": self.source_ids, "declared_artifacts": self.declared_artifacts}):
+            raise ValueError(f"Step '{self.step_id}' contains a secret or unresolved location")
         if self.step_id in self.depends_on:
             raise ValueError(
                 f"Step '{self.step_id}' references itself in depends_on"
@@ -35,6 +114,16 @@ class Step(BaseModel):
 class Plan(BaseModel):
     steps: list[Step] = Field(validation_alias=AliasChoices("steps", "plan"))
     user_question: str
+
+    @model_validator(mode="after")
+    def validate_safe_question(self) -> "Plan":
+        if _contains_secret({"user_question": self.user_question}):
+            raise ValueError("Plan contains a secret or unresolved location")
+        return self
+
+    @property
+    def agents(self) -> set[str]:
+        return {step.agent for step in self.steps}
 
     @model_validator(mode="after")
     def validate_step_ids_unique(self) -> "Plan":
@@ -50,17 +139,109 @@ class Plan(BaseModel):
         for step in self.steps:
             for dep in step.depends_on:
                 if dep not in step_ids:
-                    raise ValueError(
-                        f"Step '{step.step_id}' depends on unknown step '{dep}'"
-                    )
+                    raise ValueError(f"Step '{step.step_id}' depends on unknown step '{dep}'")
                 if dep not in produced:
-                    raise ValueError(
-                        f"Step '{step.step_id}' depends on step '{dep}' "
-                        "which appears after it in the plan"
-                    )
+                    raise ValueError(f"Step '{step.step_id}' depends on step '{dep}' which appears after it in the plan")
             produced.add(step.step_id)
         return self
 
+
+class Handoff(BaseModel):
+    step: Step
+    source_ids: list[str] = Field(default_factory=list)
+    source_values: dict[str, SourceReference] = Field(default_factory=dict)
+    declared_artifacts: dict[str, ArtifactBinding] = Field(default_factory=dict)
+    input_artifacts: dict[str, Any] = Field(default_factory=dict, validation_alias=AliasChoices("input_artifacts", "artifacts"))
+    user_question: str
+    analysis_parameters: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_safe_values(self) -> "Handoff":
+        if _contains_secret({"source_ids": self.source_ids,
+                             "user_question": self.user_question,
+                             "analysis_parameters": self.analysis_parameters,
+                             "input_artifacts": self.input_artifacts}):
+            raise ValueError("Handoff contains a secret or unresolved location")
+        if (_is_raw_location(self.input_artifacts)
+                or _is_raw_location(self.analysis_parameters)
+                or _is_raw_location(self.source_values)):
+            raise ValueError("Handoff contains an unresolved filesystem location")
+        return self
+
+
+def resolve_handoff(step: Step, plan: Plan, artifacts: Mapping[str, Any],
+                    data_sources: Mapping[str, Any] | Sequence[str] = (),
+                    analysis_parameters: Mapping[str, Any] | None = None) -> Handoff:
+    plan_step = next((candidate for candidate in plan.steps if candidate.step_id == step.step_id), None)
+    if plan_step is None or plan_step != step:
+        raise ValueError(f"Step '{step.step_id}' does not match the Step contract in the Plan")
+    catalog = set(data_sources.keys()) if isinstance(data_sources, Mapping) else set(data_sources)
+    unknown = set(step.source_ids) - catalog
+    if unknown:
+        raise ValueError(f"Step '{step.step_id}' references unknown Data Sources: {sorted(unknown)}")
+    # Dependencies refer to prior Steps, but their runtime inputs are keyed by
+    # the artifact IDs those Steps declare—not by implementation step IDs.
+    required_artifacts: list[str] = []
+    for dependency_id in step.depends_on:
+        dependency = next(candidate for candidate in plan.steps if candidate.step_id == dependency_id)
+        required_artifacts.extend(dependency.declared_artifacts or [dependency.expected_output])
+    required_artifacts = list(dict.fromkeys(required_artifacts))
+    missing = set(required_artifacts) - set(artifacts)
+    if missing:
+        raise ValueError(f"Step '{step.step_id}' is missing input artifacts: {sorted(missing)}")
+    declared_names = list(step.declared_artifacts or [step.expected_output])
+    declared = {
+        name: ArtifactBinding(
+            artifact_id=name,
+            reference=artifacts.get(name, {
+                "kind": "planned_output",
+                "producer_step_id": step.step_id,
+                "artifact_id": name,
+            }),
+            status="resolved" if name in artifacts else "declared",
+        )
+        for name in declared_names
+    }
+    inputs = {artifact: artifacts[artifact] for artifact in required_artifacts}
+    inputs.update({artifact: artifacts[artifact] for artifact in declared if artifact in artifacts})
+    source_values = ({source: SourceReference(source_id=source, reference=data_sources[source]) for source in step.source_ids}
+                     if isinstance(data_sources, Mapping)
+                   else {source: SourceReference(source_id=source, reference={
+                       "kind": "catalog_reference", "catalog": "data_sources", "source_id": source,
+                   }) for source in step.source_ids})
+    return Handoff(step=step, source_ids=list(step.source_ids), source_values=source_values,
+                   declared_artifacts=declared, input_artifacts=inputs,
+                   user_question=plan.user_question,
+                   analysis_parameters=dict(analysis_parameters or {}))
+
+
+class Crew:
+    """Capability boundary used by callers to validate and resolve Plans."""
+
+    def __init__(self, available_agents: Sequence[str] = PHASE1_AGENTS,
+                 data_sources: Mapping[str, Any] | Sequence[str] = ()):
+        self.available_agents = set(available_agents)
+        unknown = self.available_agents - set(AGENTS)
+        if unknown:
+            raise ValueError(f"Unknown available Agents: {sorted(unknown)}")
+        self.data_sources = data_sources
+
+    def validate_plan(self, plan: Plan) -> Plan:
+        unavailable = plan.agents - self.available_agents
+        if unavailable:
+            raise ValueError(f"Plan references unavailable Agents: {sorted(unavailable)}")
+        unknown = {source for step in plan.steps for source in step.source_ids}
+        catalog = set(self.data_sources.keys()) if isinstance(self.data_sources, Mapping) else set(self.data_sources)
+        if unknown - catalog:
+            raise ValueError(f"Plan references unknown Data Sources: {sorted(unknown - catalog)}")
+        return plan
+
+    def resolve_handoff(self, step: Step, plan: Plan, artifacts: Mapping[str, Any],
+                        analysis_parameters: Mapping[str, Any] | None = None) -> Handoff:
+        self.validate_plan(plan)
+        if step.agent not in self.available_agents:
+            raise ValueError(f"Step references unavailable Agent: {step.agent}")
+        return resolve_handoff(step, plan, artifacts, self.data_sources, analysis_parameters)
 
 SYSTEM_PROMPT = """You are the Planner Agent for Analyst Crew, a multi-agent data analysis copilot.
 
@@ -96,7 +277,15 @@ class PlannerAgent:
         temperature: float | None = None,
         max_tokens: int | None = None,
         store=None,
+        available_agents: Sequence[str] | None = None,
+        data_sources: Mapping[str, Any] | Sequence[str] = (),
+        llm=None,
     ):
+        self.available_agents = set(PHASE1_AGENTS if available_agents is None else available_agents)
+        invalid = self.available_agents - set(AGENTS)
+        if invalid:
+            raise ValueError(f"Unknown available Agents: {sorted(invalid)}")
+        self.data_sources = set(data_sources.keys()) if isinstance(data_sources, Mapping) else set(data_sources)
         self.model = model or str(config.get("llm.model", "google/gemma-4-26b-a4b-it:free"))
         self.temperature = (
             temperature
@@ -106,12 +295,12 @@ class PlannerAgent:
         self.max_tokens = max_tokens or int(config.get("llm.max_tokens", 4096))
 
         self._api_key = os.getenv("OPENROUTER_API_KEY")
-        if not self._api_key:
+        if llm is None and not self._api_key:
             raise RuntimeError(
                 "OPENROUTER_API_KEY is not set. Add it to your .env file or environment."
             )
 
-        self._llm = ChatOpenAI(
+        self._llm = llm or ChatOpenAI(
             model=self.model,
             api_key=self._api_key,
             base_url="https://openrouter.ai/api/v1",
@@ -134,12 +323,27 @@ class PlannerAgent:
             method="json_mode",
         )
 
-    def generate_plan(self, question: str) -> Plan:
+    def generate_plan(self, question: str, available_agents: Sequence[str] | None = None,
+                      data_sources: Mapping[str, Any] | Sequence[str] | None = None) -> Plan:
         if not question.strip():
             raise ValueError("Question must not be empty.")
 
+        allowed_agents = set(available_agents) if available_agents is not None else self.available_agents
+        invalid = allowed_agents - set(AGENTS)
+        if invalid:
+            raise ValueError(f"Unknown available Agents: {sorted(invalid)}")
+        if not allowed_agents:
+            raise ValueError("available_agents must include at least one Agent")
+        source_catalog = (set(data_sources.keys()) if isinstance(data_sources, Mapping)
+                          else set(data_sources)) if data_sources is not None else self.data_sources
+        capability_prompt = (
+            SYSTEM_PROMPT
+            + "\n\nValidated capabilities for this run (you MUST use only these Agents):\n"
+            + "Agents: " + ", ".join(sorted(allowed_agents))
+            + "\nData Sources: " + ", ".join(sorted(source_catalog))
+        )
         messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=capability_prompt),
             HumanMessage(content=question),
         ]
 
@@ -162,6 +366,14 @@ class PlannerAgent:
         if not result.steps:
             raise RuntimeError("LLM returned an empty Plan (no Steps).")
 
+        unavailable = result.agents - allowed_agents
+        if unavailable:
+            raise ValueError(f"Plan references unavailable Agents: {sorted(unavailable)}")
+        catalog = (set(data_sources.keys()) if isinstance(data_sources, Mapping) else set(data_sources)) if data_sources is not None else self.data_sources
+        unknown_sources = {source for step in result.steps for source in step.source_ids} - catalog
+        if unknown_sources:
+            raise ValueError(f"Plan references unknown Data Sources: {sorted(unknown_sources)}")
+
         return result
 
 
@@ -172,14 +384,19 @@ def _extract_question(state: CrewState) -> str:
     return ""
 
 
-def planner_node(state: CrewState) -> dict[str, Any]:
+def planner_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
     question = _extract_question(state)
 
     try:
         store = get_store()
-        agent = PlannerAgent(store=store)
+        configurable = (config or {}).get("configurable", {})
+        agent = PlannerAgent(
+            store=store,
+            available_agents=configurable.get("available_agents"),
+            data_sources=configurable.get("data_sources", ()),
+        )
         plan = agent.generate_plan(question)
-    except RuntimeError as e:
+    except (RuntimeError, ValueError) as e:
         return {
             "current_step": "planner_node",
             "artifacts": {"plan_error": str(e)},
