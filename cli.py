@@ -51,7 +51,8 @@ def format_result(result) -> str:
         f"{metric('units', findings.units, decimals=0)}. "
         f"Evidence: {findings.source_rows} source rows, {findings.included_rows} included, "
         f"{findings.quarantined_rows} quarantined, {findings.duplicate_rows} duplicates excluded; "
-        f"excluded gross revenue impact {findings.excluded_revenue_impact:,.2f}."
+        f"excluded gross revenue impact {findings.excluded_revenue_impact:,.2f}; "
+        f"reasons {findings.quarantine_reasons}."
     )
 
 

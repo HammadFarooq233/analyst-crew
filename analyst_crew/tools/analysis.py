@@ -42,6 +42,7 @@ class BaselineFindings(BaseModel):
     quarantined_rows: int = 0
     duplicate_rows: int = 0
     excluded_revenue_impact: float = 0.0
+    quarantine_reasons: dict[str, int] = {}
 
 
 class AnalystToolRequest(BaseModel):
@@ -181,6 +182,7 @@ def run_sales_baseline(
         quarantined_rows=int(profile.get("quarantined_rows", 0)),
         duplicate_rows=int(profile.get("duplicate_rows", 0)),
         excluded_revenue_impact=float(profile.get("excluded_revenue_impact", 0.0)),
+        quarantine_reasons=dict(profile.get("quarantine_reasons", {})),
     )
 
 

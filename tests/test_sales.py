@@ -49,6 +49,21 @@ def test_structurally_invalid_source_fails_required_data_source(tmp_path):
     with pytest.raises(ValueError, match="canonical fields"):
         fetch_csv("sales_csv", path, artifact_dir=tmp_path / "artifacts")
 
+def test_each_damaged_rule_is_quarantined_and_revenue_is_counted(tmp_path):
+    pytest.importorskip("pyarrow")
+    base = {"order_id": "ok", "order_date": "2025-01-01", "product_id": "P", "product_name": "x", "category": "Office", "region": "N", "sales_channel": "web", "customer_segment": "consumer", "quantity": "2", "unit_price": "10", "discount_amount": "0", "returned_quantity": "0"}
+    rows = [dict(base, order_id=f"ok-{i}") for i in range(500)]
+    rows += [dict(base, order_id="negative-price", unit_price="-1"), dict(base, order_id="too-many-returns", returned_quantity="3"), dict(base, order_id="too-much-discount", discount_amount="21")]
+    artifact = fetch_csv("sales_csv", _write_rows(tmp_path / "sales.csv", rows), artifact_dir=tmp_path / "artifacts")
+    assert artifact.profile["quarantine_reasons"] == {"discount_exceeds_gross": 1, "negative_unit_price": 1, "return_exceeds_quantity": 1}
+    assert artifact.profile["excluded_revenue_impact"] == 38.0
+
+def test_quarantine_threshold_stops_analysis(tmp_path):
+    base = {"order_id": "ok", "order_date": "2025-01-01", "product_id": "P", "product_name": "x", "category": "Office", "region": "N", "sales_channel": "web", "customer_segment": "consumer", "quantity": "1", "unit_price": "10", "discount_amount": "0", "returned_quantity": "0"}
+    rows = [dict(base, order_id=f"ok-{i}") for i in range(99)] + [dict(base, order_id=f"bad-{i}", quantity="-1") for i in range(2)]
+    with pytest.raises(ValueError, match="too many invalid rows"):
+        fetch_csv("sales_csv", _write_rows(tmp_path / "sales.csv", rows), artifact_dir=tmp_path / "artifacts")
+
 def test_fetcher_consumes_resolved_handoff_and_returns_state_reference(tmp_path):
     pytest.importorskip("pyarrow")
     source = generate_sales_csv(tmp_path / "sales.csv", rows=25_000)

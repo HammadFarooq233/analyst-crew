@@ -59,18 +59,15 @@ def fetch_csv(source_id: str, csv_path: str | Path, *, artifact_dir: str | Path 
             source_rows += 1
             try:
                 values = {key: (value.strip() if isinstance(value, str) else value) for key, value in dict(row).items()}
-                order_id = values.get("order_id")
-                if order_id and order_id in seen:
-                    reasons.append("duplicate_order_id"); quarantine_records.append({"row": values, "reason": "duplicate_order_id"}); continue
-                if order_id:
-                    seen.add(order_id)
                 for field in ("category", "region", "sales_channel", "customer_segment"): values[field] = values[field].casefold()
                 values["quantity"] = int(values["quantity"]); values["unit_price"] = float(values["unit_price"]); values["discount_amount"] = float(values["discount_amount"]); values["returned_quantity"] = int(values["returned_quantity"]); datetime.strptime(values["order_date"], "%Y-%m-%d")
                 if not values["order_id"]: reasons.append("missing_order_id"); quarantine_records.append({"row": values, "reason": "missing_order_id"}); continue
+                if values["order_id"] in seen: reasons.append("duplicate_order_id"); quarantine_records.append({"row": values, "reason": "duplicate_order_id"}); continue
                 if values["quantity"] <= 0: reasons.append("non_positive_quantity"); quarantine_records.append({"row": values, "reason": "non_positive_quantity"}); continue
                 if values["unit_price"] < 0: reasons.append("negative_unit_price"); quarantine_records.append({"row": values, "reason": "negative_unit_price"}); continue
                 if values["returned_quantity"] > values["quantity"]: reasons.append("return_exceeds_quantity"); quarantine_records.append({"row": values, "reason": "return_exceeds_quantity"}); continue
                 if values["discount_amount"] > values["quantity"] * values["unit_price"]: reasons.append("discount_exceeds_gross"); quarantine_records.append({"row": values, "reason": "discount_exceeds_gross"}); continue
+                seen.add(values["order_id"])
                 valid.append(values)
             except (KeyError, TypeError, ValueError): reasons.append("malformed_row"); quarantine_records.append({"row": dict(row), "reason": "malformed_row"})
     if not valid: raise ValueError("CSV Data Source contains zero valid rows")
@@ -90,7 +87,12 @@ def fetch_csv(source_id: str, csv_path: str | Path, *, artifact_dir: str | Path 
     dates = sorted(row["order_date"] for row in valid)
     quarantine_path = target.with_suffix(".quarantine.json")
     quarantine_path.write_text(json.dumps(quarantine_records, sort_keys=True), encoding="utf-8")
-    profile = {"source_rows": source_rows, "included_rows": len(valid), "quarantined_rows": len(reasons), "duplicate_rows": reasons.count("duplicate_order_id"), "quarantine_reasons": {reason: reasons.count(reason) for reason in sorted(set(reasons))}, "excluded_revenue_impact": sum(float(r["row"].get("quantity", 0) or 0) * float(r["row"].get("unit_price", 0) or 0) for r in quarantine_records if r["reason"] != "malformed_row"), "quarantine_sidecar": str(quarantine_path), "null_counts": {field: sum(not row[field] for row in valid) for field in CANONICAL_FIELDS}}
+    def calculable_gross(record: dict[str, Any]) -> float:
+        try:
+            return float(record.get("quantity", 0)) * float(record.get("unit_price", 0))
+        except (TypeError, ValueError):
+            return 0.0
+    profile = {"source_rows": source_rows, "included_rows": len(valid), "quarantined_rows": len(reasons), "duplicate_rows": reasons.count("duplicate_order_id"), "quarantine_reasons": {reason: reasons.count(reason) for reason in sorted(set(reasons))}, "excluded_revenue_impact": sum(calculable_gross(r["row"]) for r in quarantine_records), "quarantine_sidecar": str(quarantine_path), "null_counts": {field: sum(not row[field] for row in valid) for field in CANONICAL_FIELDS}}
     provenance = {"input_hash": input_hash, "source_metadata": source_metadata, "generator": generator, "transform": transform}
     return DatasetArtifact(f"dataset-{digest[:16]}", source_id, str(target), byte_hash, {field.name: str(field.type) for field in table.schema}, profile, len(valid), {"min": dates[0], "max": dates[-1]}, {"quarantined_rows": len(reasons), "duplicate_rows": profile["duplicate_rows"], "reasons": profile["quarantine_reasons"], "quarantine_sidecar": str(quarantine_path)}, datetime.now(timezone.utc).isoformat(), **provenance)
 
