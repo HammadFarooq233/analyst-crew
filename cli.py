@@ -52,8 +52,32 @@ def format_result(result) -> str:
         f"Evidence: {findings.source_rows} source rows, {findings.included_rows} included, "
         f"{findings.quarantined_rows} quarantined, {findings.duplicate_rows} duplicates excluded; "
         f"excluded gross revenue impact {findings.excluded_revenue_impact:,.2f}; "
-        f"reasons {findings.quarantine_reasons}."
+        f"reasons {findings.quarantine_reasons}.\n"
+        f"{format_material_changes(findings)}"
     )
+
+
+def format_material_changes(findings: BaselineFindings) -> str:
+    """Highlight only the drivers that pass the resolved Material Change
+    thresholds — the many non-material dimension rows are deliberately left
+    out of the CLI summary so real noise doesn't drown out real signal."""
+    materiality = findings.materiality
+    header = (
+        f"Material Changes (>= {materiality.relative_change_percent:g}% relative and "
+        f">= {materiality.absolute_change_percent_of_prior_total:g}% of prior-period net revenue, "
+        f"thresholds: {materiality.source}):"
+    )
+    if not findings.material_changes:
+        return f"{header} none — no dimension driver met both thresholds this period."
+    lines = [header]
+    for driver in findings.material_changes:
+        percent = "n/a (no prior baseline)" if driver.percent_change is None else f"{driver.percent_change:+.1f}%"
+        contribution = "n/a" if driver.contribution_percent is None else f"{driver.contribution_percent:+.1f}%"
+        lines.append(
+            f"  - {driver.dimension}={driver.value}: {driver.current:,.2f} vs {driver.prior:,.2f} "
+            f"({driver.absolute_change:+,.2f}, {percent}, contribution {contribution} of net change)"
+        )
+    return "\n".join(lines)
 
 
 def seed_memory_before_invoke(fact: str):

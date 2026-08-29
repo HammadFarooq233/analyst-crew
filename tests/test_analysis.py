@@ -7,6 +7,8 @@ import pytest
 import analyst_crew.agents.planner as planner_module
 from analyst_crew.agents import Plan, PlannerAgent, Step
 from analyst_crew.tools.analysis import (
+    DEFAULT_MATERIALITY_ABSOLUTE_PERCENT_OF_PRIOR_TOTAL,
+    DEFAULT_MATERIALITY_RELATIVE_PERCENT,
     AnalystAgent,
     BaselineFindings,
     ComparisonWindow,
@@ -59,6 +61,24 @@ def _row(order_id, order_date, quantity, unit_price, discount=0, returned=0):
         "region": "North",
         "sales_channel": "web",
         "customer_segment": "consumer",
+        "quantity": quantity,
+        "unit_price": unit_price,
+        "discount_amount": discount,
+        "returned_quantity": returned,
+    }
+
+
+def _dim_row(order_id, order_date, product_id, product_name, category, region, channel, segment,
+             quantity, unit_price, discount=0, returned=0):
+    return {
+        "order_id": order_id,
+        "order_date": order_date,
+        "product_id": product_id,
+        "product_name": product_name,
+        "category": category,
+        "region": region,
+        "sales_channel": channel,
+        "customer_segment": segment,
         "quantity": quantity,
         "unit_price": unit_price,
         "discount_amount": discount,
@@ -299,3 +319,263 @@ def test_cli_renders_validated_findings_as_concise_interpretation():
     assert "gross revenue 60.00 vs 40.00 (+20.00, +50.0%)" in rendered
     assert "orders 2 vs 2 (+0, +0.0%)" in rendered
     assert "units 5 vs 3 (+2, +66.7%)" in rendered
+
+
+def _dimension_scenario_source(tmp_path):
+    return _write_sales(tmp_path / "sales.csv", [
+        # P001/Office/North/web/consumer: unchanged 200 -> 200, never material.
+        _dim_row("M1", "2025-05-01", "P001", "Desk Lamp", "Office", "North", "web", "consumer", 2, 100),
+        _dim_row("J1", "2025-06-01", "P001", "Desk Lamp", "Office", "North", "web", "consumer", 2, 100),
+        # P003/Technology/East/marketplace/small_business: 1000 -> 1200, +20% relative.
+        _dim_row("M2", "2025-05-05", "P003", "Monitor", "Technology", "East", "marketplace", "small_business", 10, 100),
+        _dim_row("J2", "2025-06-05", "P003", "Monitor", "Technology", "East", "marketplace", "small_business", 12, 100),
+        # P002/Furniture/South/store/enterprise: new in June, no May baseline at all.
+        _dim_row("J3", "2025-06-10", "P002", "Notebook", "Furniture", "South", "store", "enterprise", 10, 50),
+    ])
+
+
+def test_dimension_breakdown_flags_material_changes_by_default(tmp_path):
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+    from analyst_crew.tools.sales import fetch_csv
+
+    artifact = fetch_csv("sales_csv", _dimension_scenario_source(tmp_path), artifact_dir=tmp_path / "artifacts")
+    findings = run_sales_baseline(artifact.as_reference(), as_of_date=date(2025, 6, 30))
+
+    assert findings.net_revenue.current == 1900
+    assert findings.net_revenue.prior == 1200
+    assert findings.net_revenue.absolute_change == 700
+
+    assert findings.materiality.relative_change_percent == DEFAULT_MATERIALITY_RELATIVE_PERCENT
+    assert findings.materiality.absolute_change_percent_of_prior_total == DEFAULT_MATERIALITY_ABSOLUTE_PERCENT_OF_PRIOR_TOTAL
+    assert findings.materiality.source == "default"
+
+    assert set(findings.dimensions) == {"product", "category", "region", "sales_channel", "customer_segment"}
+
+    products = {driver.value: driver for driver in findings.dimensions["product"]}
+    assert products["Desk Lamp"].current == 200
+    assert products["Desk Lamp"].prior == 200
+    assert products["Desk Lamp"].absolute_change == 0
+    assert products["Desk Lamp"].percent_change == 0
+    assert products["Desk Lamp"].is_material is False
+
+    monitor = products["Monitor"]
+    assert monitor.current == 1200 and monitor.prior == 1000
+    assert monitor.absolute_change == 200
+    assert monitor.percent_change == pytest.approx(20.0)
+    assert monitor.prior_baseline_missing is False
+    assert monitor.contribution_percent == pytest.approx(200 / 700 * 100)
+    assert monitor.is_material is True
+
+    notebook = products["Notebook"]
+    assert notebook.current == 500 and notebook.prior == 0
+    assert notebook.absolute_change == 500
+    assert notebook.percent_change is None
+    assert notebook.prior_baseline_missing is True
+    assert notebook.contribution_percent == pytest.approx(500 / 700 * 100)
+    assert notebook.is_material is True
+
+    # Every driver carries a deterministic id and its source Dataset Artifact.
+    for driver in findings.dimensions["product"]:
+        assert driver.dataset_artifact_id == findings.dataset_artifact_id
+        assert len(driver.aggregation_id) == 16
+
+    # Dimensional totals reconcile with the overall net revenue change.
+    for dimension, drivers in findings.dimensions.items():
+        total = sum(driver.absolute_change for driver in drivers)
+        assert total == pytest.approx(findings.net_revenue.absolute_change, abs=0.01), dimension
+
+    material_keys = {(driver.dimension, driver.value) for driver in findings.material_changes}
+    assert ("product", "Monitor") in material_keys
+    assert ("product", "Notebook") in material_keys
+    assert ("product", "Desk Lamp") not in material_keys
+    assert ("category", "furniture") in material_keys
+    assert ("category", "technology") in material_keys
+    assert ("category", "office") not in material_keys
+
+
+def test_dimension_aggregation_id_is_deterministic_per_dataset_window_and_value(tmp_path):
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+    from analyst_crew.tools.sales import fetch_csv
+
+    artifact = fetch_csv("sales_csv", _dimension_scenario_source(tmp_path), artifact_dir=tmp_path / "artifacts")
+    first = run_sales_baseline(artifact.as_reference(), as_of_date=date(2025, 6, 30))
+    second = run_sales_baseline(artifact.as_reference(), as_of_date=date(2025, 6, 30))
+
+    first_ids = {(d.dimension, d.value): d.aggregation_id for d in first.dimensions["product"]}
+    second_ids = {(d.dimension, d.value): d.aggregation_id for d in second.dimensions["product"]}
+    assert first_ids == second_ids
+    assert len(set(first_ids.values())) == len(first_ids)
+
+
+def test_analysis_parameters_override_materiality_thresholds(tmp_path):
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+    from analyst_crew.tools.sales import fetch_csv
+
+    artifact = fetch_csv("sales_csv", _dimension_scenario_source(tmp_path), artifact_dir=tmp_path / "artifacts")
+    findings = run_sales_baseline(
+        artifact.as_reference(),
+        as_of_date=date(2025, 6, 30),
+        analysis_parameters={"materiality_absolute_threshold_percent": 100},
+    )
+    assert findings.materiality.source == "analysis_parameters"
+    assert findings.materiality.absolute_change_percent_of_prior_total == 100
+    assert findings.materiality.relative_change_percent == DEFAULT_MATERIALITY_RELATIVE_PERCENT
+    # 100% of the prior period total (1200) is 1200, larger than either driver's change.
+    assert findings.material_changes == []
+
+
+def test_user_question_override_raises_relative_threshold_and_defaults_absolute(tmp_path):
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+    from analyst_crew.tools.sales import fetch_csv
+
+    artifact = fetch_csv("sales_csv", _dimension_scenario_source(tmp_path), artifact_dir=tmp_path / "artifacts")
+    findings = run_sales_baseline(
+        artifact.as_reference(),
+        as_of_date=date(2025, 6, 30),
+        user_question="Only flag material changes with at least 25% relative change this month.",
+    )
+    assert findings.materiality.source == "user_question"
+    assert findings.materiality.relative_change_percent == 25.0
+    assert findings.materiality.absolute_change_percent_of_prior_total == DEFAULT_MATERIALITY_ABSOLUTE_PERCENT_OF_PRIOR_TOTAL
+
+    material_keys = {(driver.dimension, driver.value) for driver in findings.material_changes}
+    # Monitor's 20% relative change no longer clears the raised 25% bar.
+    assert ("product", "Monitor") not in material_keys
+    # Notebook has no prior baseline, so the relative test is satisfied by
+    # convention and it stays material on the absolute-impact test alone.
+    assert ("product", "Notebook") in material_keys
+
+
+def test_analysis_parameters_take_priority_over_user_question_wording():
+    from analyst_crew.tools.analysis import _resolve_materiality
+
+    thresholds = _resolve_materiality(
+        {"materiality_relative_threshold_percent": 10},
+        "Flag changes with at least 40% relative change and 40% absolute impact.",
+    )
+    assert thresholds.source == "analysis_parameters"
+    assert thresholds.relative_change_percent == 10
+    assert thresholds.absolute_change_percent_of_prior_total == DEFAULT_MATERIALITY_ABSOLUTE_PERCENT_OF_PRIOR_TOTAL
+
+
+def test_zero_but_present_prior_baseline_is_not_reported_as_invalid_percentage(tmp_path):
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+    from analyst_crew.tools.sales import fetch_csv
+
+    # A discount fully offsets gross revenue in May, so the product's net
+    # revenue is exactly zero while still present in the prior period.
+    source = _write_sales(tmp_path / "sales.csv", [
+        _dim_row("M1", "2025-05-01", "P004", "Clearance Item", "Office", "North", "web", "consumer", 1, 50, discount=50),
+        _dim_row("J1", "2025-06-01", "P004", "Clearance Item", "Office", "North", "web", "consumer", 1, 50),
+    ])
+    artifact = fetch_csv("sales_csv", source, artifact_dir=tmp_path / "artifacts")
+    findings = run_sales_baseline(artifact.as_reference(), as_of_date=date(2025, 6, 30))
+
+    driver = findings.dimensions["product"][0]
+    assert driver.prior == 0
+    assert driver.current == 50
+    assert driver.percent_change is None
+    assert driver.prior_baseline_missing is True
+
+
+def test_analyst_agent_forwards_analysis_parameters_and_question_to_tool():
+    handoff = type("Handoff", (), {
+        "step": type("Step", (), {"objective": "baseline"})(),
+        "user_question": "Flag changes with at least 30% relative change",
+        "analysis_parameters": {"as_of_date": "2025-06-30", "materiality_absolute_threshold_percent": 12},
+        "input_artifacts": {"sales": {
+            "kind": "Dataset Artifact",
+            "artifact_id": "dataset-1",
+        }},
+    })()
+
+    class Model:
+        def invoke(self, request):
+            return {"tool": "DuckDB.sales_baseline", "dataset_artifact_id": "dataset-1"}
+
+    captured = {}
+
+    def tool(reference, **kwargs):
+        captured.update(kwargs)
+        return "sentinel"
+
+    assert AnalystAgent(Model(), tool).run(handoff) == "sentinel"
+    assert captured["as_of_date"] == "2025-06-30"
+    assert captured["analysis_parameters"] == {"as_of_date": "2025-06-30", "materiality_absolute_threshold_percent": 12}
+    assert captured["user_question"] == "Flag changes with at least 30% relative change"
+
+
+def test_cli_material_changes_section_highlights_only_material_drivers():
+    from cli import format_result
+    from analyst_crew.tools.analysis import DimensionDriver, MaterialityThresholds
+
+    findings = BaselineFindings(
+        window=ComparisonWindow(
+            mode="complete_month",
+            current_start=date(2025, 6, 1),
+            current_end=date(2025, 6, 30),
+            prior_start=date(2025, 5, 1),
+            prior_end=date(2025, 5, 31),
+        ),
+        gross_revenue=MetricComparison(current=60, prior=40, absolute_change=20, percent_change=50),
+        net_revenue=MetricComparison(current=45, prior=19, absolute_change=26, percent_change=136.8421),
+        orders=MetricComparison(current=2, prior=2, absolute_change=0, percent_change=0),
+        units=MetricComparison(current=5, prior=3, absolute_change=2, percent_change=66.6667),
+        dataset_artifact_id="dataset-1",
+        dataset_content_hash="abc123",
+        materiality=MaterialityThresholds(),
+        dimensions={
+            "product": [
+                DimensionDriver(
+                    dimension="product", value="Desk Lamp", current=10, prior=10, absolute_change=0,
+                    percent_change=0, prior_baseline_missing=False, contribution_percent=0,
+                    is_material=False, aggregation_id="a" * 16, dataset_artifact_id="dataset-1",
+                ),
+                DimensionDriver(
+                    dimension="product", value="Monitor", current=35, prior=9, absolute_change=26,
+                    percent_change=288.8889, prior_baseline_missing=False, contribution_percent=100.0,
+                    is_material=True, aggregation_id="b" * 16, dataset_artifact_id="dataset-1",
+                ),
+            ],
+        },
+        material_changes=[
+            DimensionDriver(
+                dimension="product", value="Monitor", current=35, prior=9, absolute_change=26,
+                percent_change=288.8889, prior_baseline_missing=False, contribution_percent=100.0,
+                is_material=True, aggregation_id="b" * 16, dataset_artifact_id="dataset-1",
+            ),
+        ],
+    )
+
+    rendered = format_result({"artifacts": {"findings": findings}})
+    assert "Material Changes" in rendered
+    assert "product=Monitor" in rendered
+    assert "product=Desk Lamp" not in rendered
+
+
+def test_cli_material_changes_section_states_when_nothing_is_material():
+    from cli import format_result
+
+    findings = BaselineFindings(
+        window=ComparisonWindow(
+            mode="complete_month",
+            current_start=date(2025, 6, 1),
+            current_end=date(2025, 6, 30),
+            prior_start=date(2025, 5, 1),
+            prior_end=date(2025, 5, 31),
+        ),
+        gross_revenue=MetricComparison(current=60, prior=59, absolute_change=1, percent_change=1.7),
+        net_revenue=MetricComparison(current=45, prior=44, absolute_change=1, percent_change=2.3),
+        orders=MetricComparison(current=2, prior=2, absolute_change=0, percent_change=0),
+        units=MetricComparison(current=5, prior=5, absolute_change=0, percent_change=0),
+        dataset_artifact_id="dataset-1",
+        dataset_content_hash="abc123",
+    )
+
+    rendered = format_result({"artifacts": {"findings": findings}})
+    assert "none" in rendered.lower()
