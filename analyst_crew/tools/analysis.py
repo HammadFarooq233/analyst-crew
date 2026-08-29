@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import config
+from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
@@ -248,6 +249,14 @@ class TransientAnalystError(Exception):
 
 
 def production_analyst_model() -> Any:
+    """Build the live Analyst Tool-calling seam.
+
+    ``AnalystAgent.run`` invokes this with a plain context ``dict`` (step
+    objective, available Dataset Artifacts, allowed Tools, validation
+    feedback) — a ``ChatOpenAI`` structured-output runnable only accepts a
+    PromptValue, str, or list of ``BaseMessage``, so this wraps that dict
+    into a single formatted prompt before delegating to the structured call.
+    """
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is not set")
@@ -258,7 +267,22 @@ def production_analyst_model() -> Any:
         temperature=0,
         max_tokens=int(config.get("llm.max_tokens", 4096)),
     )
-    return model.with_structured_output(AnalystToolRequest)
+    structured = model.with_structured_output(AnalystToolRequest)
+
+    def _invoke(context: dict[str, Any]) -> AnalystToolRequest:
+        prompt = (
+            "You are the Analyst Tool-calling seam for Analyst Crew. "
+            "Choose exactly one allowed Tool and one available Dataset Artifact — never invent either.\n\n"
+            f"Step objective: {context.get('step_objective')}\n"
+            f"User question: {context.get('user_question')}\n"
+            f"Available Dataset Artifacts: {context.get('available_artifacts')}\n"
+            f"Allowed tools: {context.get('allowed_tools')}\n"
+            f"Validation feedback from a prior attempt (empty if this is the first): "
+            f"{context.get('validation_feedback') or 'none'}\n"
+        )
+        return structured.invoke(prompt)
+
+    return RunnableLambda(_invoke)
 
 
 _DATE_RANGE_SQL = """

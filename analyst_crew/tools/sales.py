@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 import config
+from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
@@ -22,11 +23,35 @@ class FetcherToolRequest(BaseModel):
     source_id: str
 
 def production_fetcher_model() -> Any:
+    """Build the live Fetcher Tool-calling seam.
+
+    ``FetcherAgent.run`` invokes this with a plain context ``dict`` (step
+    objective, declared sources, allowed Tools, validation feedback) — a
+    ``ChatOpenAI`` structured-output runnable only accepts a PromptValue,
+    str, or list of ``BaseMessage``, so this wraps that dict into a single
+    formatted prompt before delegating to the structured call.
+    """
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is not set")
     model = ChatOpenAI(model=config.get("llm.model", "google/gemma-4-26b-a4b-it:free"), api_key=api_key, base_url="https://openrouter.ai/api/v1", temperature=0, max_tokens=int(config.get("llm.max_tokens", 4096)))
-    return model.with_structured_output(FetcherToolRequest)
+    structured = model.with_structured_output(FetcherToolRequest)
+
+    def _invoke(context: dict[str, Any]) -> FetcherToolRequest:
+        prompt = (
+            "You are the Fetcher Tool-calling seam for Analyst Crew. "
+            "Choose exactly one allowed Tool and one declared source_id — never invent either.\n\n"
+            f"Step objective: {context.get('step_objective')}\n"
+            f"User question: {context.get('user_question')}\n"
+            f"Declared source_ids: {context.get('source_ids')}\n"
+            f"Source descriptors: {context.get('source_descriptors')}\n"
+            f"Allowed tools: {context.get('allowed_tools')}\n"
+            f"Validation feedback from a prior attempt (empty if this is the first): "
+            f"{context.get('validation_feedback') or 'none'}\n"
+        )
+        return structured.invoke(prompt)
+
+    return RunnableLambda(_invoke)
 
 @dataclass(frozen=True)
 class DatasetArtifact:

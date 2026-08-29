@@ -15,7 +15,7 @@ from analyst_crew.tools.memory import clear_namespace, seed_memory
 
 
 class OpenRouterEvaluator(DeepEvalBaseLLM):
-    def __init__(self, model_name: str = "google/gemma-4-26b-a4b-it:free"):
+    def __init__(self, model_name: str = "google/gemma-4-31b-it:free"):
         self._model_name = model_name
         self._model = ChatOpenAI(
             model=model_name,
