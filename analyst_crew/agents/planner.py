@@ -1,7 +1,10 @@
+import hashlib
+import json
 import os
 import time
 import uuid
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -16,7 +19,7 @@ from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 import config
 from analyst_crew.state import CrewState
-from analyst_crew.tools.analysis import AnalystAgent, production_analyst_model
+from analyst_crew.tools.analysis import AnalystAgent, BaselineFindings, production_analyst_model
 from analyst_crew.tools.sales import FetcherAgent, production_fetcher_model
 
 
@@ -241,6 +244,128 @@ def resolve_handoff(step: Step, plan: Plan, artifacts: Mapping[str, Any],
                    analysis_parameters=dict(analysis_parameters or {}))
 
 
+def _step_contract_fingerprint(step: Step) -> dict[str, Any]:
+    """The declarative parts of a Step contract that define what work it
+    does, independent of any runtime data. Changing any of these means the
+    Step no longer means the same thing, so any previously computed output
+    for it must be invalidated."""
+    return {
+        "step_id": step.step_id,
+        "agent": step.agent,
+        "objective": step.objective,
+        "source_ids": sorted(step.source_ids),
+        "expected_output": step.expected_output,
+        "declared_artifacts": sorted(step.declared_artifacts or [step.expected_output]),
+        "depends_on": sorted(step.depends_on),
+    }
+
+
+def execution_key(
+    step: Step,
+    *,
+    analysis_parameters: Mapping[str, Any] | None = None,
+    input_artifact_hashes: Sequence[str] = (),
+) -> str:
+    """Stable content hash identifying one Step's resolved execution (issue #11).
+
+    Composed from exactly three things, matching the acceptance criteria:
+
+    1. The Step's own contract (``_step_contract_fingerprint``) — step_id,
+       agent, objective, declared source_ids/artifacts, and dependencies.
+       A Planner-authored change to what a Step is supposed to do (a new
+       objective, a different declared source, a changed dependency) always
+       changes the key.
+    2. The resolved ``analysis_parameters`` for this Handoff. The Fetcher
+       Step never receives ``analysis_parameters`` in its key (callers pass
+       ``{}``), so a parameter-only change (e.g. a different ``as_of_date``)
+       leaves the Fetcher's key unchanged — its Dataset Artifact is reused —
+       while the Analyst's key (which does receive them) changes and it
+       recomputes.
+    3. The content hash(es) of the Step's input artifacts. For the Fetcher
+       this is the source CSV's own byte hash, computed cheaply before any
+       parse/validate work; for the Analyst this is the Fetcher's output
+       Dataset Artifact content hash. Because the Analyst's key transitively
+       depends on the Fetcher's output hash, a Fetcher recompute (triggered
+       by changed CSV content) automatically changes the Analyst's key too —
+       cascading invalidation falls out of this composition; it is never a
+       separately maintained "invalidate downstream" list.
+
+    Two Steps with identical contract, parameters, and input hashes always
+    hash to the same key and are safe to treat as interchangeable on resume;
+    a difference in any one of the three changes the key and forces a
+    recompute.
+    """
+    payload = {
+        "step": _step_contract_fingerprint(step),
+        "analysis_parameters": dict(analysis_parameters or {}),
+        "input_artifact_hashes": sorted(input_artifact_hashes),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _source_content_hash(reference: Any) -> str | None:
+    """Cheap identity hash for a catalogued CSV Data Source, computed before
+    any expensive parse/validate work. This is the same byte hash the
+    Fetcher Tool itself records as ``DatasetArtifact.input_hash`` once a
+    fetch actually runs (see ``analyst_crew.tools.sales.fetch_csv``), so a
+    match here guarantees the Fetcher would produce byte-identical output."""
+    if not isinstance(reference, Mapping) or reference.get("kind") != "CSV":
+        return None
+    location = reference.get("location")
+    if not location:
+        return None
+    path = Path(str(location))
+    if not path.is_file():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _resume_decision(state: CrewState, step_id: str, current_key: str) -> tuple[str, str]:
+    """Decide whether a Step's previously checkpointed output is still valid
+    to reuse for this thread (issue #11).
+
+    Returns ``(resume_outcome, resume_reason)``:
+
+    - ``resume_outcome`` is ``"reused"`` (skip recomputation, reuse the
+      stored output) or ``"recomputed"`` (run the Step's work again).
+    - ``resume_reason`` explains why, as one of five distinct, inspectable
+      labels:
+        - ``"unchanged"``: a completed prior outcome exists for this Step
+          and its execution key still matches this run's -> reused.
+        - ``"invalidated"``: a completed prior outcome exists but its
+          execution key no longer matches (a changed Step contract,
+          analysis parameter, or input artifact content) -> recomputed.
+        - ``"failed"``: the prior run recorded a terminal failure for this
+          exact Step -> recomputed.
+        - ``"interrupted"``: this thread has been invoked before (its
+          accumulated message history holds more than the single message
+          this invoke is adding) but this Step has neither a completed
+          outcome nor a recorded failure — the previous invoke must have
+          been interrupted before this Step's node returned, and therefore
+          before anything about that attempt could be checkpointed ->
+          recomputed from a clean Handoff (LangGraph's checkpointer already
+          restarts at the last node boundary that *did* complete; nothing
+          about a genuinely interrupted node survives to resume from).
+        - ``"never_ran"``: this is the first invoke on this thread ->
+          recomputed.
+    """
+    artifacts = state.get("artifacts", {})
+    prior_outcome = artifacts.get("step_outcomes", {}).get(step_id)
+    prior_failure = artifacts.get("terminal_failure")
+    had_prior_invoke = len(state.get("messages", [])) > 1
+
+    if isinstance(prior_failure, Mapping) and prior_failure.get("step_id") == step_id:
+        return "recomputed", "failed"
+    if isinstance(prior_outcome, Mapping) and prior_outcome.get("status") == "completed":
+        if prior_outcome.get("execution_key") == current_key:
+            return "reused", "unchanged"
+        return "recomputed", "invalidated"
+    if had_prior_invoke:
+        return "recomputed", "interrupted"
+    return "recomputed", "never_ran"
+
+
 class Crew:
     """Capability boundary used by callers to validate and resolve Plans."""
 
@@ -453,7 +578,18 @@ def planner_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
 
 
 def fetcher_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
-    """Execute the first Fetcher Step through its resolved Handoff."""
+    """Execute the first Fetcher Step through its resolved Handoff.
+
+    Before doing any expensive work (reading/parsing/validating the CSV and
+    writing a Parquet Dataset Artifact), this resolves the Handoff, computes
+    the source CSV's cheap content hash, and derives this Step's execution
+    key (see ``execution_key``). ``_resume_decision`` compares that key
+    against the one recorded the last time this thread completed this Step:
+    a match reuses the previously produced Dataset Artifact reference
+    untouched (no re-read, no re-parse); a mismatch — or no valid prior
+    completion — recomputes it. The resume outcome/reason are always
+    recorded on ``step_outcomes`` for CrewState inspection.
+    """
     plan = state.get("artifacts", {}).get("plan")
     configurable = (config or {}).get("configurable", {})
     catalog = configurable.get("data_sources", {})
@@ -466,26 +602,77 @@ def fetcher_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
     try:
         crew = Crew(available_agents=configurable.get("available_agents", PHASE1_AGENTS), data_sources=catalog)
         handoff = crew.resolve_handoff(fetch_step, plan, state.get("artifacts", {}).get("datasets", {}))
-        model = configurable.get("fetcher_model") or production_fetcher_model()
-        agent = FetcherAgent(model)
-        artifact = agent.run(handoff, artifact_dir=configurable.get("artifact_dir", ".artifacts"))
-        reference = artifact.as_reference()
+
+        source_hash = None
+        if handoff.source_values:
+            source_reference = next(iter(handoff.source_values.values())).reference
+            source_hash = _source_content_hash(source_reference)
+        current_key = execution_key(
+            fetch_step,
+            analysis_parameters={},
+            input_artifact_hashes=[source_hash] if source_hash else [],
+        )
+        resume_outcome, resume_reason = _resume_decision(state, fetch_step.step_id, current_key)
+
+        reference = None
+        prior_outcome = None
+        if resume_outcome == "reused":
+            prior_outcome = state.get("artifacts", {}).get("step_outcomes", {}).get(fetch_step.step_id, {})
+            prior_artifact_id = next(iter(prior_outcome.get("artifact_ids", [])), None)
+            reference = (
+                state.get("artifacts", {}).get("datasets", {}).get(prior_artifact_id)
+                if prior_artifact_id else None
+            )
+            if reference is None:
+                # Defensive fallback: the prior outcome claims a key match
+                # but its Dataset Artifact reference is missing from state —
+                # never trust a reuse we can't actually produce output for.
+                resume_outcome, resume_reason = "recomputed", "invalidated"
+
         output_names = fetch_step.declared_artifacts or [fetch_step.expected_output]
-        retry_counts = {"validation_retries": agent.validation_retries, "tool_retries": agent.tool_retries}
+
+        if resume_outcome == "reused":
+            retry_counts = prior_outcome.get("retry_counts") or {"validation_retries": 0, "tool_retries": 0}
+        else:
+            model = configurable.get("fetcher_model") or production_fetcher_model()
+            agent = FetcherAgent(model)
+            artifact = agent.run(handoff, artifact_dir=configurable.get("artifact_dir", ".artifacts"))
+            reference = artifact.as_reference()
+            retry_counts = {"validation_retries": agent.validation_retries, "tool_retries": agent.tool_retries}
+
         return {
             "current_step": "fetcher_node",
             "steps_completed": [fetch_step.step_id],
             "artifacts": {
-                "datasets": {artifact.artifact_id: reference},
+                "terminal_failure": None,
+                "datasets": {reference["artifact_id"]: reference},
                 "step_outputs": {name: reference for name in output_names},
-                "dataset_profile": artifact.profile,
-                "handoffs": {fetch_step.step_id: handoff.model_dump(mode="json")},
-                "step_outcomes": {fetch_step.step_id: {
-                    "status": "completed",
-                    "artifact_ids": [artifact.artifact_id],
-                    "retry_counts": retry_counts,
-                }},
-                "retry_counts": {fetch_step.step_id: retry_counts},
+                "dataset_profile": reference.get("profile", {}),
+                "handoffs": {
+                    **state.get("artifacts", {}).get("handoffs", {}),
+                    fetch_step.step_id: handoff.model_dump(mode="json"),
+                },
+                # merge_dicts is a shallow update of "artifacts" — it would
+                # otherwise replace the whole step_outcomes/retry_counts
+                # sub-dicts wholesale, wiping the Analyst's outcome recorded
+                # by a previous invoke on this thread before analyst_node
+                # even runs this turn. Spread the prior entries explicitly,
+                # matching analyst_node's own merge below.
+                "step_outcomes": {
+                    **state.get("artifacts", {}).get("step_outcomes", {}),
+                    fetch_step.step_id: {
+                        "status": "completed",
+                        "artifact_ids": [reference["artifact_id"]],
+                        "retry_counts": retry_counts,
+                        "execution_key": current_key,
+                        "resume_outcome": resume_outcome,
+                        "resume_reason": resume_reason,
+                    },
+                },
+                "retry_counts": {
+                    **state.get("artifacts", {}).get("retry_counts", {}),
+                    fetch_step.step_id: retry_counts,
+                },
             },
         }
     except (OSError, RuntimeError, ValueError) as exc:
@@ -497,7 +684,10 @@ def fetcher_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
             "current_step": "fetcher_node",
             "artifacts": {
                 "fetcher_error": str(exc),
-                "retry_counts": {fetch_step.step_id: retry_counts},
+                "retry_counts": {
+                    **state.get("artifacts", {}).get("retry_counts", {}),
+                    fetch_step.step_id: retry_counts,
+                },
                 "terminal_failure": {
                     "agent": "Fetcher",
                     "step_id": fetch_step.step_id,
@@ -511,7 +701,21 @@ def fetcher_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
 
 
 def analyst_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
-    """Execute the Analyst Step from the Fetcher's Dataset Artifact Handoff."""
+    """Execute the Analyst Step from the Fetcher's Dataset Artifact Handoff.
+
+    Resolves the optional Postgres target / FRED CPI enrichments, resolves
+    the Handoff, then derives this Step's execution key from the Step
+    contract, the resolved ``analysis_parameters``, and the input Dataset
+    Artifact's content hash (see ``execution_key``). Because that content
+    hash comes straight from the Fetcher's just-resolved output, a Fetcher
+    recompute (changed CSV content) naturally changes the Analyst's key too
+    — cascading invalidation, with no separate downstream-invalidation list.
+    A parameter-only change (e.g. a different ``as_of_date``) changes only
+    the Analyst's key, so the Fetcher's Dataset Artifact is reused untouched
+    while Findings recompute. ``_resume_decision`` compares the key against
+    the one recorded the last time this thread completed this Step; a match
+    reuses the previously produced Findings untouched.
+    """
     plan = state.get("artifacts", {}).get("plan")
     configurable = (config or {}).get("configurable", {})
     if not isinstance(plan, Plan):
@@ -527,8 +731,24 @@ def analyst_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
         )
         analysis_parameters = dict(configurable.get("analysis_parameters", {}))
         catalog = configurable.get("data_sources", {})
-        target_source = catalog.get("sales_targets_postgres") if isinstance(catalog, Mapping) else None
         as_of_date = analysis_parameters.get("as_of_date")
+
+        # Reused external fetches: if the last Handoff this thread resolved
+        # for this Step used the same as_of_date (the sole driver of the
+        # comparable-period window these optional sources are queried for),
+        # its already-retrieved target/CPI result is byte-identical to what
+        # a fresh retrieval would return, so it is reused directly instead
+        # of re-issuing the Postgres query / FRED HTTP call.
+        prior_handoff = state.get("artifacts", {}).get("handoffs", {}).get(analyst_step.step_id)
+        prior_parameters = prior_handoff.get("analysis_parameters", {}) if isinstance(prior_handoff, Mapping) else {}
+
+        def _reused_optional_source(key: str) -> Mapping[str, Any] | None:
+            if not as_of_date or prior_parameters.get("as_of_date") != as_of_date:
+                return None
+            cached = prior_parameters.get(key)
+            return cached if isinstance(cached, Mapping) else None
+
+        target_source = catalog.get("sales_targets_postgres") if isinstance(catalog, Mapping) else None
         if target_source is not None and as_of_date:
             # The optional Postgres target Data Source is only ever
             # retrieved here through the read-only Fetcher Tool, and only
@@ -536,11 +756,15 @@ def analyst_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
             # computes via the shared comparison_window() function — never
             # reimplemented. A failure here never raises; it degrades to a
             # recorded source status the Analyst Tool turns into a Finding.
-            from analyst_crew.tools.analysis import comparison_window
-            from analyst_crew.tools.targets import retrieve_targets
+            cached_target_data = _reused_optional_source("target_data")
+            if cached_target_data is not None:
+                analysis_parameters["target_data"] = cached_target_data
+            else:
+                from analyst_crew.tools.analysis import comparison_window
+                from analyst_crew.tools.targets import retrieve_targets
 
-            window = comparison_window(as_of_date)
-            analysis_parameters["target_data"] = retrieve_targets(window.current_start, window.current_end)
+                window = comparison_window(as_of_date)
+                analysis_parameters["target_data"] = retrieve_targets(window.current_start, window.current_end)
 
         cpi_source = catalog.get("cpi_fred") if isinstance(catalog, Mapping) else None
         if cpi_source is not None and as_of_date:
@@ -550,25 +774,66 @@ def analyst_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
             # the shared comparison_window() function — never reimplemented.
             # A failure here never raises; it degrades to a recorded source
             # status the Analyst Tool turns into a Finding and a limitation.
-            from analyst_crew.tools.analysis import comparison_window
-            from analyst_crew.tools.fred import retrieve_cpi
+            cached_cpi_data = _reused_optional_source("cpi_data")
+            if cached_cpi_data is not None:
+                analysis_parameters["cpi_data"] = cached_cpi_data
+            else:
+                from analyst_crew.tools.analysis import comparison_window
+                from analyst_crew.tools.fred import retrieve_cpi
 
-            cpi_window = comparison_window(as_of_date)
-            analysis_parameters["cpi_data"] = retrieve_cpi(cpi_window.prior_start, cpi_window.current_end)
+                cpi_window = comparison_window(as_of_date)
+                analysis_parameters["cpi_data"] = retrieve_cpi(cpi_window.prior_start, cpi_window.current_end)
         handoff = crew.resolve_handoff(
             analyst_step,
             plan,
             state.get("artifacts", {}).get("step_outputs", {}),
             analysis_parameters,
         )
-        model = configurable.get("analyst_model") or production_analyst_model()
-        agent = AnalystAgent(model)
-        findings = agent.run(handoff)
-        retry_counts = {"validation_retries": agent.validation_retries, "tool_retries": agent.tool_retries}
+
+        dataset_references = {
+            key: value
+            for key, value in handoff.input_artifacts.items()
+            if isinstance(value, dict) and value.get("kind") == "Dataset Artifact"
+        }
+        input_hashes = sorted({
+            str(value["content_hash"]) for value in dataset_references.values() if value.get("content_hash")
+        })
+        current_key = execution_key(
+            analyst_step,
+            analysis_parameters=analysis_parameters,
+            input_artifact_hashes=input_hashes,
+        )
+        resume_outcome, resume_reason = _resume_decision(state, analyst_step.step_id, current_key)
+
+        prior_outcome = None
+        findings = None
+        if resume_outcome == "reused":
+            prior_outcome = state.get("artifacts", {}).get("step_outcomes", {}).get(analyst_step.step_id, {})
+            reused_findings = state.get("artifacts", {}).get("findings")
+            if reused_findings is None:
+                # Defensive fallback: a completed prior outcome claims a key
+                # match, but no Findings are actually on state — never trust
+                # a reuse we can't actually produce output for.
+                resume_outcome, resume_reason = "recomputed", "invalidated"
+            else:
+                findings = (
+                    reused_findings if isinstance(reused_findings, BaselineFindings)
+                    else BaselineFindings.model_validate(reused_findings)
+                )
+
+        if resume_outcome == "reused":
+            retry_counts = prior_outcome.get("retry_counts") or {"validation_retries": 0, "tool_retries": 0}
+        else:
+            model = configurable.get("analyst_model") or production_analyst_model()
+            agent = AnalystAgent(model)
+            findings = agent.run(handoff)
+            retry_counts = {"validation_retries": agent.validation_retries, "tool_retries": agent.tool_retries}
+
         return {
             "current_step": "analyst_node",
             "steps_completed": [analyst_step.step_id],
             "artifacts": {
+                "terminal_failure": None,
                 "findings": findings,
                 "handoffs": {
                     **state.get("artifacts", {}).get("handoffs", {}),
@@ -581,6 +846,9 @@ def analyst_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
                         "artifact_ids": analyst_step.declared_artifacts or [analyst_step.expected_output],
                         "input_artifact_ids": [findings.dataset_artifact_id],
                         "retry_counts": retry_counts,
+                        "execution_key": current_key,
+                        "resume_outcome": resume_outcome,
+                        "resume_reason": resume_reason,
                     },
                 },
                 "retry_counts": {
@@ -714,7 +982,23 @@ def _run_metadata(result: CrewState) -> dict[str, Any]:
     return metadata
 
 
-def invoke(user_question: str, config: dict | None = None) -> CrewState:
+def invoke(
+    user_question: str,
+    config: dict | None = None,
+    *,
+    checkpointer: Any = None,
+    store: Any = None,
+) -> CrewState:
+    """Run one Crew turn.
+
+    ``checkpointer``/``store`` let a caller supply their own checkpointer
+    (e.g. an in-memory ``langgraph.checkpoint.memory.MemorySaver`` for
+    offline resume tests) instead of the default Postgres-or-nothing
+    selection below. Without a live ``POSTGRES_CONNECTION_STRING`` and no
+    explicit ``checkpointer``, the graph runs uncheckpointed exactly as
+    before — resume/reuse behavior (issue #11) requires a checkpointer that
+    actually persists CrewState across calls with the same ``thread_id``.
+    """
     if config is None:
         config = {}
     config.setdefault("configurable", {})
@@ -743,15 +1027,17 @@ def invoke(user_question: str, config: dict | None = None) -> CrewState:
         return graph.invoke(_state, _config)
 
     def _run():
+        if checkpointer is not None:
+            return _do_invoke(state, config, checkpointer, store if store is not None else InMemoryStore())
         if conn_string:
             with (
-                PostgresSaver.from_conn_string(conn_string) as checkpointer,
-                PostgresStore.from_conn_string(conn_string) as store,
+                PostgresSaver.from_conn_string(conn_string) as pg_checkpointer,
+                PostgresStore.from_conn_string(conn_string) as pg_store,
             ):
-                checkpointer.setup()
-                store.setup()
-                return _do_invoke(state, config, checkpointer, store)
-        return _do_invoke(state, config, None, InMemoryStore())
+                pg_checkpointer.setup()
+                pg_store.setup()
+                return _do_invoke(state, config, pg_checkpointer, pg_store)
+        return _do_invoke(state, config, None, store if store is not None else InMemoryStore())
 
     result = _run()
     _create_langfuse_trace(thread_id, user_id, metadata=_run_metadata(result))
