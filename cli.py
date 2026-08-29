@@ -5,6 +5,7 @@ import uuid
 
 import config  # noqa: F401 — triggers load_dotenv()
 from analyst_crew.agents import invoke
+from analyst_crew.tools.analysis import BaselineFindings
 
 
 def format_plan(result) -> str:
@@ -24,6 +25,31 @@ def format_plan(result) -> str:
         lines.append(f"    Depends on: {deps}")
         lines.append("")
     return "\n".join(lines)
+
+
+def format_result(result) -> str:
+    findings = result.get("artifacts", {}).get("findings")
+    if findings is None:
+        return format_plan(result)
+    if not isinstance(findings, BaselineFindings):
+        findings = BaselineFindings.model_validate(findings)
+    window = findings.window
+    def metric(label, comparison, *, decimals=2):
+        percent = "n/a" if comparison.percent_change is None else f"{comparison.percent_change:+.1f}%"
+        return (
+            f"{label} {comparison.current:,.{decimals}f} vs {comparison.prior:,.{decimals}f} "
+            f"({comparison.absolute_change:+,.{decimals}f}, {percent})"
+        )
+
+    return (
+        f"Baseline sales Findings ({window.mode}): "
+        f"{window.current_start.isoformat()} to {window.current_end.isoformat()} vs "
+        f"{window.prior_start.isoformat()} to {window.prior_end.isoformat()}. "
+        f"{metric('Net revenue', findings.net_revenue)}; "
+        f"{metric('gross revenue', findings.gross_revenue)}; "
+        f"{metric('orders', findings.orders, decimals=0)}; "
+        f"{metric('units', findings.units, decimals=0)}."
+    )
 
 
 def seed_memory_before_invoke(fact: str):
@@ -53,6 +79,7 @@ def main() -> None:
     parser.add_argument("--memory-seed", type=str, default=None)
     parser.add_argument("--sales-csv", type=str, default=None)
     parser.add_argument("--artifact-dir", type=str, default=".artifacts")
+    parser.add_argument("--as-of-date", type=str, required=True)
     args = parser.parse_args()
 
     if not args.sales_csv:
@@ -82,6 +109,9 @@ def main() -> None:
         from analyst_crew.tools.sales import sales_data_source
         invoke_config["configurable"]["data_sources"] = sales_data_source(args.sales_csv)
         invoke_config["configurable"]["artifact_dir"] = args.artifact_dir
+        invoke_config["configurable"]["analysis_parameters"] = {
+            "as_of_date": args.as_of_date,
+        }
 
     try:
         result = invoke(question, invoke_config)
@@ -89,7 +119,7 @@ def main() -> None:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print(format_plan(result))
+    print(format_result(result))
 
 
 if __name__ == "__main__":

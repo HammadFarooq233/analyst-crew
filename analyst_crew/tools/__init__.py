@@ -1,3 +1,21 @@
-from analyst_crew.tools.memory import create_memory_tool, seed_memory, clear_namespace
+from analyst_crew.tools.analysis import (
+    AnalystAgent,
+    AnalystToolRequest,
+    BaselineFindings,
+    ComparisonWindow,
+    MetricComparison,
+    run_sales_baseline,
+)
+from analyst_crew.tools.memory import clear_namespace, create_memory_tool, seed_memory
 
-__all__ = ["create_memory_tool", "seed_memory", "clear_namespace"]
+__all__ = [
+    "AnalystAgent",
+    "AnalystToolRequest",
+    "BaselineFindings",
+    "ComparisonWindow",
+    "MetricComparison",
+    "clear_namespace",
+    "create_memory_tool",
+    "run_sales_baseline",
+    "seed_memory",
+]

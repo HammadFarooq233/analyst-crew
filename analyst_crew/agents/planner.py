@@ -16,6 +16,7 @@ from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 import config
 from analyst_crew.state import CrewState
+from analyst_crew.tools.analysis import AnalystAgent, production_analyst_model
 from analyst_crew.tools.sales import FetcherAgent, production_fetcher_model
 
 
@@ -160,14 +161,34 @@ class Handoff(BaseModel):
 
     @model_validator(mode="after")
     def validate_safe_values(self) -> "Handoff":
+        # A Dataset Artifact location is resolved, integrity-bound runtime data,
+        # not an Agent-invented source location. Validate the rest of each
+        # reference while permitting that single application-owned field.
+        def without_resolved_locations(value: Any) -> Any:
+            if isinstance(value, Mapping):
+                return {
+                    key: without_resolved_locations(item)
+                    for key, item in value.items()
+                    if not any(token in str(key).lower() for token in ("path", "location", "sidecar"))
+                }
+            if isinstance(value, list):
+                return [without_resolved_locations(item) for item in value]
+            return value
+
+        safe_input_artifacts = {
+            key: (without_resolved_locations(artifact)
+                  if isinstance(artifact, Mapping) and artifact.get("kind") == "Dataset Artifact"
+                  else artifact)
+            for key, artifact in self.input_artifacts.items()
+        }
         if _contains_secret({"source_ids": self.source_ids,
                              "user_question": self.user_question,
                              "analysis_parameters": self.analysis_parameters,
-                             "input_artifacts": self.input_artifacts}):
+                             "input_artifacts": safe_input_artifacts}):
             raise ValueError("Handoff contains a secret or unresolved location")
         resolved_sources = {key: value.reference for key, value in self.source_values.items() if isinstance(value.reference, Mapping) and value.reference.get("kind") == "CSV"}
         source_values = {key: value for key, value in self.source_values.items() if key not in resolved_sources}
-        if (_is_raw_location(self.input_artifacts)
+        if (_is_raw_location(safe_input_artifacts)
                 or _is_raw_location(self.analysis_parameters)
                 or _is_raw_location(source_values)):
             raise ValueError("Handoff contains an unresolved filesystem location")
@@ -263,16 +284,16 @@ Available Agents:
 Before drafting the Plan, call search_memory to retrieve any relevant facts, preferences, or conventions the user has established in prior sessions. Incorporate these into your Plan decisions.
 
 Rules:
-1. Produce between 2 and 5 Steps.
+1. Produce only Steps that can execute with the validated capabilities for this run.
 2. Each Step must have a unique step_id (snake_case string).
 3. Each Step must name exactly one Agent from the list above.
 4. depends_on must reference only step_ids from earlier Steps in the plan (never itself, never a later Step).
 5. The Steps must form a valid dependency order — no cycles, no forward references.
-6. Think about the data flow: Fetcher provides data, Analyst computes on it, Visualizer creates charts, Reporter writes prose, Critic reviews.
-7. Every question should produce a Reporter Step as the final Step.
+6. For the Phase 1 sales comparison, produce exactly a Fetcher Step followed by a dependent Analyst Step.
+7. The Fetcher must use a supplied Data Source and declare one Dataset Artifact output. The Analyst must depend on that Fetcher output and declare Findings.
 8. Include the exact user_question text in the Plan.
-9. Use exactly these output keys: top-level `steps`, and for each Step `produces`.
-    Do not use `plan` or `description` as substitutes."""
+9. Use these Step keys: `step_id`, `agent`, `objective`, `source_ids`, `expected_output`, `declared_artifacts`, and `depends_on`.
+10. Never invent a Data Source ID, filesystem location, executable SQL, or arithmetic result."""
 
 
 class PlannerAgent:
@@ -379,6 +400,19 @@ class PlannerAgent:
         if unknown_sources:
             raise ValueError(f"Plan references unknown Data Sources: {sorted(unknown_sources)}")
 
+        if allowed_agents == set(PHASE1_AGENTS) and "sales_csv" in catalog:
+            if len(result.steps) != 2 or [step.agent for step in result.steps] != ["Fetcher", "Analyst"]:
+                raise ValueError("Phase 1 sales Plan must contain exactly Fetcher then Analyst Steps")
+            fetch_step, analyst_step = result.steps
+            if fetch_step.source_ids != ["sales_csv"]:
+                raise ValueError("Phase 1 Fetcher must use the catalogued sales_csv Data Source")
+            if analyst_step.depends_on != [fetch_step.step_id]:
+                raise ValueError("Phase 1 Analyst must depend on the Fetcher Step")
+            if not (fetch_step.declared_artifacts or [fetch_step.expected_output]):
+                raise ValueError("Phase 1 Fetcher must declare a Dataset Artifact output")
+            if not (analyst_step.declared_artifacts or [analyst_step.expected_output]):
+                raise ValueError("Phase 1 Analyst must declare a Findings output")
+
         return result
 
 
@@ -393,12 +427,17 @@ def planner_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
     question = _extract_question(state)
 
     try:
-        store = get_store()
         configurable = (config or {}).get("configurable", {})
+        planner_model = configurable.get("planner_model")
+        try:
+            store = get_store()
+        except RuntimeError:
+            store = None
         agent = PlannerAgent(
-            store=store,
+            store=None if planner_model is not None else store,
             available_agents=configurable.get("available_agents"),
             data_sources=configurable.get("data_sources", ()),
+            llm=planner_model,
         )
         plan = agent.generate_plan(question)
     except (RuntimeError, ValueError) as e:
@@ -428,9 +467,75 @@ def fetcher_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
         handoff = crew.resolve_handoff(fetch_step, plan, state.get("artifacts", {}).get("datasets", {}))
         model = configurable.get("fetcher_model") or production_fetcher_model()
         artifact = FetcherAgent(model).run(handoff, artifact_dir=configurable.get("artifact_dir", ".artifacts"))
-        return {"current_step": "fetcher_node", "steps_completed": [fetch_step.step_id], "artifacts": {"datasets": {artifact.artifact_id: artifact.as_reference()}, "dataset_profile": artifact.profile}}
+        reference = artifact.as_reference()
+        output_names = fetch_step.declared_artifacts or [fetch_step.expected_output]
+        return {
+            "current_step": "fetcher_node",
+            "steps_completed": [fetch_step.step_id],
+            "artifacts": {
+                "datasets": {artifact.artifact_id: reference},
+                "step_outputs": {name: reference for name in output_names},
+                "dataset_profile": artifact.profile,
+                "handoffs": {fetch_step.step_id: handoff.model_dump(mode="json")},
+                "step_outcomes": {fetch_step.step_id: {
+                    "status": "completed",
+                    "artifact_ids": [artifact.artifact_id],
+                }},
+            },
+        }
     except (OSError, RuntimeError, ValueError) as exc:
         return {"current_step": "fetcher_node", "artifacts": {"fetcher_error": str(exc), "terminal_failure": {"agent": "Fetcher", "required": True, "status": "failed"}}}
+
+
+def analyst_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
+    """Execute the Analyst Step from the Fetcher's Dataset Artifact Handoff."""
+    plan = state.get("artifacts", {}).get("plan")
+    configurable = (config or {}).get("configurable", {})
+    if not isinstance(plan, Plan):
+        return {"current_step": "analyst_node", "artifacts": {"analyst_error": "No executable Plan"}}
+    analyst_step = next((step for step in plan.steps if step.agent == "Analyst"), None)
+    if analyst_step is None:
+        return {"current_step": "analyst_node"}
+    try:
+        crew = Crew(
+            available_agents=configurable.get("available_agents", PHASE1_AGENTS),
+            data_sources=configurable.get("data_sources", {}),
+        )
+        handoff = crew.resolve_handoff(
+            analyst_step,
+            plan,
+            state.get("artifacts", {}).get("step_outputs", {}),
+            configurable.get("analysis_parameters", {}),
+        )
+        model = configurable.get("analyst_model") or production_analyst_model()
+        findings = AnalystAgent(model).run(handoff)
+        return {
+            "current_step": "analyst_node",
+            "steps_completed": [analyst_step.step_id],
+            "artifacts": {
+                "findings": findings,
+                "handoffs": {
+                    **state.get("artifacts", {}).get("handoffs", {}),
+                    analyst_step.step_id: handoff.model_dump(mode="json"),
+                },
+                "step_outcomes": {
+                    **state.get("artifacts", {}).get("step_outcomes", {}),
+                    analyst_step.step_id: {
+                        "status": "completed",
+                        "artifact_ids": analyst_step.declared_artifacts or [analyst_step.expected_output],
+                        "input_artifact_ids": [findings.dataset_artifact_id],
+                    },
+                },
+            },
+        }
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "current_step": "analyst_node",
+            "artifacts": {
+                "analyst_error": str(exc),
+                "terminal_failure": {"agent": "Analyst", "required": True, "status": "failed"},
+            },
+        }
 
 
 def get_langfuse_handler(
@@ -479,15 +584,34 @@ def _create_langfuse_trace(session_id: str, user_id: str) -> None:
 
 
 def build_graph(checkpointer=None, store=None, runtime_config: dict | None = None):
+    def merged_config(config: dict | None) -> dict:
+        base = runtime_config or {}
+        incoming = config or {}
+        return {
+            **base,
+            **incoming,
+            "configurable": {
+                **base.get("configurable", {}),
+                **incoming.get("configurable", {}),
+            },
+        }
+
     graph = StateGraph(CrewState)
-    graph.add_node("planner_node", planner_node)
-    graph.add_node("fetcher_node", lambda state, config=None: fetcher_node(state, {**(runtime_config or {}), **(config or {})}))
+    graph.add_node("planner_node", lambda state, config=None: planner_node(state, merged_config(config)))
+    graph.add_node("fetcher_node", lambda state, config=None: fetcher_node(state, merged_config(config)))
+    graph.add_node("analyst_node", lambda state, config=None: analyst_node(state, merged_config(config)))
     graph.add_edge(START, "planner_node")
     def next_node(state: CrewState) -> str:
         plan = state.get("artifacts", {}).get("plan")
         return "fetcher_node" if isinstance(plan, Plan) and any(step.agent == "Fetcher" for step in plan.steps) else END
     graph.add_conditional_edges("planner_node", next_node, {"fetcher_node": "fetcher_node", END: END})
-    graph.add_edge("fetcher_node", END)
+    def after_fetcher(state: CrewState) -> str:
+        if state.get("artifacts", {}).get("terminal_failure"):
+            return END
+        plan = state.get("artifacts", {}).get("plan")
+        return "analyst_node" if isinstance(plan, Plan) and any(step.agent == "Analyst" for step in plan.steps) else END
+    graph.add_conditional_edges("fetcher_node", after_fetcher, {"analyst_node": "analyst_node", END: END})
+    graph.add_edge("analyst_node", END)
     return graph.compile(checkpointer=checkpointer, store=store)
 
 
@@ -512,7 +636,11 @@ def invoke(user_question: str, config: dict | None = None) -> CrewState:
     conn_string = os.getenv("POSTGRES_CONNECTION_STRING")
 
     def _do_invoke(_state, _config, _checkpointer, _store):
-        graph = build_graph(checkpointer=_checkpointer, store=_store)
+        graph = build_graph(
+            checkpointer=_checkpointer,
+            store=_store,
+            runtime_config=_config,
+        )
         return graph.invoke(_state, _config)
 
     def _run():

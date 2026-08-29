@@ -124,7 +124,8 @@ def test_custom_generator_provenance_and_cli_requires_source(monkeypatch, tmp_pa
         monkeypatch.setattr("sys.argv", ["cli"]); cli.main()
     captured = {}
     monkeypatch.setattr(cli, "invoke", lambda question, config: captured.update(config) or {"artifacts": {}})
-    monkeypatch.setattr("sys.argv", ["cli", "--question", "q", "--sales-csv", str(tmp_path / "sales.csv"), "--artifact-dir", str(tmp_path / "artifacts")])
+    monkeypatch.setattr("sys.argv", ["cli", "--question", "q", "--sales-csv", str(tmp_path / "sales.csv"), "--artifact-dir", str(tmp_path / "artifacts"), "--as-of-date", "2025-06-30"])
     cli.main()
     assert captured["configurable"]["data_sources"]["sales_csv"]["kind"] == "CSV"
     assert captured["configurable"]["artifact_dir"] == str(tmp_path / "artifacts")
+    assert captured["configurable"]["analysis_parameters"] == {"as_of_date": "2025-06-30"}
