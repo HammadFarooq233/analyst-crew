@@ -1,12 +1,13 @@
 # Phase 1 live acceptance status (issue #12)
 
-Last evidence-gathering run: 2026-08-29, this session. **Phase 1 is NOT being marked complete.** Two real production bugs were found and fixed during this run, one live run of the full CLI scenario succeeded with real Findings, resume/reuse (#11) was verified for real, and a real gap in the Langfuse trace-linking acceptance criterion was found and is not fixed. See below for exact evidence.
+Last evidence-gathering run: 2026-08-29, this session (two passes). **Phase 1 is still NOT being marked complete**, but the Langfuse trace-linking gap flagged in the first pass has now been fixed and verified live against the real Langfuse server — see §7 (updated). Three real production bugs were found and fixed across both passes, one live run of the full CLI scenario succeeded with real Findings, resume/reuse (#11) was verified for real, and the Langfuse trace-linking mechanism was verified live through the real production graph/node code — but not yet with a genuine OpenRouter-backed run, because OpenRouter's free-tier daily quota was exhausted before the fix landed. See below for exact evidence and what's left for a human with fresh quota to confirm.
 
 ## Environment used for this run
 
 - Docker Desktop was not running at the start of the session; started successfully, then `docker compose up -d` brought up Postgres (`localhost:5434`) and self-hosted Langfuse v2 (`localhost:3000`) cleanly.
 - `.env` already had real `OPENROUTER_API_KEY`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST`, `POSTGRES_CONNECTION_STRING`. `FRED_API_KEY` was not set and was not obtained — FRED enrichment ran in its documented `not_configured` degraded mode, which is valid, expected behavior (issue #9), and was exercised for real (see below).
 - Outbound network to `openrouter.ai`, `api.stlouisfed.org` (redirects to `research.stlouisfed.org`), and Docker Hub's registry was reachable from this sandbox.
+- Mid-session, an earlier `docker compose down -v` (run to get a clean Postgres for isolated test-checkpointer debugging) also wiped Langfuse's own database, orphaning `.env`'s `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` against the fresh, empty Langfuse project (confirmed: `curl .../api/public/traces` → `"Invalid credentials"`). Fixed properly rather than just re-copying new keys into `.env`: `docker-compose.yml`'s `langfuse` service now sets Langfuse's own `LANGFUSE_INIT_*` bootstrap env vars (org/project/user, with the project's API key pair read from `.env` via compose's automatic `.env` substitution), so any future `docker compose down -v && up -d` re-provisions a project whose keys match `.env` automatically — verified live (see §7).
 
 ## 1. Offline suite — PASSES, no network/live-model access
 
@@ -128,33 +129,82 @@ pytest -m eval
 
 Note: re-running `pytest -m integration` a second time against the **same** Postgres volume without resetting it first spuriously fails `TestResumeAgainstPostgres` (its fixed `thread_id = "test-resume-postgres-thread-001"` is never cleaned up, so a second run sees leftover state from the first and reports `reused` where it expects `recomputed` on the "first" call). This is a pre-existing test-isolation gap, not a product bug — confirmed by re-running against a freshly recreated `docker compose down -v && up -d` Postgres, where the test passes cleanly. Worth a follow-up ticket (e.g. a per-run unique thread suffix or an explicit teardown) so `pytest -m integration` is safe to run repeatedly against a persistent dev Postgres.
 
-## 7. Langfuse tracing — gap found, NOT met
+## 7. Langfuse tracing — FIXED and verified live (second pass)
 
-`analyst_crew/agents/planner.py::get_langfuse_handler()` is a hard-coded no-op (`return None`) with this exact comment in the source:
+### What was wrong
 
-> "The bundled self-hosted deployment is Langfuse v2. Its ingestion API is compatible with the v2 SDK, but not with the OTLP exporter introduced by newer SDKs. The trace is recorded after the graph run by invoke()."
+`get_langfuse_handler()` was a hard-coded no-op (`return None`), and `_create_langfuse_trace()` created one flat, disconnected trace per `invoke()` call after the graph already finished — confirmed live in the first pass via the Langfuse API (10 trace records, `name="planner"`, `"observations": []` on every one). No nested spans for Planner/Fetcher/Analyst LLM calls, Handoffs, or Tool invocations.
 
-`_create_langfuse_trace()` creates exactly one flat trace per `invoke()` call, tagged `agent:Planner`, carrying `session_id`/`user_id` and a `metadata.retry_counts` dict (and `terminal_failure` when present) — confirmed live via the Langfuse API:
+### Root cause of why it was stubbed out
+
+The pinned Langfuse v2 SDK's LangChain integration (`langfuse.callback.CallbackHandler`) imports `langchain.callbacks.base.BaseCallbackHandler`, `langchain.schema.agent.{AgentAction,AgentFinish}`, and `langchain.schema.document.Document` — legacy import paths. This project's installed `langchain` is 1.3.14, which no longer exposes any of them at those paths (verified: `python -c "import langchain.callbacks.base"` → `ModuleNotFoundError: No module named 'langchain.callbacks'`). Those exact symbols do still exist, just only in `langchain_core` (already a direct dependency here), which `langfuse.callback` doesn't know to fall back to.
+
+### The fix
+
+- `analyst_crew/agents/planner.py::_ensure_langchain_callback_compat()` registers thin `sys.modules` shims for the missing legacy `langchain.callbacks.base` / `langchain.schema.agent` / `langchain.schema.document` paths, pointing them at their `langchain_core` equivalents, before `langfuse.callback` is imported. Verified directly: `from langfuse.callback import CallbackHandler` succeeds after the shim runs, and fails without it.
+- `get_langfuse_handler()` now creates one real Langfuse v2 trace up front (`client.trace(name="crew_run", session_id=thread_id, tags=["agent:Planner"], ...)`) and a `CallbackHandler(stateful_client=trace)` bound to it, returned as `(client, trace, handler)`.
+- `invoke()` threads that one `handler` through `config["callbacks"]` for the whole `graph.invoke()` call, exactly as before — but now the handler actually exists.
+- `planner_node`/`fetcher_node`/`analyst_node` now pass their `config` (which carries `callbacks`) into `PlannerAgent.generate_plan(..., config=config)`, `FetcherAgent.run(..., config=config)`, `AnalystAgent.run(..., config=config)`, and the two production Tool-calling seams (`production_fetcher_model`/`production_analyst_model`, already reworked in the first pass) forward it to the underlying structured-output `.invoke(prompt, config=config)` call.
+- A new `analyst_crew/tools/retry.py::invoke_with_optional_config(model, payload, config)` helper forwards `config` only when the target's `invoke` signature actually declares a `config` parameter (checked via `inspect.signature`) — real LangChain Runnables always do; the scripted fake models used throughout the offline test suite (`invoke(self, request)`, no `config`) don't, so they're untouched and the full offline suite still passes unchanged.
+- `_finish_langfuse_trace()` (replacing `_create_langfuse_trace()`) updates that same trace's metadata after the graph run with retry counts, terminal-failure outcome, per-Step `resume_outcome`/`resume_reason`, and optional-source status (`target_comparison.source_status` / `cpi_adjustment.source_status` from the Findings) — see `_run_metadata()`.
+- `docker-compose.yml`'s `langfuse` service now sets `LANGFUSE_INIT_*` env vars (org/project/user, project API keys pulled from `.env`'s own `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` via compose's automatic `.env` substitution) so a fresh `docker compose down -v && up -d` auto-provisions a project whose keys match `.env`, instead of leaving `.env`'s keys orphaned against an empty Langfuse instance (this happened to us mid-session from an earlier `down -v` and had to be fixed to keep testing).
+
+### Live verification — mechanism confirmed real, but with local LLM stand-ins, not OpenRouter
+
+OpenRouter's free-tier daily quota (50 req/day) was already exhausted before this fix was written (see §3; reset 2026-08-30T00:00:00Z), so the fix could not be verified with a genuine OpenRouter-backed Planner/Fetcher/Analyst run in this session. What **was** verified live, running the actual production `analyst_crew.agents.invoke()` → `build_graph()` → `planner_node`/`fetcher_node`/`analyst_node` code (real Postgres checkpointer, real CSV Fetcher Tool against `data/sales.csv`, real DuckDB Analyst Tool, real Postgres targets query, real Langfuse server) with only the three LLM calls substituted for a local, network-free `langchain_core.language_models.fake_chat_models.FakeListChatModel` (a genuine `BaseChatModel` that fires the same LangChain callback events a real `ChatOpenAI` call does — `planner_model`/`fetcher_model`/`analyst_model` configurable overrides, the same seam the offline test suite already uses):
 
 ```
 $ curl -u "$LANGFUSE_PUBLIC_KEY:$LANGFUSE_SECRET_KEY" \
-    "http://localhost:3000/api/public/traces?sessionId=demo-run-2&limit=20"
-# 10 trace records, name="planner", tags=["agent:Planner"], sessionId="demo-run-2",
-# metadata.retry_counts populated per Step, "observations": [] on every one.
+    "http://localhost:3000/api/public/traces/2d0834c3-66c5-4045-8656-15767fae6ad2"
+{
+  "name": "crew_run", "tags": ["agent:Planner"], "sessionId": "trace-wiring-check-795ca4fb",
+  "metadata": {
+    "retry_counts": {"fetch_sales": {...}, "analyze_sales": {...}},
+    "source_status": {"cpi_fred": {"status": "not_configured", "detail": "FRED_API_KEY is not set"},
+                       "sales_targets_postgres": {"status": "available", "detail": null}},
+    "step_outcomes": {"fetch_sales": {"status": "completed", "resume_outcome": "recomputed", ...},
+                       "analyze_sales": {"status": "completed", "resume_outcome": "recomputed", ...}}
+  },
+  "observations": [ ... 9 observations ... ]
+}
 ```
 
-`observations` is empty on every trace — there are **no nested spans for the individual Planner/Fetcher/Analyst LLM calls, Handoffs, or Tool invocations**. The trace links a session/thread to retry counts and terminal-failure status, but it does not link Planner, Fetcher, Analyst, Handoffs, and Tools together as the acceptance criterion requires. `tests/test_tracing.py::test_trace_exists` only asserts a trace with the right `session_id`/tag exists — it does not check for per-Agent/Tool observations, so the existing test suite does not actually enforce this criterion either.
+The 9 observations on that one trace, with real parent/child links:
 
-**This acceptance criterion — "One Langfuse trace links Planner, Fetcher, Analyst, Handoffs, Tools, retries, source status, and failures" — is not met.** Wiring real per-node Langfuse spans (e.g. via `@observe` decorators or explicit span creation in each graph node, migrating off the disabled callback handler) is a real, non-trivial follow-up, explicitly out of scope for this proof-of-work session; it needs its own ticket.
+```
+SPAN       name=LangGraph            parent=None                  <- the graph's own top-level run
+SPAN       name=planner_node         parent=LangGraph
+GENERATION name=FakeListChatModel    parent=planner_node
+SPAN       name=next_node            parent=planner_node          <- LangGraph's own conditional-edge fn
+SPAN       name=fetcher_node         parent=LangGraph
+GENERATION name=FakeListChatModel    parent=fetcher_node
+SPAN       name=after_fetcher        parent=fetcher_node
+SPAN       name=analyst_node         parent=LangGraph
+GENERATION name=FakeListChatModel    parent=analyst_node
+```
 
-## Why Phase 1 status is not being marked complete
+This run also produced real Findings (`findings present: True`, `terminal_failure: None`) from real CSV/DuckDB/Postgres work, in the same `invoke()` call. A second run with a deliberately unreadable CSV path confirmed `terminal_failure` also lands correctly on the same trace's metadata:
 
-1. The Langfuse trace-linking criterion is a genuine, currently-unmet product gap (not an infrastructure/availability issue) — see §7.
-2. Live acceptance evidence for the LLM/eval/tracing marked suites is partial: one full live CLI run succeeded and is documented above with real output, and the OpenRouter free-tier blocker is clearly evidenced, but that is not the same as "these suites pass."
+```
+$ curl -u "..." "http://localhost:3000/api/public/traces?sessionId=trace-failure-check-26b26403"
+"metadata": {"retry_counts": {...}, "terminal_failure": {"agent": "Fetcher", "step_id": "fetch_sales",
+  "status": "failed", "error": "CSV Data Source is unreadable: /nonexistent/sales.csv", ...}}
+```
+
+### What this proves and what it doesn't
+
+**Proven, live, against the real self-hosted Langfuse server and the real production graph/node code:** one trace per Crew run; nested Planner/Fetcher/Analyst spans with nested LLM-generation observations under them; retry counts, per-Step resume outcomes, optional-source status, and terminal-failure all attached to that same trace's metadata; the compat shim actually makes the pinned Langfuse v2 SDK importable against this project's langchain 1.x.
+
+**Not yet proven:** a genuine OpenRouter-backed live run through this exact new tracing code — the CLI run in §4 predates this fix and used the old flat/unlinked tracing. Also, Tool execution itself (`fetch_csv`, `run_sales_baseline`) is plain Python inside the `fetcher_node`/`analyst_node` spans, not a separately-named Tool-type observation — it's visible via that span's duration/input/output, not as its own node in the trace tree. `tests/test_tracing.py::test_trace_exists` still could not be run live this session (it calls `invoke()` for real, which needs a live Planner call — quota-blocked, evidenced skip below).
+
+## Why Phase 1 status is still not being marked complete
+
+1. The Langfuse trace-linking gap is fixed and verified live against the real production code, but only with local LLM stand-ins — not yet with a genuine OpenRouter-backed run, since quota ran out first. That is a real, reasonable, but real gap between "the mechanism is proven correct" and "the full live acceptance scenario has been observed end to end with this fix in place."
+2. Live acceptance evidence for the LLM/eval/tracing marked suites is still partial for the same reason (§3, §6): one full live CLI run succeeded pre-fix, and the OpenRouter free-tier blocker is clearly evidenced, but `pytest -m llm`/`eval`/`test_tracing.py` still can't run live today.
 
 ## What's needed to close this out
 
-1. Wire real per-node Langfuse spans for Planner/Fetcher/Analyst/Handoffs/Tools (see §7) so one trace actually links them.
-2. Either fund an OpenRouter account (add credits to raise the free daily cap) or get a more reliable/paid model configured for CI-grade live runs, since the free tier is both rate-limited and inconsistently schema-compliant.
-3. Re-run `pytest -m llm`, `pytest -m integration`, `pytest -m eval` end to end once the above are addressed, and re-run the full CLI scenario + resume to confirm the trace now shows the full Planner→Fetcher→Analyst→Handoff→Tool chain.
+1. Once OpenRouter quota resets (2026-08-30T00:00:00Z) or a paid/BYOK key is available, re-run the documented CLI command (README.md) once, then re-run it a second time with the same `--thread-id` to also re-confirm resume/reuse under the new tracing code.
+2. Check the resulting trace via the Langfuse UI (`http://localhost:3000`) or API (`GET /api/public/traces?sessionId=<thread_id>`) and confirm it shows the same `planner_node`/`fetcher_node`/`analyst_node` span structure seen above, but with real `ChatOpenAI` `GENERATION` observations (model name, token usage, real prompts/completions) instead of `FakeListChatModel` ones.
+3. Re-run `pytest -m llm`, `pytest -m integration`, `pytest -m eval` end to end once quota is available — expect `test_tracing.py::test_trace_exists` to now pass for real (it only checks tag/session_id, which this fix already satisfies structurally).
 4. Only then update this file (or wherever Phase 1 roadmap status ultimately lives) to "complete."

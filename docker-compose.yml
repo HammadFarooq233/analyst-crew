@@ -26,6 +26,21 @@ services:
       NEXTAUTH_URL: http://localhost:3000
       TELEMETRY_ENABLED: "false"
       LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      # Auto-provision one org/project/user on first boot (empty pgdata
+      # volume only — a no-op once they already exist) with a project API
+      # key pair matching LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY from the
+      # app's own .env, via docker compose's automatic .env substitution.
+      # Without this, a `docker compose down -v` orphans whatever keys are
+      # in .env against a fresh, empty Langfuse project.
+      LANGFUSE_INIT_ORG_ID: analyst-crew
+      LANGFUSE_INIT_ORG_NAME: Analyst Crew
+      LANGFUSE_INIT_PROJECT_ID: analyst-crew
+      LANGFUSE_INIT_PROJECT_NAME: Analyst Crew
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_INIT_USER_EMAIL: dev@analyst-crew.local
+      LANGFUSE_INIT_USER_NAME: Analyst Crew Dev
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-changeme-local-dev-only}
     depends_on:
       postgres:
         condition: service_healthy

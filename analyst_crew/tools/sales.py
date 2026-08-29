@@ -10,7 +10,7 @@ from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
-from analyst_crew.tools.retry import retry_with_backoff
+from analyst_crew.tools.retry import invoke_with_optional_config, retry_with_backoff
 
 CANONICAL_FIELDS = ("order_id", "order_date", "product_id", "product_name", "category", "region", "sales_channel", "customer_segment", "quantity", "unit_price", "discount_amount", "returned_quantity")
 DEFAULT_SEED = 20260301
@@ -37,7 +37,12 @@ def production_fetcher_model() -> Any:
     model = ChatOpenAI(model=config.get("llm.model", "google/gemma-4-26b-a4b-it:free"), api_key=api_key, base_url="https://openrouter.ai/api/v1", temperature=0, max_tokens=int(config.get("llm.max_tokens", 4096)))
     structured = model.with_structured_output(FetcherToolRequest)
 
-    def _invoke(context: dict[str, Any]) -> FetcherToolRequest:
+    def _invoke(context: dict[str, Any], config: Any = None) -> FetcherToolRequest:
+        # ``config`` (accepted because RunnableLambda only forwards it when a
+        # parameter literally named ``config`` is present) carries this
+        # run's Langfuse CallbackHandler through from FetcherAgent.run, so
+        # this call becomes a nested observation on the same trace as the
+        # Planner/Analyst calls rather than an untracked side call.
         prompt = (
             "You are the Fetcher Tool-calling seam for Analyst Crew. "
             "Choose exactly one allowed Tool and one declared source_id — never invent either.\n\n"
@@ -49,7 +54,7 @@ def production_fetcher_model() -> Any:
             f"Validation feedback from a prior attempt (empty if this is the first): "
             f"{context.get('validation_feedback') or 'none'}\n"
         )
-        return structured.invoke(prompt)
+        return structured.invoke(prompt, config=config)
 
     return RunnableLambda(_invoke)
 
@@ -158,12 +163,12 @@ class FetcherAgent:
         self.tool_retries = 0
         self.last_validation_error: str | None = None
 
-    def run(self, handoff: Any, *, artifact_dir: str | Path = ".artifacts") -> DatasetArtifact:
+    def run(self, handoff: Any, *, artifact_dir: str | Path = ".artifacts", config: Any = None) -> DatasetArtifact:
         context = {"step_objective": handoff.step.objective, "user_question": handoff.user_question, "source_ids": handoff.source_ids, "source_descriptors": {key: value.reference for key, value in handoff.source_values.items()}, "allowed_tools": sorted(self.allowed_tools)}
         feedback = ""
         for attempt in range(2):
             try:
-                request = self.model.invoke({**context, "validation_feedback": feedback})
+                request = invoke_with_optional_config(self.model, {**context, "validation_feedback": feedback}, config)
                 if isinstance(request, FetcherToolRequest): request = request.model_dump()
                 if not isinstance(request, dict) or request.get("tool") not in self.allowed_tools: raise ValueError("disallowed Tool")
                 if request.get("source_id") not in handoff.source_ids: raise ValueError("undeclared Data Source")

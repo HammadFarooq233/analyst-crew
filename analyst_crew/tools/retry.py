@@ -32,14 +32,39 @@ call sites reuse this helper instead of writing a fourth ad hoc loop.
 """
 from __future__ import annotations
 
+import inspect
 import time
 from dataclasses import dataclass
-from typing import Callable, TypeVar
+from typing import Any, Callable, TypeVar
 
 T = TypeVar("T")
 
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BACKOFF_SECONDS = 0.5
+
+
+def invoke_with_optional_config(model: Any, payload: Any, config: Any = None) -> Any:
+    """Call ``model.invoke(payload)``, threading ``config`` through only when
+    ``model.invoke`` actually accepts a ``config`` parameter.
+
+    Real LangChain Runnables (``ChatOpenAI``, ``with_structured_output(...)``
+    chains, and the ``RunnableLambda``-wrapped production Fetcher/Analyst
+    Tool-calling seams) accept ``config`` and need it so a Langfuse
+    ``CallbackHandler`` threaded through the graph's config sees every
+    nested LLM/Tool call as one observation linked to the same trace (issue
+    #12). The scripted fake models used throughout the offline test suite
+    only implement ``invoke(self, request)`` — unconditionally passing an
+    unsupported ``config`` kwarg to those would break every one of them, so
+    this only forwards it when the callable's own signature declares a
+    ``config`` parameter.
+    """
+    try:
+        accepts_config = "config" in inspect.signature(model.invoke).parameters
+    except (TypeError, ValueError):
+        accepts_config = False
+    if accepts_config and config is not None:
+        return model.invoke(payload, config=config)
+    return model.invoke(payload)
 
 
 @dataclass(frozen=True)

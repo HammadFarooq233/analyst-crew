@@ -141,7 +141,7 @@ def test_fetcher_node_constructs_production_model_when_not_injected(monkeypatch)
     from analyst_crew.tools.sales import FetcherAgent
     sentinel = object()
     monkeypatch.setattr(planner_module, "production_fetcher_model", lambda: sentinel)
-    monkeypatch.setattr(planner_module, "FetcherAgent", lambda model: type("Agent", (), {"run": lambda self, handoff, artifact_dir: (_ for _ in ()).throw(ValueError("expected test stop"))})())
+    monkeypatch.setattr(planner_module, "FetcherAgent", lambda model: type("Agent", (), {"run": lambda self, handoff, artifact_dir, config=None: (_ for _ in ()).throw(ValueError("expected test stop"))})())
     step = Step(step_id="fetch", agent="Fetcher", objective="fetch", source_ids=["sales_csv"], expected_output="sales")
     result = planner_module.fetcher_node({"artifacts": {"plan": Plan(steps=[step], user_question="q")}}, {"configurable": {"data_sources": {"sales_csv": {"kind": "CSV", "location": "/tmp/sales.csv"}}, "fetcher_model": None}})
     assert result["artifacts"]["terminal_failure"]["agent"] == "Fetcher"

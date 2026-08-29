@@ -15,7 +15,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
 from analyst_crew.tools.fred import FRED_SERIES_ID
-from analyst_crew.tools.retry import retry_with_backoff
+from analyst_crew.tools.retry import invoke_with_optional_config, retry_with_backoff
 
 # Every dimension breakdown partitions the same set of rows used for the
 # overall net revenue comparison, so the sum of a dimension's per-value
@@ -269,7 +269,12 @@ def production_analyst_model() -> Any:
     )
     structured = model.with_structured_output(AnalystToolRequest)
 
-    def _invoke(context: dict[str, Any]) -> AnalystToolRequest:
+    def _invoke(context: dict[str, Any], config: Any = None) -> AnalystToolRequest:
+        # ``config`` (accepted because RunnableLambda only forwards it when a
+        # parameter literally named ``config`` is present) carries this
+        # run's Langfuse CallbackHandler through from AnalystAgent.run, so
+        # this call becomes a nested observation on the same trace as the
+        # Planner/Fetcher calls rather than an untracked side call.
         prompt = (
             "You are the Analyst Tool-calling seam for Analyst Crew. "
             "Choose exactly one allowed Tool and one available Dataset Artifact — never invent either.\n\n"
@@ -280,7 +285,7 @@ def production_analyst_model() -> Any:
             f"Validation feedback from a prior attempt (empty if this is the first): "
             f"{context.get('validation_feedback') or 'none'}\n"
         )
-        return structured.invoke(prompt)
+        return structured.invoke(prompt, config=config)
 
     return RunnableLambda(_invoke)
 
@@ -914,7 +919,7 @@ class AnalystAgent:
         self.tool_retries = 0
         self.last_validation_error: str | None = None
 
-    def run(self, handoff: Any) -> BaselineFindings:
+    def run(self, handoff: Any, *, config: Any = None) -> BaselineFindings:
         dataset_references = {
             key: value
             for key, value in handoff.input_artifacts.items()
@@ -925,7 +930,7 @@ class AnalystAgent:
         feedback = ""
         for attempt in range(2):
             try:
-                request = self.model.invoke({
+                request = invoke_with_optional_config(self.model, {
                     "step_objective": handoff.step.objective,
                     "user_question": handoff.user_question,
                     "available_artifacts": {
@@ -933,7 +938,7 @@ class AnalystAgent:
                     },
                     "allowed_tools": sorted(self.allowed_tools),
                     "validation_feedback": feedback,
-                })
+                }, config)
                 if isinstance(request, AnalystToolRequest):
                     request = request.model_dump()
                 if not isinstance(request, dict) or request.get("tool") not in self.allowed_tools:

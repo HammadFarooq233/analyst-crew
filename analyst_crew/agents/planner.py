@@ -20,6 +20,7 @@ from pydantic import AliasChoices, BaseModel, Field, model_validator
 import config
 from analyst_crew.state import CrewState
 from analyst_crew.tools.analysis import AnalystAgent, BaselineFindings, production_analyst_model
+from analyst_crew.tools.retry import invoke_with_optional_config
 from analyst_crew.tools.sales import FetcherAgent, production_fetcher_model
 
 
@@ -475,7 +476,8 @@ class PlannerAgent:
         )
 
     def generate_plan(self, question: str, available_agents: Sequence[str] | None = None,
-                      data_sources: Mapping[str, Any] | Sequence[str] | None = None) -> Plan:
+                      data_sources: Mapping[str, Any] | Sequence[str] | None = None,
+                      config: dict | None = None) -> Plan:
         if not question.strip():
             raise ValueError("Question must not be empty.")
 
@@ -499,7 +501,7 @@ class PlannerAgent:
         ]
 
         try:
-            result = self._chain.invoke(messages)
+            result = invoke_with_optional_config(self._chain, messages, config)
         except Exception as e:
             msg = str(e)
             if "quota" in msg.lower() or "429" in msg:
@@ -564,7 +566,7 @@ def planner_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
             data_sources=configurable.get("data_sources", ()),
             llm=planner_model,
         )
-        plan = agent.generate_plan(question)
+        plan = agent.generate_plan(question, config=config)
     except (RuntimeError, ValueError) as e:
         return {
             "current_step": "planner_node",
@@ -636,7 +638,7 @@ def fetcher_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
         else:
             model = configurable.get("fetcher_model") or production_fetcher_model()
             agent = FetcherAgent(model)
-            artifact = agent.run(handoff, artifact_dir=configurable.get("artifact_dir", ".artifacts"))
+            artifact = agent.run(handoff, artifact_dir=configurable.get("artifact_dir", ".artifacts"), config=config)
             reference = artifact.as_reference()
             retry_counts = {"validation_retries": agent.validation_retries, "tool_retries": agent.tool_retries}
 
@@ -826,7 +828,7 @@ def analyst_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
         else:
             model = configurable.get("analyst_model") or production_analyst_model()
             agent = AnalystAgent(model)
-            findings = agent.run(handoff)
+            findings = agent.run(handoff, config=config)
             retry_counts = {"validation_retries": agent.validation_retries, "tool_retries": agent.tool_retries}
 
         return {
@@ -882,56 +884,139 @@ def analyst_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
         }
 
 
+def _ensure_langchain_callback_compat() -> None:
+    """Make the pinned Langfuse v2 SDK's LangChain integration importable
+    against this project's langchain 1.x.
+
+    ``langfuse.callback`` (the v2 SDK's ``CallbackHandler``) imports
+    ``langchain.callbacks.base.BaseCallbackHandler`` and
+    ``langchain.schema.{agent,document}`` — legacy import paths that
+    langchain>=1.0 no longer exposes (those symbols now live only in
+    ``langchain_core``, which this project already depends on directly).
+    This registers thin ``sys.modules`` shims for the missing legacy paths,
+    pointing them at their ``langchain_core`` equivalents, before
+    ``langfuse.callback`` is imported. It only patches paths that are
+    actually missing, so it is a no-op against any langchain version that
+    still exposes them.
+    """
+    import sys
+    import types
+
+    try:
+        import langchain.callbacks.base  # noqa: F401
+    except ImportError:
+        from langchain_core.callbacks.base import BaseCallbackHandler
+
+        callbacks_pkg = types.ModuleType("langchain.callbacks")
+        callbacks_base = types.ModuleType("langchain.callbacks.base")
+        callbacks_base.BaseCallbackHandler = BaseCallbackHandler
+        callbacks_pkg.base = callbacks_base
+        sys.modules["langchain.callbacks"] = callbacks_pkg
+        sys.modules["langchain.callbacks.base"] = callbacks_base
+
+    try:
+        import langchain.schema.agent  # noqa: F401
+        have_schema_agent = True
+    except ImportError:
+        have_schema_agent = False
+    try:
+        import langchain.schema.document  # noqa: F401
+        have_schema_document = True
+    except ImportError:
+        have_schema_document = False
+
+    if not (have_schema_agent and have_schema_document):
+        schema_pkg = sys.modules.get("langchain.schema") or types.ModuleType("langchain.schema")
+        if not have_schema_agent:
+            from langchain_core.agents import AgentAction, AgentFinish
+
+            schema_agent = types.ModuleType("langchain.schema.agent")
+            schema_agent.AgentAction = AgentAction
+            schema_agent.AgentFinish = AgentFinish
+            schema_pkg.agent = schema_agent
+            sys.modules["langchain.schema.agent"] = schema_agent
+        if not have_schema_document:
+            from langchain_core.documents import Document
+
+            schema_document = types.ModuleType("langchain.schema.document")
+            schema_document.Document = Document
+            schema_pkg.document = schema_document
+            sys.modules["langchain.schema.document"] = schema_document
+        sys.modules["langchain.schema"] = schema_pkg
+
+
 def get_langfuse_handler(
     session_id: str | None = None,
     tags: list[str] | None = None,
     user_id: str | None = None,
-) -> None:
-    # The bundled self-hosted deployment is Langfuse v2. Its ingestion API is
-    # compatible with the v2 SDK, but not with the OTLP exporter introduced by
-    # newer SDKs. The trace is recorded after the graph run by invoke().
-    return None
+) -> tuple[Any, Any, Any]:
+    """Build one Langfuse v2 trace and a ``CallbackHandler`` bound to it for
+    this Crew run.
 
+    The handler is shared across the whole ``graph.invoke()`` call (threaded
+    through every node's ``config``), so every Planner/Fetcher/Analyst LLM
+    call and Tool invocation becomes a nested observation on this same
+    trace, instead of each ``invoke()`` producing its own flat, unlinked
+    trace record.
 
-def _create_langfuse_trace(session_id: str, user_id: str, metadata: dict[str, Any] | None = None) -> None:
-    """Create a trace using the Langfuse v2 SDK matching the server deployment.
-
-    ``metadata`` carries this run's retry counts and terminal-failure
-    outcome (see ``_run_metadata``) so a retry or a terminal Step failure is
-    visible on the trace, even though there is no live per-node Langfuse
-    span wired up yet — this is populated from the same CrewState the CLI
-    and any other caller can already inspect after ``invoke()`` returns.
+    Returns ``(client, trace, handler)`` — all ``None`` when Langfuse isn't
+    configured or the SDK/compat shim fails; observability must never make a
+    successful Crew run fail.
     """
     host = os.getenv("LANGFUSE_HOST")
     public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
     secret_key = os.getenv("LANGFUSE_SECRET_KEY")
     if not all((host, public_key, secret_key)):
-        return
+        return None, None, None
 
     try:
-        client = Langfuse(
-            public_key=public_key,
-            secret_key=secret_key,
-            host=host,
-        )
-        client.trace(
-            name="planner",
+        _ensure_langchain_callback_compat()
+        from langfuse.callback import CallbackHandler
+
+        client = Langfuse(public_key=public_key, secret_key=secret_key, host=host)
+        trace = client.trace(
+            name="crew_run",
             session_id=session_id,
             user_id=user_id,
-            tags=["agent:Planner"],
-            metadata=metadata or {},
+            tags=tags or [],
         )
+        handler = CallbackHandler(stateful_client=trace)
+        return client, trace, handler
+    except Exception:
+        # Observability must never make a successful Crew run fail.
+        return None, None, None
+
+
+def _finish_langfuse_trace(
+    client: Any,
+    trace: Any,
+    metadata: dict[str, Any] | None = None,
+    *,
+    wait_for_index: bool = True,
+) -> None:
+    """Attach this run's retry counts, terminal-failure outcome, and source
+    status to the trace ``get_langfuse_handler`` already created and
+    threaded through the graph run (see ``_run_metadata``), then flush and —
+    for callers that immediately query the API afterward — wait briefly for
+    Langfuse v2's async ingestion to index it.
+    """
+    if client is None or trace is None:
+        return
+    try:
+        trace.update(metadata=metadata or {})
         client.flush()
-        # Langfuse v2 acknowledges ingestion before the trace is queryable.
-        # Wait briefly for indexing so callers can safely query after invoke().
+        if not wait_for_index:
+            return
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            traces = client.api.trace.list(tags=["agent:Planner"])
-            if any(trace.session_id == session_id for trace in traces.data):
-                return
+            try:
+                if client.api.trace.get(trace.id) is not None:
+                    return
+            except Exception:
+                pass
             time.sleep(0.5)
     except Exception:
-        # Observability must never make a successful planner request fail.
+        # Observability must never make a successful Crew run fail.
         return
 
 
@@ -968,9 +1053,11 @@ def build_graph(checkpointer=None, store=None, runtime_config: dict | None = Non
 
 
 def _run_metadata(result: CrewState) -> dict[str, Any]:
-    """Retry counts and terminal-outcome summary for tracing metadata —
-    populated from the same ``artifacts`` the CLI and any other caller can
-    already inspect after ``invoke()`` returns."""
+    """Retry counts, terminal-outcome, Step resume outcomes, and optional-
+    source status summary for tracing metadata — populated from the same
+    ``artifacts`` the CLI and any other caller can already inspect after
+    ``invoke()`` returns, and attached to the one Langfuse trace this run's
+    ``CallbackHandler`` already linked Planner/Fetcher/Analyst spans to."""
     artifacts = result.get("artifacts", {})
     metadata: dict[str, Any] = {}
     retry_counts = artifacts.get("retry_counts")
@@ -979,6 +1066,26 @@ def _run_metadata(result: CrewState) -> dict[str, Any]:
     terminal_failure = artifacts.get("terminal_failure")
     if terminal_failure:
         metadata["terminal_failure"] = terminal_failure
+    step_outcomes = artifacts.get("step_outcomes")
+    if step_outcomes:
+        metadata["step_outcomes"] = {
+            step_id: {
+                "status": outcome.get("status"),
+                "resume_outcome": outcome.get("resume_outcome"),
+                "resume_reason": outcome.get("resume_reason"),
+            }
+            for step_id, outcome in step_outcomes.items()
+        }
+    findings = artifacts.get("findings")
+    if findings is not None:
+        findings = findings if isinstance(findings, BaselineFindings) else BaselineFindings.model_validate(findings)
+        source_status: dict[str, Any] = {}
+        if findings.target_comparison is not None:
+            source_status["sales_targets_postgres"] = findings.target_comparison.source_status.model_dump()
+        if findings.cpi_adjustment is not None:
+            source_status["cpi_fred"] = findings.cpi_adjustment.source_status.model_dump()
+        if source_status:
+            metadata["source_status"] = source_status
     return metadata
 
 
@@ -1007,7 +1114,7 @@ def invoke(
 
     state = {"messages": [HumanMessage(content=user_question)]}
 
-    handler = get_langfuse_handler(
+    langfuse_client, langfuse_trace, handler = get_langfuse_handler(
         session_id=thread_id,
         tags=["agent:Planner"],
         user_id=user_id,
@@ -1040,6 +1147,6 @@ def invoke(
         return _do_invoke(state, config, None, store if store is not None else InMemoryStore())
 
     result = _run()
-    _create_langfuse_trace(thread_id, user_id, metadata=_run_metadata(result))
+    _finish_langfuse_trace(langfuse_client, langfuse_trace, metadata=_run_metadata(result))
 
     return result
