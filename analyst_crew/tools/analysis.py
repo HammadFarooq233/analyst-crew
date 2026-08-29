@@ -37,6 +37,11 @@ class BaselineFindings(BaseModel):
     dataset_artifact_id: str
     dataset_content_hash: str
     integrity_verified: bool = True
+    source_rows: int = 0
+    included_rows: int = 0
+    quarantined_rows: int = 0
+    duplicate_rows: int = 0
+    excluded_revenue_impact: float = 0.0
 
 
 class AnalystToolRequest(BaseModel):
@@ -162,6 +167,7 @@ def run_sales_baseline(
     finally:
         connection.close()
 
+    profile = dataset_reference.get("profile", {})
     return BaselineFindings(
         window=window,
         gross_revenue=_comparison(current["gross_revenue"], prior["gross_revenue"]),
@@ -170,6 +176,11 @@ def run_sales_baseline(
         units=_comparison(current["units"], prior["units"]),
         dataset_artifact_id=str(dataset_reference["artifact_id"]),
         dataset_content_hash=actual_hash,
+        source_rows=int(profile.get("source_rows", dataset_reference.get("row_count", 0))),
+        included_rows=int(profile.get("included_rows", dataset_reference.get("row_count", 0))),
+        quarantined_rows=int(profile.get("quarantined_rows", 0)),
+        duplicate_rows=int(profile.get("duplicate_rows", 0)),
+        excluded_revenue_impact=float(profile.get("excluded_revenue_impact", 0.0)),
     )
 
 

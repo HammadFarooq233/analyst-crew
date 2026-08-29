@@ -24,6 +24,31 @@ def test_empty_valid_input_fails_clearly(tmp_path):
     with pytest.raises(ValueError, match="zero valid rows"):
         fetch_csv("sales_csv", path, artifact_dir=tmp_path / "artifacts")
 
+def test_damaged_rows_are_quarantined_with_accounting(tmp_path):
+    pytest.importorskip("pyarrow")
+    rows = [{"order_id": f"ok-{index}", "order_date": "2025-01-01", "product_id": "P", "product_name": "x", "category": "Office", "region": "N", "sales_channel": "web", "customer_segment": "consumer", "quantity": "2", "unit_price": "10", "discount_amount": "0", "returned_quantity": "0"} for index in range(200)]
+    rows += [dict(rows[0], order_id="bad", quantity="-1"), dict(rows[0], order_id="ok-1", unit_price="20")]
+    rows += [dict(rows[0], order_id="dup", unit_price="20")]
+    source = _write_rows(tmp_path / "sales.csv", rows)
+    artifact = fetch_csv("sales_csv", source, artifact_dir=tmp_path / "artifacts")
+    assert artifact.profile["source_rows"] == 203
+    assert artifact.profile["included_rows"] == 201
+    assert artifact.profile["quarantined_rows"] == 2
+    assert artifact.profile["duplicate_rows"] == 1
+
+def _write_rows(path, rows):
+    import csv
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CANONICAL_FIELDS)
+        writer.writeheader(); writer.writerows(rows)
+    return path
+
+def test_structurally_invalid_source_fails_required_data_source(tmp_path):
+    path = tmp_path / "bad.csv"
+    path.write_text("order_id,order_date\n1,2025-01-01\n")
+    with pytest.raises(ValueError, match="canonical fields"):
+        fetch_csv("sales_csv", path, artifact_dir=tmp_path / "artifacts")
+
 def test_fetcher_consumes_resolved_handoff_and_returns_state_reference(tmp_path):
     pytest.importorskip("pyarrow")
     source = generate_sales_csv(tmp_path / "sales.csv", rows=25_000)
