@@ -13,6 +13,8 @@ import config
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
+from analyst_crew.tools.fred import FRED_SERIES_ID
+
 # Every dimension breakdown partitions the same set of rows used for the
 # overall net revenue comparison, so the sum of a dimension's per-value
 # absolute_change values must equal the overall net_revenue.absolute_change
@@ -160,6 +162,57 @@ class TargetComparison(BaseModel):
     source_status: TargetSourceStatus
 
 
+NON_CAUSALITY_CAVEAT = (
+    "National CPI is contextual only and does not establish causation for any "
+    "product, category, region, channel, or segment result."
+)
+
+CPI_METHODOLOGY = (
+    "Nominal net-revenue change is the observed current-period net revenue "
+    "minus the observed prior-period net revenue, with no adjustment. The "
+    "approximate inflation-adjusted change deflates current-period net "
+    "revenue by the ratio of the prior-period to current-period CPI-U (All "
+    "Items, Not Seasonally Adjusted, FRED series CPIAUCNS) before comparing "
+    "against prior-period net revenue: adjusted_current_net_revenue = "
+    "current_net_revenue * (prior_cpi / current_cpi); "
+    "inflation_adjusted_change = adjusted_current_net_revenue - "
+    "prior_net_revenue. This is a national, all-items price-level "
+    "approximation — not a category-, region-, or product-specific deflator "
+    "— computed by fixed application arithmetic, never an Agent. "
+    + NON_CAUSALITY_CAVEAT
+)
+
+
+class CpiSourceStatus(BaseModel):
+    """Status of the optional FRED CPI enrichment. ``available`` means the
+    inflation-adjusted change below is trustworthy; any other status means
+    the required CSV-based Findings still completed, but the optional
+    inflation adjustment did not (see ``BaselineFindings.limitations``)."""
+
+    status: Literal["not_configured", "available", "unavailable", "invalid"]
+    detail: str | None = None
+
+
+class CpiAdjustment(BaseModel):
+    """Nominal vs. approximate inflation-adjusted net-revenue change for the
+    same comparable period used by the core sales analysis, sourced from a
+    catalogued FRED CPI series. Always carries a non-causality caveat: this
+    is national, contextual price-level information, never a causal
+    explanation for a dimensional sales result."""
+
+    series_id: str
+    source: str = "FRED (Federal Reserve Bank of St. Louis)"
+    nominal_change: float
+    inflation_adjusted_change: float | None
+    prior_cpi_value: float | None
+    current_cpi_value: float | None
+    prior_cpi_observation_dates: list[str] = []
+    current_cpi_observation_dates: list[str] = []
+    methodology: str = CPI_METHODOLOGY
+    non_causality_caveat: str = NON_CAUSALITY_CAVEAT
+    source_status: CpiSourceStatus
+
+
 class BaselineFindings(BaseModel):
     window: ComparisonWindow
     gross_revenue: MetricComparison
@@ -180,6 +233,7 @@ class BaselineFindings(BaseModel):
     material_changes: list[DimensionDriver] = []
     revenue_bridge: RevenueBridge | None = None
     target_comparison: TargetComparison | None = None
+    cpi_adjustment: CpiAdjustment | None = None
     limitations: list[str] = []
 
 
@@ -631,6 +685,86 @@ def _build_target_comparison(
     return TargetComparison(rows=rows, source_status=TargetSourceStatus(status="available")), []
 
 
+def _select_period_cpi(
+    observations: list[dict[str, Any]], start: date, end: date
+) -> tuple[float, list[str]] | None:
+    """Average the CPI observation(s) whose date falls within one comparison
+    period. FRED's monthly CPI observations are dated to the first of the
+    month, so a period covering that date yields exactly one observation in
+    the ordinary case; averaging only guards the rare case of more than one
+    observation falling in the window. Returns None when no observation
+    covers the period at all."""
+    candidates = [obs for obs in observations if start <= date.fromisoformat(obs["date"]) <= end]
+    if not candidates:
+        return None
+    value = sum(obs["value"] for obs in candidates) / len(candidates)
+    return value, sorted(obs["date"] for obs in candidates)
+
+
+def _build_cpi_adjustment(
+    window: ComparisonWindow,
+    net_revenue: MetricComparison,
+    cpi_data: dict[str, Any] | None,
+) -> tuple[CpiAdjustment | None, list[str]]:
+    """Approximate inflation-adjusted net-revenue change for the same
+    comparable period as the core sales analysis, from an already-retrieved
+    FRED CPI Fetcher Tool result (``analyst_crew.tools.fred.retrieve_cpi``).
+    This function performs no HTTP I/O itself, does pure deterministic
+    application arithmetic (never an Agent computation), and never raises
+    for an unavailable/invalid optional source — it records status and a
+    limitation instead, so the required CSV Findings are unaffected."""
+    if cpi_data is None:
+        return None, []
+
+    status = cpi_data.get("status", "not_configured")
+    detail = cpi_data.get("detail")
+    if status != "available":
+        limitation = f"FRED CPI inflation adjustment {status}: {detail or 'no further detail available'}"
+        return CpiAdjustment(
+            series_id=FRED_SERIES_ID,
+            nominal_change=net_revenue.absolute_change,
+            inflation_adjusted_change=None,
+            prior_cpi_value=None,
+            current_cpi_value=None,
+            source_status=CpiSourceStatus(status=status, detail=detail),
+        ), [limitation]
+
+    observations = cpi_data.get("observations", [])
+    prior_selection = _select_period_cpi(observations, window.prior_start, window.prior_end)
+    current_selection = _select_period_cpi(observations, window.current_start, window.current_end)
+    if prior_selection is None or current_selection is None or current_selection[0] == 0:
+        limitation = (
+            "FRED CPI observations do not cover the comparison window; "
+            "inflation-adjusted change unavailable."
+        )
+        return CpiAdjustment(
+            series_id=FRED_SERIES_ID,
+            nominal_change=net_revenue.absolute_change,
+            inflation_adjusted_change=None,
+            prior_cpi_value=None if prior_selection is None else prior_selection[0],
+            current_cpi_value=None if current_selection is None else current_selection[0],
+            prior_cpi_observation_dates=[] if prior_selection is None else prior_selection[1],
+            current_cpi_observation_dates=[] if current_selection is None else current_selection[1],
+            source_status=CpiSourceStatus(status="invalid", detail=limitation),
+        ), [limitation]
+
+    prior_cpi, prior_dates = prior_selection
+    current_cpi, current_dates = current_selection
+    adjusted_current_net_revenue = net_revenue.current * (prior_cpi / current_cpi)
+    inflation_adjusted_change = adjusted_current_net_revenue - net_revenue.prior
+
+    return CpiAdjustment(
+        series_id=FRED_SERIES_ID,
+        nominal_change=net_revenue.absolute_change,
+        inflation_adjusted_change=inflation_adjusted_change,
+        prior_cpi_value=prior_cpi,
+        current_cpi_value=current_cpi,
+        prior_cpi_observation_dates=prior_dates,
+        current_cpi_observation_dates=current_dates,
+        source_status=CpiSourceStatus(status="available"),
+    ), []
+
+
 def run_sales_baseline(
     dataset_reference: dict[str, Any],
     *,
@@ -638,6 +772,7 @@ def run_sales_baseline(
     analysis_parameters: dict[str, Any] | None = None,
     user_question: str = "",
     target_data: dict[str, Any] | None = None,
+    cpi_data: dict[str, Any] | None = None,
 ) -> BaselineFindings:
     """Execute only application-owned SQL templates against a verified artifact."""
     if dataset_reference.get("kind") != "Dataset Artifact":
@@ -697,6 +832,7 @@ def run_sales_baseline(
             net_revenue_change=net_revenue.absolute_change,
         )
         target_comparison, target_limitations = _build_target_comparison(connection, location, window, target_data)
+        cpi_adjustment, cpi_limitations = _build_cpi_adjustment(window, net_revenue, cpi_data)
     finally:
         connection.close()
 
@@ -725,7 +861,8 @@ def run_sales_baseline(
         material_changes=material_changes,
         revenue_bridge=revenue_bridge,
         target_comparison=target_comparison,
-        limitations=target_limitations,
+        cpi_adjustment=cpi_adjustment,
+        limitations=target_limitations + cpi_limitations,
     )
 
 
@@ -785,6 +922,7 @@ class AnalystAgent:
                         analysis_parameters=handoff.analysis_parameters,
                         user_question=handoff.user_question,
                         target_data=handoff.analysis_parameters.get("target_data"),
+                        cpi_data=handoff.analysis_parameters.get("cpi_data"),
                     )
                 except (TimeoutError, ConnectionError, TransientAnalystError):
                     if tool_attempt == 1:

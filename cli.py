@@ -55,7 +55,33 @@ def format_result(result) -> str:
         f"reasons {findings.quarantine_reasons}.\n"
         f"{format_material_changes(findings)}\n"
         f"{format_revenue_bridge(findings)}\n"
-        f"{format_target_comparison(findings)}"
+        f"{format_target_comparison(findings)}\n"
+        f"{format_cpi_adjustment(findings)}"
+    )
+
+
+def format_cpi_adjustment(findings: BaselineFindings) -> str:
+    """Render the optional FRED CPI inflation-adjustment context. When the
+    optional Data Source was not part of this run, this is silent — when it
+    was attempted but unavailable/invalid, the recorded status and the
+    matching limitation are both surfaced so the degradation is visible.
+    Nominal and inflation-adjusted changes are always labeled separately,
+    and the non-causality caveat is always shown alongside an available
+    adjustment."""
+    cpi = findings.cpi_adjustment
+    if cpi is None:
+        return "CPI inflation context: not part of this run."
+    status = cpi.source_status
+    if status.status != "available":
+        detail = f" ({status.detail})" if status.detail else ""
+        return f"CPI inflation context: {status.status}{detail}. Nominal net revenue change {cpi.nominal_change:+,.2f}."
+    return (
+        f"CPI inflation context (FRED series {cpi.series_id}): "
+        f"nominal net revenue change {cpi.nominal_change:+,.2f}; "
+        f"approximate inflation-adjusted change {cpi.inflation_adjusted_change:+,.2f} "
+        f"(prior CPI {cpi.prior_cpi_value:.3f} on {', '.join(cpi.prior_cpi_observation_dates)}, "
+        f"current CPI {cpi.current_cpi_value:.3f} on {', '.join(cpi.current_cpi_observation_dates)}). "
+        f"{cpi.non_causality_caveat}"
     )
 
 
@@ -186,9 +212,11 @@ def main() -> None:
     if args.sales_csv:
         from analyst_crew.tools.sales import sales_data_source
         from analyst_crew.tools.targets import sales_targets_data_source
+        from analyst_crew.tools.fred import fred_cpi_data_source
         invoke_config["configurable"]["data_sources"] = {
             **sales_data_source(args.sales_csv),
             **sales_targets_data_source(),
+            **fred_cpi_data_source(),
         }
         invoke_config["configurable"]["artifact_dir"] = args.artifact_dir
         invoke_config["configurable"]["analysis_parameters"] = {

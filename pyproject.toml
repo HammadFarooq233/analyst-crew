@@ -21,6 +21,7 @@ dependencies = [
     "psycopg>=3.3.4",
     "pyarrow>=18.0",
     "duckdb>=1.2.0",
+    "requests>=2.31",
 ]
 
 [tool.pytest.ini_options]

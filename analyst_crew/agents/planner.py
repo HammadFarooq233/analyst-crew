@@ -517,6 +517,20 @@ def analyst_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
 
             window = comparison_window(as_of_date)
             analysis_parameters["target_data"] = retrieve_targets(window.current_start, window.current_end)
+
+        cpi_source = catalog.get("cpi_fred") if isinstance(catalog, Mapping) else None
+        if cpi_source is not None and as_of_date:
+            # The optional FRED CPI Data Source is only ever retrieved here
+            # through the bounded-retry Fetcher Tool, and only for the exact
+            # comparable period the core CSV analysis already computes via
+            # the shared comparison_window() function — never reimplemented.
+            # A failure here never raises; it degrades to a recorded source
+            # status the Analyst Tool turns into a Finding and a limitation.
+            from analyst_crew.tools.analysis import comparison_window
+            from analyst_crew.tools.fred import retrieve_cpi
+
+            cpi_window = comparison_window(as_of_date)
+            analysis_parameters["cpi_data"] = retrieve_cpi(cpi_window.prior_start, cpi_window.current_end)
         handoff = crew.resolve_handoff(
             analyst_step,
             plan,
