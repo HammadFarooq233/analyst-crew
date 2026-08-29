@@ -14,6 +14,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
 from analyst_crew.tools.fred import FRED_SERIES_ID
+from analyst_crew.tools.retry import retry_with_backoff
 
 # Every dimension breakdown partitions the same set of rows used for the
 # overall net revenue comparison, so the sum of a dimension's per-value
@@ -867,13 +868,27 @@ def run_sales_baseline(
 
 
 class AnalystAgent:
-    """Validated Agent loop selecting narrow deterministic DuckDB Tools."""
+    """Validated Agent loop selecting narrow deterministic DuckDB Tools.
+
+    Contract-invalid Agent output (a disallowed Tool or an undeclared
+    Dataset Artifact) receives at most one repair retry, with the validation
+    error fed back into the next model call as feedback — never a second
+    call to the Planner. Transient Tool failures (network timeouts,
+    connection errors) receive a bounded retry via
+    ``analyst_crew.tools.retry.retry_with_backoff``; any other Tool failure
+    is never retried. ``validation_retries``/``tool_retries`` record how
+    many retries were actually used, for CrewState/tracing visibility.
+    """
 
     allowed_tools = frozenset({"DuckDB.sales_baseline"})
+    max_tool_attempts = 2
 
     def __init__(self, model: Any, tool: Any = run_sales_baseline):
         self.model = model
         self.tool = tool
+        self.validation_retries = 0
+        self.tool_retries = 0
+        self.last_validation_error: str | None = None
 
     def run(self, handoff: Any) -> BaselineFindings:
         dataset_references = {
@@ -907,24 +922,32 @@ class AnalystAgent:
                 if selected is None:
                     raise ValueError("undeclared Dataset Artifact")
             except ValueError as exc:
+                self.last_validation_error = str(exc)
                 if attempt:
                     raise
+                self.validation_retries += 1
                 feedback = f"Invalid Analyst request: {exc}. Select only an allowed Tool and artifact."
                 continue
-            for tool_attempt in range(2):
-                try:
-                    analysis_as_of = handoff.analysis_parameters.get("as_of_date")
-                    if not analysis_as_of:
-                        raise ValueError("Analyst requires an explicit as_of_date coverage boundary")
-                    return self.tool(
-                        selected,
-                        as_of_date=analysis_as_of,
-                        analysis_parameters=handoff.analysis_parameters,
-                        user_question=handoff.user_question,
-                        target_data=handoff.analysis_parameters.get("target_data"),
-                        cpi_data=handoff.analysis_parameters.get("cpi_data"),
-                    )
-                except (TimeoutError, ConnectionError, TransientAnalystError):
-                    if tool_attempt == 1:
-                        raise
+
+            def _call_tool(selected=selected) -> BaselineFindings:
+                analysis_as_of = handoff.analysis_parameters.get("as_of_date")
+                if not analysis_as_of:
+                    raise ValueError("Analyst requires an explicit as_of_date coverage boundary")
+                return self.tool(
+                    selected,
+                    as_of_date=analysis_as_of,
+                    analysis_parameters=handoff.analysis_parameters,
+                    user_question=handoff.user_question,
+                    target_data=handoff.analysis_parameters.get("target_data"),
+                    cpi_data=handoff.analysis_parameters.get("cpi_data"),
+                )
+
+            result, outcome = retry_with_backoff(
+                _call_tool,
+                is_transient=lambda exc: isinstance(exc, (TimeoutError, ConnectionError, TransientAnalystError)),
+                max_attempts=self.max_tool_attempts,
+                backoff_seconds=0.0,
+            )
+            self.tool_retries = outcome.retries
+            return result
         raise RuntimeError("Analyst request loop exhausted")

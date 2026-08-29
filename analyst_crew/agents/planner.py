@@ -462,13 +462,16 @@ def fetcher_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
     fetch_step = next((step for step in plan.steps if step.agent == "Fetcher"), None)
     if fetch_step is None:
         return {"current_step": "fetcher_node"}
+    agent = None
     try:
         crew = Crew(available_agents=configurable.get("available_agents", PHASE1_AGENTS), data_sources=catalog)
         handoff = crew.resolve_handoff(fetch_step, plan, state.get("artifacts", {}).get("datasets", {}))
         model = configurable.get("fetcher_model") or production_fetcher_model()
-        artifact = FetcherAgent(model).run(handoff, artifact_dir=configurable.get("artifact_dir", ".artifacts"))
+        agent = FetcherAgent(model)
+        artifact = agent.run(handoff, artifact_dir=configurable.get("artifact_dir", ".artifacts"))
         reference = artifact.as_reference()
         output_names = fetch_step.declared_artifacts or [fetch_step.expected_output]
+        retry_counts = {"validation_retries": agent.validation_retries, "tool_retries": agent.tool_retries}
         return {
             "current_step": "fetcher_node",
             "steps_completed": [fetch_step.step_id],
@@ -480,11 +483,31 @@ def fetcher_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
                 "step_outcomes": {fetch_step.step_id: {
                     "status": "completed",
                     "artifact_ids": [artifact.artifact_id],
+                    "retry_counts": retry_counts,
                 }},
+                "retry_counts": {fetch_step.step_id: retry_counts},
             },
         }
     except (OSError, RuntimeError, ValueError) as exc:
-        return {"current_step": "fetcher_node", "artifacts": {"fetcher_error": str(exc), "terminal_failure": {"agent": "Fetcher", "required": True, "status": "failed"}}}
+        retry_counts = {
+            "validation_retries": getattr(agent, "validation_retries", 0),
+            "tool_retries": getattr(agent, "tool_retries", 0),
+        }
+        return {
+            "current_step": "fetcher_node",
+            "artifacts": {
+                "fetcher_error": str(exc),
+                "retry_counts": {fetch_step.step_id: retry_counts},
+                "terminal_failure": {
+                    "agent": "Fetcher",
+                    "step_id": fetch_step.step_id,
+                    "required": True,
+                    "status": "failed",
+                    "error": str(exc),
+                    "retry_counts": retry_counts,
+                },
+            },
+        }
 
 
 def analyst_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
@@ -496,6 +519,7 @@ def analyst_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
     analyst_step = next((step for step in plan.steps if step.agent == "Analyst"), None)
     if analyst_step is None:
         return {"current_step": "analyst_node"}
+    agent = None
     try:
         crew = Crew(
             available_agents=configurable.get("available_agents", PHASE1_AGENTS),
@@ -538,7 +562,9 @@ def analyst_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
             analysis_parameters,
         )
         model = configurable.get("analyst_model") or production_analyst_model()
-        findings = AnalystAgent(model).run(handoff)
+        agent = AnalystAgent(model)
+        findings = agent.run(handoff)
+        retry_counts = {"validation_retries": agent.validation_retries, "tool_retries": agent.tool_retries}
         return {
             "current_step": "analyst_node",
             "steps_completed": [analyst_step.step_id],
@@ -554,16 +580,36 @@ def analyst_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
                         "status": "completed",
                         "artifact_ids": analyst_step.declared_artifacts or [analyst_step.expected_output],
                         "input_artifact_ids": [findings.dataset_artifact_id],
+                        "retry_counts": retry_counts,
                     },
+                },
+                "retry_counts": {
+                    **state.get("artifacts", {}).get("retry_counts", {}),
+                    analyst_step.step_id: retry_counts,
                 },
             },
         }
     except (OSError, RuntimeError, ValueError) as exc:
+        retry_counts = {
+            "validation_retries": getattr(agent, "validation_retries", 0),
+            "tool_retries": getattr(agent, "tool_retries", 0),
+        }
         return {
             "current_step": "analyst_node",
             "artifacts": {
                 "analyst_error": str(exc),
-                "terminal_failure": {"agent": "Analyst", "required": True, "status": "failed"},
+                "retry_counts": {
+                    **state.get("artifacts", {}).get("retry_counts", {}),
+                    analyst_step.step_id: retry_counts,
+                },
+                "terminal_failure": {
+                    "agent": "Analyst",
+                    "step_id": analyst_step.step_id,
+                    "required": True,
+                    "status": "failed",
+                    "error": str(exc),
+                    "retry_counts": retry_counts,
+                },
             },
         }
 
@@ -579,8 +625,15 @@ def get_langfuse_handler(
     return None
 
 
-def _create_langfuse_trace(session_id: str, user_id: str) -> None:
-    """Create a trace using the Langfuse v2 SDK matching the server deployment."""
+def _create_langfuse_trace(session_id: str, user_id: str, metadata: dict[str, Any] | None = None) -> None:
+    """Create a trace using the Langfuse v2 SDK matching the server deployment.
+
+    ``metadata`` carries this run's retry counts and terminal-failure
+    outcome (see ``_run_metadata``) so a retry or a terminal Step failure is
+    visible on the trace, even though there is no live per-node Langfuse
+    span wired up yet — this is populated from the same CrewState the CLI
+    and any other caller can already inspect after ``invoke()`` returns.
+    """
     host = os.getenv("LANGFUSE_HOST")
     public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
     secret_key = os.getenv("LANGFUSE_SECRET_KEY")
@@ -598,6 +651,7 @@ def _create_langfuse_trace(session_id: str, user_id: str) -> None:
             session_id=session_id,
             user_id=user_id,
             tags=["agent:Planner"],
+            metadata=metadata or {},
         )
         client.flush()
         # Langfuse v2 acknowledges ingestion before the trace is queryable.
@@ -645,6 +699,21 @@ def build_graph(checkpointer=None, store=None, runtime_config: dict | None = Non
     return graph.compile(checkpointer=checkpointer, store=store)
 
 
+def _run_metadata(result: CrewState) -> dict[str, Any]:
+    """Retry counts and terminal-outcome summary for tracing metadata —
+    populated from the same ``artifacts`` the CLI and any other caller can
+    already inspect after ``invoke()`` returns."""
+    artifacts = result.get("artifacts", {})
+    metadata: dict[str, Any] = {}
+    retry_counts = artifacts.get("retry_counts")
+    if retry_counts:
+        metadata["retry_counts"] = retry_counts
+    terminal_failure = artifacts.get("terminal_failure")
+    if terminal_failure:
+        metadata["terminal_failure"] = terminal_failure
+    return metadata
+
+
 def invoke(user_question: str, config: dict | None = None) -> CrewState:
     if config is None:
         config = {}
@@ -685,6 +754,6 @@ def invoke(user_question: str, config: dict | None = None) -> CrewState:
         return _do_invoke(state, config, None, InMemoryStore())
 
     result = _run()
-    _create_langfuse_trace(thread_id, user_id)
+    _create_langfuse_trace(thread_id, user_id, metadata=_run_metadata(result))
 
     return result

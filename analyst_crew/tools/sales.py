@@ -9,6 +9,8 @@ import config
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
+from analyst_crew.tools.retry import retry_with_backoff
+
 CANONICAL_FIELDS = ("order_id", "order_date", "product_id", "product_name", "category", "region", "sales_channel", "customer_segment", "quantity", "unit_price", "discount_amount", "returned_quantity")
 DEFAULT_SEED = 20260301
 
@@ -110,9 +112,27 @@ def fetcher_tool(handoff: Any, *, artifact_dir: str | Path = ".artifacts") -> Da
     return fetch_csv(source_id, reference["location"], artifact_dir=artifact_dir, generator_metadata=reference.get("generator"))
 
 class FetcherAgent:
-    """Small validated tool-calling seam; production models can implement invoke()."""
+    """Small validated tool-calling seam; production models can implement invoke().
+
+    Contract-invalid Agent output (a disallowed Tool or an undeclared Data
+    Source) receives at most one repair retry, with the validation error fed
+    back into the next model call as feedback — never a second call to the
+    Planner. Transient Tool failures (network timeouts, connection errors)
+    receive a bounded retry via ``analyst_crew.tools.retry.retry_with_backoff``;
+    any other Tool failure (e.g. a permission or schema error) is never
+    retried. ``validation_retries``/``tool_retries`` record how many retries
+    were actually used, for CrewState/tracing visibility.
+    """
     allowed_tools = frozenset({"CSV.read"})
-    def __init__(self, model: Any, tool: Any = fetcher_tool): self.model = model; self.tool = tool
+    max_tool_attempts = 2
+
+    def __init__(self, model: Any, tool: Any = fetcher_tool):
+        self.model = model
+        self.tool = tool
+        self.validation_retries = 0
+        self.tool_retries = 0
+        self.last_validation_error: str | None = None
+
     def run(self, handoff: Any, *, artifact_dir: str | Path = ".artifacts") -> DatasetArtifact:
         context = {"step_objective": handoff.step.objective, "user_question": handoff.user_question, "source_ids": handoff.source_ids, "source_descriptors": {key: value.reference for key, value in handoff.source_values.items()}, "allowed_tools": sorted(self.allowed_tools)}
         feedback = ""
@@ -123,12 +143,17 @@ class FetcherAgent:
                 if not isinstance(request, dict) or request.get("tool") not in self.allowed_tools: raise ValueError("disallowed Tool")
                 if request.get("source_id") not in handoff.source_ids: raise ValueError("undeclared Data Source")
             except ValueError as exc:
+                self.last_validation_error = str(exc)
                 if attempt: raise
+                self.validation_retries += 1
                 feedback = f"Invalid Fetcher request: {exc}. Return only CSV.read and a declared source_id."
                 continue
-            for tool_attempt in range(2):
-                try:
-                    return self.tool(handoff, artifact_dir=artifact_dir)
-                except (TimeoutError, ConnectionError, TransientFetcherError):
-                    if tool_attempt == 1: raise
+            result, outcome = retry_with_backoff(
+                lambda: self.tool(handoff, artifact_dir=artifact_dir),
+                is_transient=lambda exc: isinstance(exc, (TimeoutError, ConnectionError, TransientFetcherError)),
+                max_attempts=self.max_tool_attempts,
+                backoff_seconds=0.0,
+            )
+            self.tool_retries = outcome.retries
+            return result
         raise RuntimeError("Fetcher request loop exhausted")

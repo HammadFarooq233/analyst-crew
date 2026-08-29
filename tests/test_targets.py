@@ -185,6 +185,95 @@ def test_retrieve_targets_marks_invalid_on_malformed_rows(monkeypatch):
     assert result["rows"] == []
 
 
+def test_retrieve_targets_retries_transient_connection_failure_then_succeeds(monkeypatch):
+    import types
+
+    attempts = {"count": 0}
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def execute(self, sql, params):
+            pass
+
+        def fetchall(self):
+            return [(date(2025, 6, 1), "North", "Office", 10000.0, 150)]
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def cursor(self):
+            return FakeCursor()
+
+    def flaky_connect(*args, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise RuntimeError("connection to server at localhost failed: connection refused")
+        return FakeConnection()
+
+    fake_psycopg = types.SimpleNamespace(connect=flaky_connect)
+    monkeypatch.setitem(__import__("sys").modules, "psycopg", fake_psycopg)
+
+    result = retrieve_targets(
+        date(2025, 6, 1), date(2025, 6, 30),
+        conn_string="postgresql://analyst:analyst@localhost:5434/analyst_crew",
+        max_attempts=3, backoff_seconds=0,
+    )
+    assert result["status"] == "available"
+    assert attempts["count"] == 3
+
+
+def test_retrieve_targets_exhausted_transient_failure_is_unavailable(monkeypatch):
+    import types
+
+    attempts = {"count": 0}
+
+    def always_boom(*args, **kwargs):
+        attempts["count"] += 1
+        raise RuntimeError("connection to server at localhost failed: connection refused")
+
+    fake_psycopg = types.SimpleNamespace(connect=always_boom)
+    monkeypatch.setitem(__import__("sys").modules, "psycopg", fake_psycopg)
+
+    result = retrieve_targets(
+        date(2025, 6, 1), date(2025, 6, 30),
+        conn_string="postgresql://analyst:analyst@localhost:5434/analyst_crew",
+        max_attempts=3, backoff_seconds=0,
+    )
+    assert result["status"] == "unavailable"
+    assert attempts["count"] == 3
+
+
+def test_retrieve_targets_auth_failure_is_invalid_and_never_retried(monkeypatch):
+    import types
+
+    attempts = {"count": 0}
+
+    def bad_password(*args, **kwargs):
+        attempts["count"] += 1
+        raise RuntimeError('connection failed: FATAL: password authentication failed for user "analyst"')
+
+    fake_psycopg = types.SimpleNamespace(connect=bad_password)
+    monkeypatch.setitem(__import__("sys").modules, "psycopg", fake_psycopg)
+
+    result = retrieve_targets(
+        date(2025, 6, 1), date(2025, 6, 30),
+        conn_string="postgresql://analyst:analyst@localhost:5434/analyst_crew",
+        max_attempts=3, backoff_seconds=0,
+    )
+    assert result["status"] == "invalid"
+    assert attempts["count"] == 1
+    assert "analyst:analyst" not in result["detail"]
+
+
 def test_redact_strips_credentials_from_error_text():
     text = "connection to postgresql://analyst:analyst@localhost:5434/analyst_crew failed"
     redacted = _redact(text)

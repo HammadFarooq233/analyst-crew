@@ -16,7 +16,15 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+from analyst_crew.tools.retry import retry_with_backoff
+
 DEFAULT_TARGET_SEED = 20260301  # same deterministic-seed family as the synthetic sales generator
+
+# A small bounded retry budget for transient connection/query failures only
+# (matches analyst_crew.tools.fred's policy). Authentication/permission
+# failures never retry — see _AUTH_FAILURE_PATTERN below.
+DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_BACKOFF_SECONDS = 0.1
 
 # Six months aligned with the synthetic retailer's Jan-Jun 2025 order date range.
 TARGET_MONTHS = tuple((2025, month) for month in range(1, 7))
@@ -152,6 +160,15 @@ def seed_targets(conn_string: str, *, seed: int = DEFAULT_TARGET_SEED) -> int:
 
 _CREDENTIAL_URI_PATTERN = re.compile(r"//[^\s:@/]+:[^\s@/]+@")
 
+# Authentication/permission failures never retry — retrying a bad password
+# or missing grant just repeats a failure that will never succeed. Anything
+# else (connection refused, timeout, transient network error) is treated as
+# transient and gets a bounded retry with backoff.
+_AUTH_FAILURE_PATTERN = re.compile(
+    r"password authentication failed|permission denied|authentication failed|role .* does not exist",
+    re.IGNORECASE,
+)
+
 
 def _redact(text: str) -> str:
     """Strip a `user:password@` credential shape from any error text before
@@ -159,11 +176,17 @@ def _redact(text: str) -> str:
     return _CREDENTIAL_URI_PATTERN.sub("//***:***@", text)
 
 
+def _is_auth_failure(exc: BaseException) -> bool:
+    return bool(_AUTH_FAILURE_PATTERN.search(str(exc)))
+
+
 def retrieve_targets(
     window_current_start: date,
     window_current_end: date,
     *,
     conn_string: str | None = None,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    backoff_seconds: float = DEFAULT_BACKOFF_SECONDS,
 ) -> dict[str, Any]:
     """Read-only Postgres Fetcher Tool.
 
@@ -175,6 +198,12 @@ def retrieve_targets(
     Returns a plain dict (not raising) so optional-source failures degrade
     gracefully: ``{"status": "available" | "unavailable" | "invalid",
     "detail": str | None, "rows": [...]}``.
+
+    Transient connection/query failures (timeouts, connection refused,
+    network errors) receive up to ``max_attempts`` tries with a short
+    exponential backoff (``analyst_crew.tools.retry.retry_with_backoff``).
+    Authentication/permission failures never retry and are reported as
+    ``invalid`` immediately.
     """
     if _SELECT_TARGETS_SQL.strip().upper().split(None, 1)[0] != "SELECT":
         # Defense in depth: the query text above is a fixed module constant,
@@ -192,13 +221,24 @@ def retrieve_targets(
         return {"status": "unavailable", "detail": _redact(f"psycopg is not installed: {exc}"), "rows": []}
 
     target_month = date(window_current_start.year, window_current_start.month, 1)
-    try:
+
+    def _query() -> list[Any]:
         with psycopg.connect(resolved_conn_string, connect_timeout=5) as conn:
             with conn.cursor() as cur:
                 cur.execute(_SELECT_TARGETS_SQL, (target_month,))
-                fetched = cur.fetchall()
-    except Exception as exc:  # noqa: BLE001 — any connection/query failure degrades this optional source
-        return {"status": "unavailable", "detail": _redact(f"Postgres target query failed: {exc}"), "rows": []}
+                return cur.fetchall()
+
+    try:
+        fetched, _outcome = retry_with_backoff(
+            _query,
+            is_transient=lambda exc: not _is_auth_failure(exc),
+            max_attempts=max_attempts,
+            backoff_seconds=backoff_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001 — any exhausted connection/query failure degrades this optional source
+        detail = _redact(f"Postgres target query failed: {exc}")
+        status = "invalid" if _is_auth_failure(exc) else "unavailable"
+        return {"status": status, "detail": detail, "rows": []}
 
     try:
         rows = [

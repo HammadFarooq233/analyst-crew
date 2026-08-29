@@ -27,7 +27,37 @@ def format_plan(result) -> str:
     return "\n".join(lines)
 
 
+def format_terminal_failure(result) -> str:
+    """Concise, human-readable summary of a terminal Step failure. Full
+    diagnostics (retry counts, the original error, which Step/Agent failed,
+    and the original Plan) remain on the returned CrewState/``artifacts``
+    dict for programmatic inspection — this is deliberately just the
+    one-line summary printed to the user."""
+    failure = result.get("artifacts", {}).get("terminal_failure")
+    if failure is None:
+        return ""
+    agent = failure.get("agent", "unknown Agent")
+    step_id = failure.get("step_id")
+    step_note = f" (Step '{step_id}')" if step_id else ""
+    retry_counts = failure.get("retry_counts") or {}
+    retries_note = (
+        f" after {retry_counts.get('validation_retries', 0)} validation "
+        f"retr{'y' if retry_counts.get('validation_retries', 0) == 1 else 'ies'} and "
+        f"{retry_counts.get('tool_retries', 0)} tool retr{'y' if retry_counts.get('tool_retries', 0) == 1 else 'ies'}"
+        if retry_counts else ""
+    )
+    error = failure.get("error", "unknown error")
+    return (
+        f"Error: {agent}{step_note} failed terminally{retries_note}: {error}\n"
+        "The original Plan and full diagnostics remain available in the returned state."
+    )
+
+
 def format_result(result) -> str:
+    terminal_failure = result.get("artifacts", {}).get("terminal_failure")
+    if terminal_failure is not None:
+        return format_terminal_failure(result)
+
     findings = result.get("artifacts", {}).get("findings")
     if findings is None:
         return format_plan(result)
@@ -230,6 +260,10 @@ def main() -> None:
         sys.exit(1)
 
     print(format_result(result))
+
+    artifacts = result.get("artifacts", {})
+    if artifacts.get("terminal_failure") is not None or artifacts.get("plan_error") is not None:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
