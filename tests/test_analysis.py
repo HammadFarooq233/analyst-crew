@@ -209,6 +209,21 @@ def test_full_crew_records_handoffs_outcomes_and_deterministic_findings(tmp_path
         open(result["artifacts"]["datasets"][findings.dataset_artifact_id]["location"], "rb").read()
     ).hexdigest()
 
+    # The revenue bridge is exposed through the same validated Findings the
+    # full Crew invocation produces, not computed separately.
+    bridge = findings.revenue_bridge
+    assert bridge is not None
+    assert bridge.continuing_product_count == 1
+    assert bridge.new_product_count == 0
+    assert bridge.discontinued_product_count == 0
+    assert bridge.volume_effect == pytest.approx(80 / 3, abs=0.001)
+    assert bridge.price_effect == pytest.approx(-4.0, abs=0.001)
+    assert bridge.interaction_effect == pytest.approx(-8 / 3, abs=0.001)
+    assert bridge.discount_effect == pytest.approx(-4.0)
+    assert bridge.return_effect == pytest.approx(10.0)
+    assert bridge.total_effect == pytest.approx(findings.net_revenue.absolute_change, abs=0.01)
+    assert bridge.reconciliation_gap <= 0.01
+
 
 def test_analyst_rejects_model_sql_and_repairs_invalid_request():
     handoff = type("Handoff", (), {
@@ -556,6 +571,271 @@ def test_cli_material_changes_section_highlights_only_material_drivers():
     assert "Material Changes" in rendered
     assert "product=Monitor" in rendered
     assert "product=Desk Lamp" not in rendered
+
+
+def _bridge_row(order_id, order_date, product_id, quantity, unit_price, discount=0, returned=0, product_name="Product"):
+    return _dim_row(
+        order_id, order_date, product_id, product_name, "Category", "North", "web", "consumer",
+        quantity, unit_price, discount, returned,
+    )
+
+
+def test_revenue_bridge_isolates_pure_price_effect(tmp_path):
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+    from analyst_crew.tools.sales import fetch_csv
+
+    # Same quantity (5) both periods, price rises from 10 to 12: pure price effect.
+    source = _write_sales(tmp_path / "sales.csv", [
+        _bridge_row("M1", "2025-05-01", "P100", 5, 10),
+        _bridge_row("J1", "2025-06-01", "P100", 5, 12),
+    ])
+    artifact = fetch_csv("sales_csv", source, artifact_dir=tmp_path / "artifacts")
+    findings = run_sales_baseline(artifact.as_reference(), as_of_date=date(2025, 6, 30))
+
+    bridge = findings.revenue_bridge
+    assert bridge.volume_effect == pytest.approx(0.0)
+    assert bridge.price_effect == pytest.approx(10.0)
+    assert bridge.interaction_effect == pytest.approx(0.0)
+    assert bridge.discount_effect == pytest.approx(0.0)
+    assert bridge.return_effect == pytest.approx(0.0)
+    assert bridge.new_product_effect == pytest.approx(0.0)
+    assert bridge.discontinued_product_effect == pytest.approx(0.0)
+    assert bridge.continuing_product_count == 1
+    assert bridge.new_product_count == 0
+    assert bridge.discontinued_product_count == 0
+
+
+def test_revenue_bridge_isolates_pure_volume_effect(tmp_path):
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+    from analyst_crew.tools.sales import fetch_csv
+
+    # Same price (10) both periods, quantity rises from 5 to 8: pure volume effect.
+    source = _write_sales(tmp_path / "sales.csv", [
+        _bridge_row("M1", "2025-05-01", "P100", 5, 10),
+        _bridge_row("J1", "2025-06-01", "P100", 8, 10),
+    ])
+    artifact = fetch_csv("sales_csv", source, artifact_dir=tmp_path / "artifacts")
+    findings = run_sales_baseline(artifact.as_reference(), as_of_date=date(2025, 6, 30))
+
+    bridge = findings.revenue_bridge
+    assert bridge.volume_effect == pytest.approx(30.0)
+    assert bridge.price_effect == pytest.approx(0.0)
+    assert bridge.interaction_effect == pytest.approx(0.0)
+
+
+def test_revenue_bridge_computes_price_volume_interaction(tmp_path):
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+    from analyst_crew.tools.sales import fetch_csv
+
+    # Quantity 5 -> 8, price 10 -> 12: both volume and price move, so a distinct
+    # interaction term is required to make the three effects sum exactly to the
+    # gross-revenue change (96 - 50 = 46).
+    source = _write_sales(tmp_path / "sales.csv", [
+        _bridge_row("M1", "2025-05-01", "P100", 5, 10),
+        _bridge_row("J1", "2025-06-01", "P100", 8, 12),
+    ])
+    artifact = fetch_csv("sales_csv", source, artifact_dir=tmp_path / "artifacts")
+    findings = run_sales_baseline(artifact.as_reference(), as_of_date=date(2025, 6, 30))
+
+    bridge = findings.revenue_bridge
+    assert bridge.volume_effect == pytest.approx(30.0)
+    assert bridge.price_effect == pytest.approx(10.0)
+    assert bridge.interaction_effect == pytest.approx(6.0)
+    assert bridge.volume_effect + bridge.price_effect + bridge.interaction_effect == pytest.approx(46.0)
+
+
+def test_revenue_bridge_isolates_discount_effect(tmp_path):
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+    from analyst_crew.tools.sales import fetch_csv
+
+    # Same quantity and price both periods; only the discount amount changes.
+    source = _write_sales(tmp_path / "sales.csv", [
+        _bridge_row("M1", "2025-05-01", "P100", 5, 10, discount=5),
+        _bridge_row("J1", "2025-06-01", "P100", 5, 10, discount=15),
+    ])
+    artifact = fetch_csv("sales_csv", source, artifact_dir=tmp_path / "artifacts")
+    findings = run_sales_baseline(artifact.as_reference(), as_of_date=date(2025, 6, 30))
+
+    bridge = findings.revenue_bridge
+    assert bridge.volume_effect == pytest.approx(0.0)
+    assert bridge.price_effect == pytest.approx(0.0)
+    assert bridge.interaction_effect == pytest.approx(0.0)
+    assert bridge.discount_effect == pytest.approx(-10.0)
+    assert bridge.return_effect == pytest.approx(0.0)
+    assert bridge.total_effect == pytest.approx(findings.net_revenue.absolute_change)
+
+
+def test_revenue_bridge_isolates_return_effect(tmp_path):
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+    from analyst_crew.tools.sales import fetch_csv
+
+    # Same quantity and price both periods; only the returned quantity changes.
+    source = _write_sales(tmp_path / "sales.csv", [
+        _bridge_row("M1", "2025-05-01", "P100", 5, 10, returned=1),
+        _bridge_row("J1", "2025-06-01", "P100", 5, 10, returned=2),
+    ])
+    artifact = fetch_csv("sales_csv", source, artifact_dir=tmp_path / "artifacts")
+    findings = run_sales_baseline(artifact.as_reference(), as_of_date=date(2025, 6, 30))
+
+    bridge = findings.revenue_bridge
+    assert bridge.volume_effect == pytest.approx(0.0)
+    assert bridge.price_effect == pytest.approx(0.0)
+    assert bridge.interaction_effect == pytest.approx(0.0)
+    assert bridge.discount_effect == pytest.approx(0.0)
+    # Returned value goes from 1*10=10 to 2*10=20, a 10 increase, so a -10 effect.
+    assert bridge.return_effect == pytest.approx(-10.0)
+
+
+def test_revenue_bridge_routes_launched_product_to_new_product_effect(tmp_path):
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+    from analyst_crew.tools.sales import fetch_csv
+
+    # P100 continues unchanged; P200 only appears in June (no May baseline at all).
+    source = _write_sales(tmp_path / "sales.csv", [
+        _bridge_row("M1", "2025-05-01", "P100", 5, 10),
+        _bridge_row("J1", "2025-06-01", "P100", 5, 10),
+        _bridge_row("J2", "2025-06-05", "P200", 4, 25),
+    ])
+    artifact = fetch_csv("sales_csv", source, artifact_dir=tmp_path / "artifacts")
+    findings = run_sales_baseline(artifact.as_reference(), as_of_date=date(2025, 6, 30))
+
+    bridge = findings.revenue_bridge
+    # P200 must not be forced through the price/volume/interaction formulas —
+    # continuing-product effects come from P100 alone (all zero, since unchanged).
+    assert bridge.volume_effect == pytest.approx(0.0)
+    assert bridge.price_effect == pytest.approx(0.0)
+    assert bridge.interaction_effect == pytest.approx(0.0)
+    assert bridge.new_product_effect == pytest.approx(100.0)  # 4 * 25
+    assert bridge.discontinued_product_effect == pytest.approx(0.0)
+    assert bridge.new_product_count == 1
+    assert bridge.continuing_product_count == 1
+    assert bridge.discontinued_product_count == 0
+
+
+def test_revenue_bridge_routes_discontinued_product_to_discontinued_effect(tmp_path):
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+    from analyst_crew.tools.sales import fetch_csv
+
+    # P100 continues unchanged; P300 only appears in May (discontinued by June).
+    source = _write_sales(tmp_path / "sales.csv", [
+        _bridge_row("M1", "2025-05-01", "P100", 5, 10),
+        _bridge_row("M2", "2025-05-05", "P300", 3, 20),
+        _bridge_row("J1", "2025-06-01", "P100", 5, 10),
+    ])
+    artifact = fetch_csv("sales_csv", source, artifact_dir=tmp_path / "artifacts")
+    findings = run_sales_baseline(artifact.as_reference(), as_of_date=date(2025, 6, 30))
+
+    bridge = findings.revenue_bridge
+    assert bridge.volume_effect == pytest.approx(0.0)
+    assert bridge.price_effect == pytest.approx(0.0)
+    assert bridge.interaction_effect == pytest.approx(0.0)
+    assert bridge.new_product_effect == pytest.approx(0.0)
+    assert bridge.discontinued_product_effect == pytest.approx(-60.0)  # -(3 * 20)
+    assert bridge.discontinued_product_count == 1
+    assert bridge.continuing_product_count == 1
+    assert bridge.new_product_count == 0
+
+
+def test_revenue_bridge_reconciles_to_net_revenue_change_with_mixed_scenario(tmp_path):
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+    from analyst_crew.tools.sales import fetch_csv
+
+    source = _write_sales(tmp_path / "sales.csv", [
+        # Continuing product with price, volume, discount, and return movement.
+        _bridge_row("M1", "2025-05-01", "P100", 5, 10, discount=5, returned=1),
+        _bridge_row("J1", "2025-06-01", "P100", 8, 12, discount=15, returned=2),
+        # Launched in June.
+        _bridge_row("J2", "2025-06-05", "P200", 4, 25),
+        # Discontinued after May.
+        _bridge_row("M2", "2025-05-05", "P300", 3, 20),
+    ])
+    artifact = fetch_csv("sales_csv", source, artifact_dir=tmp_path / "artifacts")
+    findings = run_sales_baseline(artifact.as_reference(), as_of_date=date(2025, 6, 30))
+
+    bridge = findings.revenue_bridge
+    total = (
+        bridge.volume_effect + bridge.price_effect + bridge.interaction_effect
+        + bridge.discount_effect + bridge.return_effect
+        + bridge.new_product_effect + bridge.discontinued_product_effect
+    )
+    assert total == pytest.approx(findings.net_revenue.absolute_change, abs=0.01)
+    assert bridge.total_effect == pytest.approx(findings.net_revenue.absolute_change, abs=0.01)
+    assert bridge.reconciliation_gap <= 0.01
+    assert bridge.continuing_product_count == 1
+    assert bridge.new_product_count == 1
+    assert bridge.discontinued_product_count == 1
+    assert bridge.methodology
+    assert bridge.limitations
+    assert bridge.source_references
+    assert bridge.dataset_artifact_id == findings.dataset_artifact_id
+
+
+def test_revenue_bridge_aggregation_id_is_deterministic(tmp_path):
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+    from analyst_crew.tools.sales import fetch_csv
+
+    artifact = fetch_csv("sales_csv", _dimension_scenario_source(tmp_path), artifact_dir=tmp_path / "artifacts")
+    first = run_sales_baseline(artifact.as_reference(), as_of_date=date(2025, 6, 30))
+    second = run_sales_baseline(artifact.as_reference(), as_of_date=date(2025, 6, 30))
+
+    assert first.revenue_bridge.aggregation_id == second.revenue_bridge.aggregation_id
+    assert len(first.revenue_bridge.aggregation_id) == 16
+
+
+def test_cli_renders_revenue_bridge_concisely():
+    from cli import format_result
+    from analyst_crew.tools.analysis import RevenueBridge
+
+    findings = BaselineFindings(
+        window=ComparisonWindow(
+            mode="complete_month",
+            current_start=date(2025, 6, 1),
+            current_end=date(2025, 6, 30),
+            prior_start=date(2025, 5, 1),
+            prior_end=date(2025, 5, 31),
+        ),
+        gross_revenue=MetricComparison(current=60, prior=40, absolute_change=20, percent_change=50),
+        net_revenue=MetricComparison(current=45, prior=19, absolute_change=26, percent_change=136.8421),
+        orders=MetricComparison(current=2, prior=2, absolute_change=0, percent_change=0),
+        units=MetricComparison(current=5, prior=3, absolute_change=2, percent_change=66.6667),
+        dataset_artifact_id="dataset-1",
+        dataset_content_hash="abc123",
+        revenue_bridge=RevenueBridge(
+            volume_effect=26.6667,
+            price_effect=-4.0,
+            interaction_effect=-2.6667,
+            discount_effect=-4.0,
+            return_effect=10.0,
+            new_product_effect=0.0,
+            discontinued_product_effect=0.0,
+            total_effect=26.0,
+            reconciliation_gap=0.0,
+            continuing_product_count=1,
+            new_product_count=0,
+            discontinued_product_count=0,
+            source_references=["Dataset Artifact dataset-1"],
+            dataset_artifact_id="dataset-1",
+            aggregation_id="a" * 16,
+        ),
+    )
+
+    rendered = format_result({"artifacts": {"findings": findings}})
+    assert "Revenue bridge" in rendered
+    assert "volume: +26.67" in rendered
+    assert "price: -4.00" in rendered
+    assert "price-volume interaction: -2.67" in rendered
+    assert "discount: -4.00" in rendered
+    assert "return: +10.00" in rendered
+    assert "total: +26.00" in rendered
 
 
 def test_cli_material_changes_section_states_when_nothing_is_material():

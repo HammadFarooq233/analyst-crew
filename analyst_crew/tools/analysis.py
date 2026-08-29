@@ -75,6 +75,60 @@ class DimensionDriver(BaseModel):
     dataset_artifact_id: str
 
 
+BRIDGE_METHODOLOGY = (
+    "For products present in both the current and prior period ('continuing' "
+    "products), gross-revenue change decomposes into three exact components using "
+    "each product's period unit price p and quantity q: volume effect "
+    "(q_current - q_prior) * p_prior; price effect (p_current - p_prior) * "
+    "q_prior; and price-volume interaction (p_current - p_prior) * (q_current - "
+    "q_prior). These three always sum exactly to the continuing-product gross-"
+    "revenue change. Discount effect is the negative of the change in total "
+    "discount amount, and return effect is the negative of the change in total "
+    "return value, so an increase in discounting or returns reduces net revenue. "
+    "New-product effect is the full current-period net revenue of products with "
+    "no valid prior-period baseline; discontinued-product effect is the negative "
+    "of the full prior-period net revenue of products with no current-period "
+    "presence. All seven effects sum to the observed net-revenue change within a "
+    "documented rounding tolerance. This is a descriptive decomposition of "
+    "observed revenue, not a causal explanation of why volume or price moved."
+)
+
+BRIDGE_LIMITATIONS = (
+    "Unit price is a product-period weighted average (period gross revenue "
+    "divided by period quantity), so it does not capture within-period price "
+    "variation across individual orders of the same product.",
+    "Product identity is determined at the product_id grain only; a product "
+    "renamed or re-identified between periods appears as a discontinuation plus "
+    "a launch rather than as a continuing product.",
+    "The bridge is a descriptive decomposition, not a causal analysis of why "
+    "volume, price, discounting, or returns changed.",
+)
+
+
+class RevenueBridge(BaseModel):
+    """Auditable decomposition of the net-revenue change into distinct,
+    non-causal effects that reconcile exactly (within ``RECONCILIATION_TOLERANCE``)
+    to ``BaselineFindings.net_revenue.absolute_change``."""
+
+    volume_effect: float
+    price_effect: float
+    interaction_effect: float
+    discount_effect: float
+    return_effect: float
+    new_product_effect: float
+    discontinued_product_effect: float
+    total_effect: float
+    reconciliation_gap: float
+    continuing_product_count: int
+    new_product_count: int
+    discontinued_product_count: int
+    methodology: str = BRIDGE_METHODOLOGY
+    limitations: list[str] = list(BRIDGE_LIMITATIONS)
+    source_references: list[str]
+    dataset_artifact_id: str
+    aggregation_id: str
+
+
 class BaselineFindings(BaseModel):
     window: ComparisonWindow
     gross_revenue: MetricComparison
@@ -93,6 +147,7 @@ class BaselineFindings(BaseModel):
     materiality: MaterialityThresholds = MaterialityThresholds()
     dimensions: dict[str, list[DimensionDriver]] = {}
     material_changes: list[DimensionDriver] = []
+    revenue_bridge: RevenueBridge | None = None
 
 
 class AnalystToolRequest(BaseModel):
@@ -163,6 +218,24 @@ SELECT
 FROM read_parquet(?)
 WHERE order_date BETWEEN ? AND ?
 GROUP BY {column}
+"""
+
+
+_PRODUCT_PERIOD_SQL = """
+SELECT
+    product_id AS product_key,
+    coalesce(sum(quantity), 0)::DOUBLE AS quantity,
+    coalesce(sum(quantity * unit_price), 0)::DOUBLE AS gross_revenue,
+    coalesce(sum(discount_amount), 0)::DOUBLE AS discount_amount,
+    coalesce(sum(returned_quantity * unit_price), 0)::DOUBLE AS return_value,
+    coalesce(sum(
+        quantity * unit_price
+        - discount_amount
+        - returned_quantity * unit_price
+    ), 0)::DOUBLE AS net_revenue
+FROM read_parquet(?)
+WHERE order_date BETWEEN ? AND ?
+GROUP BY product_id
 """
 
 
@@ -332,6 +405,99 @@ def _dimension_breakdown(
     return breakdown
 
 
+def _bridge_aggregation_id(dataset_content_hash: str, window: ComparisonWindow) -> str:
+    payload = "|".join((
+        dataset_content_hash, window.mode,
+        window.current_start.isoformat(), window.current_end.isoformat(),
+        window.prior_start.isoformat(), window.prior_end.isoformat(),
+        "revenue_bridge",
+    ))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _product_period_totals(connection: Any, location: Path, start: date, end: date) -> dict[str, dict[str, float]]:
+    rows = connection.execute(_PRODUCT_PERIOD_SQL, [str(location), start, end]).fetchall()
+    columns = ("quantity", "gross_revenue", "discount_amount", "return_value", "net_revenue")
+    return {str(row[0]): dict(zip(columns, row[1:], strict=True)) for row in rows}
+
+
+def _revenue_bridge(
+    connection: Any,
+    location: Path,
+    window: ComparisonWindow,
+    *,
+    dataset_artifact_id: str,
+    dataset_content_hash: str,
+    net_revenue_change: float,
+) -> RevenueBridge:
+    """Decompose the net-revenue change using only application-owned DuckDB
+    aggregation; the effect formulas themselves are fixed Python arithmetic
+    over those verified totals, never model-authored SQL or attribution."""
+    current = _product_period_totals(connection, location, window.current_start, window.current_end)
+    prior = _product_period_totals(connection, location, window.prior_start, window.prior_end)
+
+    # A product missing from a period's aggregation never had a valid quantity
+    # there (quarantine already rejects non-positive quantities), so presence
+    # in the dict is exactly "has a valid baseline in that period" — continuing
+    # products are never forced through the price/volume formulas otherwise.
+    continuing_products = set(current) & set(prior)
+    new_products = set(current) - set(prior)
+    discontinued_products = set(prior) - set(current)
+
+    volume_effect = 0.0
+    price_effect = 0.0
+    interaction_effect = 0.0
+    discount_effect = 0.0
+    return_effect = 0.0
+    for product_id in continuing_products:
+        current_totals, prior_totals = current[product_id], prior[product_id]
+        quantity_current, quantity_prior = current_totals["quantity"], prior_totals["quantity"]
+        price_current = current_totals["gross_revenue"] / quantity_current if quantity_current else 0.0
+        price_prior = prior_totals["gross_revenue"] / quantity_prior if quantity_prior else 0.0
+
+        volume_effect += (quantity_current - quantity_prior) * price_prior
+        price_effect += (price_current - price_prior) * quantity_prior
+        interaction_effect += (price_current - price_prior) * (quantity_current - quantity_prior)
+        discount_effect += -(current_totals["discount_amount"] - prior_totals["discount_amount"])
+        return_effect += -(current_totals["return_value"] - prior_totals["return_value"])
+
+    new_product_effect = sum(current[product_id]["net_revenue"] for product_id in new_products)
+    discontinued_product_effect = -sum(prior[product_id]["net_revenue"] for product_id in discontinued_products)
+
+    total_effect = (
+        volume_effect + price_effect + interaction_effect
+        + discount_effect + return_effect
+        + new_product_effect + discontinued_product_effect
+    )
+    reconciliation_gap = abs(total_effect - net_revenue_change)
+    if reconciliation_gap > RECONCILIATION_TOLERANCE:
+        raise ValueError(
+            "Revenue bridge effects do not reconcile with the overall net revenue "
+            f"change (gap {reconciliation_gap:.4f} exceeds tolerance {RECONCILIATION_TOLERANCE})"
+        )
+
+    return RevenueBridge(
+        volume_effect=volume_effect,
+        price_effect=price_effect,
+        interaction_effect=interaction_effect,
+        discount_effect=discount_effect,
+        return_effect=return_effect,
+        new_product_effect=new_product_effect,
+        discontinued_product_effect=discontinued_product_effect,
+        total_effect=total_effect,
+        reconciliation_gap=reconciliation_gap,
+        continuing_product_count=len(continuing_products),
+        new_product_count=len(new_products),
+        discontinued_product_count=len(discontinued_products),
+        source_references=[
+            f"Dataset Artifact {dataset_artifact_id} (content hash {dataset_content_hash[:12]})",
+            "DuckDB.sales_baseline product-period aggregation (application-owned SQL)",
+        ],
+        dataset_artifact_id=dataset_artifact_id,
+        aggregation_id=_bridge_aggregation_id(dataset_content_hash, window),
+    )
+
+
 def run_sales_baseline(
     dataset_reference: dict[str, Any],
     *,
@@ -388,6 +554,14 @@ def run_sales_baseline(
             thresholds=thresholds,
             prior_total_net_revenue=prior["net_revenue"],
         )
+        revenue_bridge = _revenue_bridge(
+            connection,
+            location,
+            window,
+            dataset_artifact_id=artifact_id,
+            dataset_content_hash=actual_hash,
+            net_revenue_change=net_revenue.absolute_change,
+        )
     finally:
         connection.close()
 
@@ -414,6 +588,7 @@ def run_sales_baseline(
         materiality=thresholds,
         dimensions=dimensions,
         material_changes=material_changes,
+        revenue_bridge=revenue_bridge,
     )
 
 

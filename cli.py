@@ -53,8 +53,30 @@ def format_result(result) -> str:
         f"{findings.quarantined_rows} quarantined, {findings.duplicate_rows} duplicates excluded; "
         f"excluded gross revenue impact {findings.excluded_revenue_impact:,.2f}; "
         f"reasons {findings.quarantine_reasons}.\n"
-        f"{format_material_changes(findings)}"
+        f"{format_material_changes(findings)}\n"
+        f"{format_revenue_bridge(findings)}"
     )
+
+
+def format_revenue_bridge(findings: BaselineFindings) -> str:
+    """Render the net-revenue bridge as a concise, auditable line per effect —
+    Priya sees how the components reconcile rather than a single number."""
+    bridge = findings.revenue_bridge
+    if bridge is None:
+        return "Revenue bridge: unavailable."
+    lines = [
+        "Revenue bridge (reconciles to net revenue change "
+        f"{findings.net_revenue.absolute_change:+,.2f}, gap {bridge.reconciliation_gap:.4f}):",
+        f"  - volume: {bridge.volume_effect:+,.2f}",
+        f"  - price: {bridge.price_effect:+,.2f}",
+        f"  - price-volume interaction: {bridge.interaction_effect:+,.2f}",
+        f"  - discount: {bridge.discount_effect:+,.2f}",
+        f"  - return: {bridge.return_effect:+,.2f}",
+        f"  - new products ({bridge.new_product_count}): {bridge.new_product_effect:+,.2f}",
+        f"  - discontinued products ({bridge.discontinued_product_count}): {bridge.discontinued_product_effect:+,.2f}",
+        f"  - total: {bridge.total_effect:+,.2f} (continuing products: {bridge.continuing_product_count})",
+    ]
+    return "\n".join(lines)
 
 
 def format_material_changes(findings: BaselineFindings) -> str:
