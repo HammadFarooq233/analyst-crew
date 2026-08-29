@@ -501,11 +501,27 @@ def analyst_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
             available_agents=configurable.get("available_agents", PHASE1_AGENTS),
             data_sources=configurable.get("data_sources", {}),
         )
+        analysis_parameters = dict(configurable.get("analysis_parameters", {}))
+        catalog = configurable.get("data_sources", {})
+        target_source = catalog.get("sales_targets_postgres") if isinstance(catalog, Mapping) else None
+        as_of_date = analysis_parameters.get("as_of_date")
+        if target_source is not None and as_of_date:
+            # The optional Postgres target Data Source is only ever
+            # retrieved here through the read-only Fetcher Tool, and only
+            # for the exact comparable period the core CSV analysis already
+            # computes via the shared comparison_window() function — never
+            # reimplemented. A failure here never raises; it degrades to a
+            # recorded source status the Analyst Tool turns into a Finding.
+            from analyst_crew.tools.analysis import comparison_window
+            from analyst_crew.tools.targets import retrieve_targets
+
+            window = comparison_window(as_of_date)
+            analysis_parameters["target_data"] = retrieve_targets(window.current_start, window.current_end)
         handoff = crew.resolve_handoff(
             analyst_step,
             plan,
             state.get("artifacts", {}).get("step_outputs", {}),
-            configurable.get("analysis_parameters", {}),
+            analysis_parameters,
         )
         model = configurable.get("analyst_model") or production_analyst_model()
         findings = AnalystAgent(model).run(handoff)

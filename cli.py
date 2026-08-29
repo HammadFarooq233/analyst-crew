@@ -54,8 +54,36 @@ def format_result(result) -> str:
         f"excluded gross revenue impact {findings.excluded_revenue_impact:,.2f}; "
         f"reasons {findings.quarantine_reasons}.\n"
         f"{format_material_changes(findings)}\n"
-        f"{format_revenue_bridge(findings)}"
+        f"{format_revenue_bridge(findings)}\n"
+        f"{format_target_comparison(findings)}"
     )
+
+
+def format_target_comparison(findings: BaselineFindings) -> str:
+    """Render the optional Postgres target-vs-actual comparison. When the
+    optional Data Source was not part of this run, this is silent — when it
+    was attempted but unavailable/invalid, the recorded status and the
+    matching limitation are both surfaced so the degradation is visible."""
+    comparison = findings.target_comparison
+    if comparison is None:
+        return "Sales targets: not part of this run."
+    status = comparison.source_status
+    if status.status != "available":
+        detail = f" ({status.detail})" if status.detail else ""
+        return f"Sales targets: {status.status}{detail}."
+    if not comparison.rows:
+        return "Sales targets: available, no region/category rows to compare."
+    lines = ["Sales targets (actual vs. target, by region and category):"]
+    for row in comparison.rows:
+        revenue_percent = "n/a" if row.net_revenue_variance_percent is None else f"{row.net_revenue_variance_percent:+.1f}%"
+        orders_percent = "n/a" if row.orders_variance_percent is None else f"{row.orders_variance_percent:+.1f}%"
+        lines.append(
+            f"  - {row.region}/{row.category}: net revenue {row.actual_net_revenue:,.2f} vs "
+            f"target {row.target_net_revenue:,.2f} ({row.net_revenue_variance:+,.2f}, {revenue_percent}); "
+            f"orders {row.actual_orders:,.0f} vs target {row.target_orders:,.0f} "
+            f"({row.orders_variance:+,.0f}, {orders_percent})"
+        )
+    return "\n".join(lines)
 
 
 def format_revenue_bridge(findings: BaselineFindings) -> str:
@@ -157,7 +185,11 @@ def main() -> None:
     }
     if args.sales_csv:
         from analyst_crew.tools.sales import sales_data_source
-        invoke_config["configurable"]["data_sources"] = sales_data_source(args.sales_csv)
+        from analyst_crew.tools.targets import sales_targets_data_source
+        invoke_config["configurable"]["data_sources"] = {
+            **sales_data_source(args.sales_csv),
+            **sales_targets_data_source(),
+        }
         invoke_config["configurable"]["artifact_dir"] = args.artifact_dir
         invoke_config["configurable"]["analysis_parameters"] = {
             "as_of_date": args.as_of_date,

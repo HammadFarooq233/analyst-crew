@@ -129,6 +129,37 @@ class RevenueBridge(BaseModel):
     aggregation_id: str
 
 
+class TargetSourceStatus(BaseModel):
+    """Status of the optional Postgres sales-targets enrichment. ``available``
+    means the target comparison below is trustworthy; any other status means
+    the required CSV-based Findings still completed, but the optional
+    target comparison did not (see ``BaselineFindings.limitations``)."""
+
+    status: Literal["not_configured", "available", "unavailable", "invalid"]
+    detail: str | None = None
+
+
+class TargetVariance(BaseModel):
+    """Actual vs. target net revenue and order count for one region/category
+    cell of the same comparable period used by the core sales analysis."""
+
+    region: str
+    category: str
+    actual_net_revenue: float
+    target_net_revenue: float
+    net_revenue_variance: float
+    net_revenue_variance_percent: float | None
+    actual_orders: float
+    target_orders: float
+    orders_variance: float
+    orders_variance_percent: float | None
+
+
+class TargetComparison(BaseModel):
+    rows: list[TargetVariance] = []
+    source_status: TargetSourceStatus
+
+
 class BaselineFindings(BaseModel):
     window: ComparisonWindow
     gross_revenue: MetricComparison
@@ -148,6 +179,8 @@ class BaselineFindings(BaseModel):
     dimensions: dict[str, list[DimensionDriver]] = {}
     material_changes: list[DimensionDriver] = []
     revenue_bridge: RevenueBridge | None = None
+    target_comparison: TargetComparison | None = None
+    limitations: list[str] = []
 
 
 class AnalystToolRequest(BaseModel):
@@ -218,6 +251,22 @@ SELECT
 FROM read_parquet(?)
 WHERE order_date BETWEEN ? AND ?
 GROUP BY {column}
+"""
+
+
+_REGION_CATEGORY_SQL = """
+SELECT
+    region AS region,
+    category AS category,
+    count(DISTINCT order_id)::DOUBLE AS orders,
+    coalesce(sum(
+        quantity * unit_price
+        - discount_amount
+        - returned_quantity * unit_price
+    ), 0)::DOUBLE AS net_revenue
+FROM read_parquet(?)
+WHERE order_date BETWEEN ? AND ?
+GROUP BY region, category
 """
 
 
@@ -315,6 +364,14 @@ def _comparison_window(latest: date) -> ComparisonWindow:
         prior_start=date(prior_year, prior_month, 1),
         prior_end=date(prior_year, prior_month, comparable_day),
     )
+
+
+def comparison_window(as_of_date: date | str) -> ComparisonWindow:
+    """Public alias for the comparable-period window logic, so callers outside
+    this module (e.g. the Analyst node retrieving Postgres targets) reuse the
+    exact same current/prior period selection rather than reimplementing it."""
+    latest = date.fromisoformat(as_of_date) if isinstance(as_of_date, str) else as_of_date
+    return _comparison_window(latest)
 
 
 def _comparison(current: float, prior: float) -> MetricComparison:
@@ -498,12 +555,89 @@ def _revenue_bridge(
     )
 
 
+def _region_category_actuals(
+    connection: Any, location: Path, start: date, end: date
+) -> dict[tuple[str, str], tuple[float, float]]:
+    """(region, category) -> (orders, net_revenue) for one period, from the
+    same application-owned DuckDB aggregation used for the dimension
+    breakdown — never a model-authored query."""
+    rows = connection.execute(_REGION_CATEGORY_SQL, [str(location), start, end]).fetchall()
+    return {
+        (str(region).casefold(), str(category).casefold()): (float(orders), float(net_revenue))
+        for region, category, orders, net_revenue in rows
+    }
+
+
+def _percent_variance(delta: float, base: float) -> float | None:
+    """None when the target baseline is zero — mirrors how a zero prior-period
+    baseline is handled for dimension drivers (issue #6): a relative percent
+    against a zero target is mathematically undefined, not 0% or infinite."""
+    return None if base == 0 else delta / base * 100
+
+
+def _build_target_comparison(
+    connection: Any,
+    location: Path,
+    window: ComparisonWindow,
+    target_data: dict[str, Any] | None,
+) -> tuple[TargetComparison | None, list[str]]:
+    """Compare actual net revenue and order count against Postgres sales
+    targets for the same comparable current period as the core CSV analysis,
+    by region and category. ``target_data`` is the already-retrieved result
+    of the read-only Fetcher Tool (``analyst_crew.tools.targets.retrieve_targets``);
+    this function performs no Postgres I/O itself and never raises for an
+    unavailable/invalid optional source — it records status and a limitation
+    instead, so the required CSV Findings are unaffected."""
+    if target_data is None:
+        return None, []
+
+    status = target_data.get("status", "not_configured")
+    detail = target_data.get("detail")
+    if status != "available":
+        limitation = f"Postgres sales-target comparison {status}: {detail or 'no further detail available'}"
+        return TargetComparison(rows=[], source_status=TargetSourceStatus(status=status, detail=detail)), [limitation]
+
+    actuals = _region_category_actuals(connection, location, window.current_start, window.current_end)
+    targets_by_key: dict[tuple[str, str], dict[str, Any]] = {
+        (str(row["region"]).casefold(), str(row["category"]).casefold()): row
+        for row in target_data.get("rows", [])
+    }
+
+    if not targets_by_key:
+        limitation = "Postgres returned zero target rows for the comparable period; no target comparison could be computed."
+        return TargetComparison(rows=[], source_status=TargetSourceStatus(status="invalid", detail=limitation)), [limitation]
+
+    rows: list[TargetVariance] = []
+    for region, category in sorted(set(actuals) | set(targets_by_key)):
+        actual_orders, actual_net_revenue = actuals.get((region, category), (0.0, 0.0))
+        target_row = targets_by_key.get((region, category))
+        target_net_revenue = float(target_row["target_net_revenue"]) if target_row else 0.0
+        target_orders = float(target_row["target_orders"]) if target_row else 0.0
+        net_revenue_variance = actual_net_revenue - target_net_revenue
+        orders_variance = actual_orders - target_orders
+        rows.append(TargetVariance(
+            region=region,
+            category=category,
+            actual_net_revenue=actual_net_revenue,
+            target_net_revenue=target_net_revenue,
+            net_revenue_variance=net_revenue_variance,
+            net_revenue_variance_percent=_percent_variance(net_revenue_variance, target_net_revenue),
+            actual_orders=actual_orders,
+            target_orders=target_orders,
+            orders_variance=orders_variance,
+            orders_variance_percent=_percent_variance(orders_variance, target_orders),
+        ))
+
+    return TargetComparison(rows=rows, source_status=TargetSourceStatus(status="available")), []
+
+
 def run_sales_baseline(
     dataset_reference: dict[str, Any],
     *,
     as_of_date: date | str,
     analysis_parameters: dict[str, Any] | None = None,
     user_question: str = "",
+    target_data: dict[str, Any] | None = None,
 ) -> BaselineFindings:
     """Execute only application-owned SQL templates against a verified artifact."""
     if dataset_reference.get("kind") != "Dataset Artifact":
@@ -562,6 +696,7 @@ def run_sales_baseline(
             dataset_content_hash=actual_hash,
             net_revenue_change=net_revenue.absolute_change,
         )
+        target_comparison, target_limitations = _build_target_comparison(connection, location, window, target_data)
     finally:
         connection.close()
 
@@ -589,6 +724,8 @@ def run_sales_baseline(
         dimensions=dimensions,
         material_changes=material_changes,
         revenue_bridge=revenue_bridge,
+        target_comparison=target_comparison,
+        limitations=target_limitations,
     )
 
 
@@ -647,6 +784,7 @@ class AnalystAgent:
                         as_of_date=analysis_as_of,
                         analysis_parameters=handoff.analysis_parameters,
                         user_question=handoff.user_question,
+                        target_data=handoff.analysis_parameters.get("target_data"),
                     )
                 except (TimeoutError, ConnectionError, TransientAnalystError):
                     if tool_attempt == 1:
