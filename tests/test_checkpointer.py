@@ -1,5 +1,6 @@
 import csv
 import os
+from uuid import uuid4
 
 import pytest
 
@@ -126,7 +127,7 @@ class TestResumeAgainstPostgres:
         )
         plan = Plan(steps=[fetch, analyze], user_question="Compare baseline sales")
 
-        thread_id = "test-resume-postgres-thread-001"
+        thread_id = f"test-resume-postgres-thread-{uuid4()}"
         conn_string = os.getenv("POSTGRES_CONNECTION_STRING")
         with PostgresSaver.from_conn_string(conn_string) as checkpointer:
             checkpointer.setup()

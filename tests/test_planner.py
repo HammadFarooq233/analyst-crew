@@ -35,6 +35,8 @@ def test_plan_accepts_openrouter_field_names():
 
 
 class TestStateShape:
+    @pytest.mark.llm
+    @pytest.mark.integration
     def test_state_shape(self):
         if not os.getenv("OPENROUTER_API_KEY"):
             pytest.skip("OPENROUTER_API_KEY not set")
