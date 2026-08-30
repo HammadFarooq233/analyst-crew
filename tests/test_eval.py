@@ -12,10 +12,11 @@ from langgraph.store.memory import InMemoryStore
 
 from analyst_crew.agents.planner import PlannerAgent
 from analyst_crew.tools.memory import clear_namespace, seed_memory
+from analyst_crew.tools.sales import sales_data_source
 
 
 class OpenRouterEvaluator(DeepEvalBaseLLM):
-    def __init__(self, model_name: str = "google/gemma-4-31b-it:free"):
+    def __init__(self, model_name: str = "dots-studio/dots-3-note-preview:free"):
         self._model_name = model_name
         self._model = ChatOpenAI(
             model=model_name,
@@ -68,7 +69,7 @@ def test_golden_plan_structure():
     clear_namespace(store)
     seed_memory(store, "'unusual' means >15% swings by product category")
 
-    agent = PlannerAgent(store=store)
+    agent = PlannerAgent(store=store, data_sources=sales_data_source("data/sales.csv"))
     question = "Compare this month's sales to last month and flag anything unusual"
     plan = agent.generate_plan(question)
 

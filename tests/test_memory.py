@@ -44,9 +44,13 @@ class TestMemoryIntegration:
         }
 
         from analyst_crew.agents.planner import build_graph
+        from analyst_crew.tools.sales import sales_data_source
 
         graph = build_graph(store=store)
-        result = graph.invoke(state)
+        result = graph.invoke(
+            state,
+            {"configurable": {"data_sources": sales_data_source("data/sales.csv")}},
+        )
 
         plan = result.get("artifacts", {}).get("plan")
         if plan is None:
@@ -69,6 +73,7 @@ class TestMemoryIntegration:
 
         from analyst_crew.agents import invoke
         from analyst_crew.tools.memory import seed_memory, clear_namespace
+        from analyst_crew.tools.sales import sales_data_source
         from langgraph.store.postgres import PostgresStore
 
         conn_string = os.getenv("POSTGRES_CONNECTION_STRING")
@@ -78,7 +83,8 @@ class TestMemoryIntegration:
             clear_namespace(store)
             seed_memory(store, "'unusual' means >15% swings by product category")
 
-        result1 = invoke("Flag anything unusual in this month's sales")
+        run_config = {"configurable": {"data_sources": sales_data_source("data/sales.csv")}}
+        result1 = invoke("Flag anything unusual in this month's sales", run_config)
         plan_error = result1.get("artifacts", {}).get("plan_error")
         if plan_error and (
             "quota" in plan_error.lower()
@@ -87,7 +93,7 @@ class TestMemoryIntegration:
         ):
                 pytest.skip(f"OpenRouter free-model limit exceeded: {plan_error}")
 
-        result2 = invoke("Flag anything unusual in this month's sales")
+        result2 = invoke("Flag anything unusual in this month's sales", run_config)
         plan_error = result2.get("artifacts", {}).get("plan_error")
         if plan_error and (
             "quota" in plan_error.lower()

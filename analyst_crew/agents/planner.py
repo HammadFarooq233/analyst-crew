@@ -407,7 +407,7 @@ Available Agents:
 - Critic: Reviews a draft report for uncited claims, missing caveats, and logical gaps.
 - Reporter: Writes the narrative report from findings and charts. Synthesizes results into prose, cites specific numbers.
 
-Before drafting the Plan, call search_memory to retrieve any relevant facts, preferences, or conventions the user has established in prior sessions. Incorporate these into your Plan decisions.
+Any relevant facts, preferences, or conventions the user has established in prior sessions are supplied below under "Relevant memory," already retrieved for you — incorporate them into your Plan decisions. If none are supplied, there is no prior memory to draw on.
 
 Rules:
 1. Produce only Steps that can execute with the validated capabilities for this run.
@@ -419,7 +419,8 @@ Rules:
 7. The Fetcher must use a supplied Data Source and declare one Dataset Artifact output. The Analyst must depend on that Fetcher output and declare Findings.
 8. Include the exact user_question text in the Plan.
 9. Use these Step keys: `step_id`, `agent`, `objective`, `source_ids`, `expected_output`, `declared_artifacts`, and `depends_on`.
-10. Never invent a Data Source ID, filesystem location, executable SQL, or arithmetic result."""
+10. Never invent a Data Source ID, filesystem location, executable SQL, or arithmetic result.
+11. `source_ids` lists only IDs from the "Data Sources" list above — never a `declared_artifacts` name from this or any other Step. A Step that consumes another Step's output declares that through `depends_on`, not `source_ids`. Only a Fetcher Step has a non-empty `source_ids`; every other Step's `source_ids` must be empty."""
 
 
 class PlannerAgent:
@@ -438,7 +439,7 @@ class PlannerAgent:
         if invalid:
             raise ValueError(f"Unknown available Agents: {sorted(invalid)}")
         self.data_sources = set(data_sources.keys()) if isinstance(data_sources, Mapping) else set(data_sources)
-        self.model = model or str(config.get("llm.model", "google/gemma-4-26b-a4b-it:free"))
+        self.model = model or str(config.get("llm.model", "liquid/lfm-2.5-2.6b:free"))
         self.temperature = (
             temperature
             if temperature is not None
@@ -464,16 +465,38 @@ class PlannerAgent:
             },
         )
 
+        self.validation_retries = 0
+        self.last_validation_error: str | None = None
+
+        self._memory_tool = None
         if store is not None:
             from analyst_crew.tools.memory import create_memory_tool
 
-            memory_tool = create_memory_tool(store)
-            self._llm = self._llm.bind_tools([memory_tool])
+            self._memory_tool = create_memory_tool(store)
 
         self._chain = self._llm.with_structured_output(
             Plan,
             method="json_mode",
+            include_raw=True,
         )
+
+    def _search_memory(self, question: str) -> str:
+        """Execute the search_memory Tool deterministically, application-side.
+
+        Structured-output ``json_mode`` forces the model into single-shot
+        JSON generation, which is incompatible with letting the model choose
+        to make a real tool call mid-response — free-tier models either
+        fabricate a fake tool-call JSON blob in place of a Plan, or emit a
+        genuine (but then silently dropped) tool_calls response and no
+        content at all. Retrieving memory here, before the Plan call, avoids
+        depending on model-driven tool selection for this step.
+        """
+        if self._memory_tool is None:
+            return ""
+        try:
+            return str(self._memory_tool.invoke({"query": question}))
+        except Exception:
+            return ""
 
     def generate_plan(self, question: str, available_agents: Sequence[str] | None = None,
                       data_sources: Mapping[str, Any] | Sequence[str] | None = None,
@@ -494,51 +517,91 @@ class PlannerAgent:
             + "\n\nValidated capabilities for this run (you MUST use only these Agents):\n"
             + "Agents: " + ", ".join(sorted(allowed_agents))
             + "\nData Sources: " + ", ".join(sorted(source_catalog))
+            + "\n\nRelevant memory:\n" + (self._search_memory(question) or "(none found)")
         )
         messages = [
             SystemMessage(content=capability_prompt),
             HumanMessage(content=question),
         ]
 
-        try:
-            result = invoke_with_optional_config(self._chain, messages, config)
-        except Exception as e:
-            msg = str(e)
-            if "quota" in msg.lower() or "429" in msg:
-                raise RuntimeError(
-                    "OpenRouter free-model quota or rate limit exceeded. "
-                    "Try again later or select another free model in config/settings.toml."
-                ) from e
-            raise RuntimeError(f"Planner LLM call failed: {msg}") from e
-
-        if not isinstance(result, Plan):
-            raise RuntimeError(
-                f"LLM returned unexpected type {type(result).__name__}, expected Plan."
-            )
-
-        if not result.steps:
-            raise RuntimeError("LLM returned an empty Plan (no Steps).")
-
-        unavailable = result.agents - allowed_agents
-        if unavailable:
-            raise ValueError(f"Plan references unavailable Agents: {sorted(unavailable)}")
         catalog = (set(data_sources.keys()) if isinstance(data_sources, Mapping) else set(data_sources)) if data_sources is not None else self.data_sources
-        unknown_sources = {source for step in result.steps for source in step.source_ids} - catalog
-        if unknown_sources:
-            raise ValueError(f"Plan references unknown Data Sources: {sorted(unknown_sources)}")
 
-        if allowed_agents == set(PHASE1_AGENTS) and "sales_csv" in catalog:
-            if len(result.steps) != 2 or [step.agent for step in result.steps] != ["Fetcher", "Analyst"]:
-                raise ValueError("Phase 1 sales Plan must contain exactly Fetcher then Analyst Steps")
-            fetch_step, analyst_step = result.steps
-            if fetch_step.source_ids != ["sales_csv"]:
-                raise ValueError("Phase 1 Fetcher must use the catalogued sales_csv Data Source")
-            if analyst_step.depends_on != [fetch_step.step_id]:
-                raise ValueError("Phase 1 Analyst must depend on the Fetcher Step")
-            if not (fetch_step.declared_artifacts or [fetch_step.expected_output]):
-                raise ValueError("Phase 1 Fetcher must declare a Dataset Artifact output")
-            if not (analyst_step.declared_artifacts or [analyst_step.expected_output]):
-                raise ValueError("Phase 1 Analyst must declare a Findings output")
+        def _validate(plan: Plan) -> None:
+            if not isinstance(plan, Plan):
+                raise ValueError(f"LLM returned unexpected type {type(plan).__name__}, expected Plan.")
+            if not plan.steps:
+                raise ValueError("LLM returned an empty Plan (no Steps).")
+            unavailable = plan.agents - allowed_agents
+            if unavailable:
+                raise ValueError(f"Plan references unavailable Agents: {sorted(unavailable)}")
+            unknown_sources = {source for step in plan.steps for source in step.source_ids} - catalog
+            if unknown_sources:
+                raise ValueError(f"Plan references unknown Data Sources: {sorted(unknown_sources)}")
+            if allowed_agents == set(PHASE1_AGENTS) and "sales_csv" in catalog:
+                if len(plan.steps) != 2 or [step.agent for step in plan.steps] != ["Fetcher", "Analyst"]:
+                    raise ValueError("Phase 1 sales Plan must contain exactly Fetcher then Analyst Steps")
+                fetch_step, analyst_step = plan.steps
+                if fetch_step.source_ids != ["sales_csv"]:
+                    raise ValueError("Phase 1 Fetcher must use the catalogued sales_csv Data Source")
+                if analyst_step.depends_on != [fetch_step.step_id]:
+                    raise ValueError("Phase 1 Analyst must depend on the Fetcher Step")
+                if not (fetch_step.declared_artifacts or [fetch_step.expected_output]):
+                    raise ValueError("Phase 1 Fetcher must declare a Dataset Artifact output")
+                if not (analyst_step.declared_artifacts or [analyst_step.expected_output]):
+                    raise ValueError("Phase 1 Analyst must declare a Findings output")
+
+        # Contract-invalid Plan output — malformed JSON or a structurally
+        # valid Plan that still violates a Planner rule (unavailable Agent,
+        # unknown Data Source, wrong Phase 1 shape) — receives at most one
+        # repair retry, with the validation error fed back into the next
+        # model call as feedback. Same policy already used for Fetcher/
+        # Analyst Agent output (see FetcherAgent.run, AnalystAgent.run).
+        # Free-tier models are more prone to this than larger ones, so this
+        # matters more here even though the policy itself is pre-existing.
+        result = None
+        feedback = ""
+        for attempt in range(2):
+            call_messages = messages if not feedback else messages + [
+                HumanMessage(
+                    content=f"Your previous response was invalid: {feedback} "
+                    "Return the corrected Plan as a single JSON object with no extra text."
+                )
+            ]
+            try:
+                raw_result = invoke_with_optional_config(self._chain, call_messages, config)
+            except Exception as e:
+                msg = str(e)
+                if "quota" in msg.lower() or "429" in msg:
+                    raise RuntimeError(
+                        "OpenRouter free-model quota or rate limit exceeded. "
+                        "Try again later or select another free model in config/settings.toml."
+                    ) from e
+                raise RuntimeError(f"Planner LLM call failed: {msg}") from e
+
+            if not (isinstance(raw_result, dict) and "parsed" in raw_result):
+                # Scripted test doubles (with_structured_output(...) -> self)
+                # ignore include_raw and return a Plan directly — no repair
+                # loop applies to those, they're not real LLM output.
+                result = raw_result
+                break
+
+            candidate = raw_result.get("parsed")
+            if candidate is None:
+                self.last_validation_error = str(raw_result.get("parsing_error"))
+            else:
+                try:
+                    _validate(candidate)
+                    result = candidate
+                    break
+                except ValueError as exc:
+                    self.last_validation_error = str(exc)
+
+            if attempt:
+                raise RuntimeError(f"Planner LLM call failed: {self.last_validation_error}")
+            self.validation_retries += 1
+            feedback = self.last_validation_error
+
+        _validate(result)
 
         return result
 
