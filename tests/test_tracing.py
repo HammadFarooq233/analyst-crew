@@ -36,6 +36,7 @@ class TestTracing:
         from langfuse import Langfuse
 
         from analyst_crew.agents import invoke
+        from analyst_crew.tools.sales import sales_data_source
 
         thread_id = f"test-trace-{uuid.uuid4().hex[:8]}"
 
@@ -43,6 +44,7 @@ class TestTracing:
             "configurable": {
                 "thread_id": thread_id,
                 "user_id": "test-user",
+                "data_sources": sales_data_source("data/sales.csv"),
             }
         }
 
@@ -53,6 +55,9 @@ class TestTracing:
         if plan_error is not None:
             pytest.skip(f"Skipping trace check — API error: {plan_error}")
 
+        trace_id = result.get("artifacts", {}).get("langfuse_trace_id")
+        assert trace_id is not None, "invoke() did not record a langfuse_trace_id"
+
         host = os.getenv("LANGFUSE_HOST", "")
         client = Langfuse(
             public_key=os.getenv("LANGFUSE_PUBLIC_KEY", ""),
@@ -62,18 +67,20 @@ class TestTracing:
 
         import time
 
-        trace_found = False
-        # Self-hosted Langfuse v2 may take several seconds to index ingestion.
+        # Fetch the trace directly by id — a fast, consistently-indexed
+        # lookup — rather than searching by tag, which goes through Langfuse
+        # v2's async ClickHouse indexing and can lag well behind the direct
+        # id lookup, making tag-based polling flaky under load.
+        trace = None
         deadline = time.monotonic() + 60
-        while time.monotonic() < deadline and not trace_found:
-            traces = client.api.trace.list(tags=["agent:Planner"])
-            trace_found = any(
-                hasattr(t, "session_id") and t.session_id == thread_id
-                for t in traces
-            )
-            if not trace_found:
+        while time.monotonic() < deadline and trace is None:
+            try:
+                trace = client.api.trace.get(trace_id)
+            except Exception:
+                trace = None
+            if trace is None:
                 time.sleep(1)
 
-        assert trace_found, (
-            f"No trace found for thread_id={thread_id} with tag agent:Planner"
-        )
+        assert trace is not None, f"No trace found for trace_id={trace_id}"
+        assert trace.session_id == thread_id
+        assert "agent:Planner" in (trace.tags or [])

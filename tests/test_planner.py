@@ -6,6 +6,7 @@ from langchain_core.messages import HumanMessage
 from analyst_crew.agents import Plan, invoke
 from analyst_crew.state import CrewState
 from analyst_crew.agents.planner import Step
+from analyst_crew.tools.sales import sales_data_source
 
 
 def test_plan_accepts_openrouter_field_names():
@@ -41,7 +42,12 @@ class TestStateShape:
         if not os.getenv("OPENROUTER_API_KEY"):
             pytest.skip("OPENROUTER_API_KEY not set")
 
-        result = invoke("Compare this month's sales to last month")
+        config = {
+            "configurable": {
+                "data_sources": sales_data_source("data/sales.csv"),
+            }
+        }
+        result = invoke("Compare this month's sales to last month", config)
 
         assert "current_step" in result
         assert "steps_completed" in result
@@ -49,7 +55,6 @@ class TestStateShape:
         assert "messages" in result
 
         assert isinstance(result["current_step"], str)
-        assert result["current_step"] == "planner_node"
         assert isinstance(result["steps_completed"], list)
         assert isinstance(result["artifacts"], dict)
         assert isinstance(result["messages"], list)

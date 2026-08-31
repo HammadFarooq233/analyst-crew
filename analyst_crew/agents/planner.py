@@ -1211,5 +1211,7 @@ def invoke(
 
     result = _run()
     _finish_langfuse_trace(langfuse_client, langfuse_trace, metadata=_run_metadata(result))
+    if langfuse_trace is not None:
+        result.setdefault("artifacts", {})["langfuse_trace_id"] = langfuse_trace.id
 
     return result
