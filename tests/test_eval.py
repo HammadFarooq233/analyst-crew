@@ -1,3 +1,4 @@
+from analyst_crew.llm import credentials_available as llm_credentials_available
 import os
 import json
 
@@ -7,7 +8,7 @@ from deepeval.metrics import GEval
 from deepeval.models import DeepEvalBaseLLM
 from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 from langchain_core.messages import HumanMessage
-from langchain_openai import ChatOpenAI
+from analyst_crew.llm import make_chat_model
 from langgraph.store.memory import InMemoryStore
 
 from analyst_crew.agents.planner import PlannerAgent
@@ -16,14 +17,9 @@ from analyst_crew.tools.sales import sales_data_source
 
 
 class OpenRouterEvaluator(DeepEvalBaseLLM):
-    def __init__(self, model_name: str = "dots-studio/dots-3-note-preview:free"):
+    def __init__(self, model_name: str = "configured-llm"):
         self._model_name = model_name
-        self._model = ChatOpenAI(
-            model=model_name,
-            api_key=os.getenv("OPENROUTER_API_KEY"),
-            base_url="https://openrouter.ai/api/v1",
-            temperature=0.0,
-        )
+        self._model = make_chat_model(temperature=0.0)
 
     def generate(self, prompt: str) -> str:
         response = self._model.invoke([HumanMessage(content=prompt)])
@@ -62,8 +58,8 @@ def test_golden_plan_structure():
     4. Steps are ordered so dependencies precede dependents.
     5. At least one Step references Fetcher and at least one references Analyst.
     """
-    if not os.getenv("OPENROUTER_API_KEY"):
-        pytest.skip("OPENROUTER_API_KEY not set")
+    if not llm_credentials_available():
+        pytest.skip("LLM credentials not set")
 
     store = InMemoryStore()
     clear_namespace(store)

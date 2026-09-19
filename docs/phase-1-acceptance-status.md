@@ -1,5 +1,22 @@
 # Phase 1 live acceptance status (issue #12)
 
+## Update 2026-09-19 — live acceptance PASSED on Azure OpenAI (`gpt-5.4-mini`)
+
+The OpenRouter free-tier blockers below were bypassed by adding a provider switch (`LLM_PROVIDER=azure|openrouter`, `analyst_crew/llm.py`) and running against an Azure OpenAI / Microsoft Foundry deployment. Evidence from this run:
+
+- Offline suite: 113 passed. Marked suites: `llm` 2/2, `integration` 7 passed + 1 skipped (`FRED_API_KEY` unset — optional source, documented), `eval` 1/1.
+- README CLI scenario (`--as-of-date 2025-06-30`) produced real Findings identical to the earlier verified run (net revenue 3,942,300.70 vs 4,211,835.36, bridge gap 0.0000).
+- Langfuse: one trace per run with real `AzureChatOpenAI` (`gpt-5.4-mini`) GENERATION observations nested under `planner_node` / `fetcher_node` / `analyst_node`.
+- Resume: second run on the same thread made **0 LLM calls** and reported both Steps `reused`/`unchanged`.
+
+Two real bugs found and fixed while proving this:
+1. `json_mode` on OpenAI-family endpoints requires the word "JSON" in the prompt; the Planner prompt now states it (rule 12).
+2. **Resume never actually reused work with a live Planner.** Each invoke re-planned, and the LLM worded `step_id`/`objective` differently, changing every execution key. `planner_node` now reuses the checkpointed Plan when the question and capabilities are unchanged (`_reusable_prior_plan`, with regression tests). The earlier "reused" evidence only held because fakes/older models were stable.
+
+Remaining: `FRED_API_KEY` is still unset (live FRED test skipped). README's old `--as-of-date 2025-07-01` example produced a degenerate one-day comparison because the data ends 2025-06-30; README now uses 2025-06-30. The history below is retained for context.
+
+---
+
 Last evidence-gathering run: 2026-08-29, this session (two passes). **Phase 1 is still NOT being marked complete**, but the Langfuse trace-linking gap flagged in the first pass has now been fixed and verified live against the real Langfuse server — see §7 (updated). Three real production bugs were found and fixed across both passes, one live run of the full CLI scenario succeeded with real Findings, resume/reuse (#11) was verified for real, and the Langfuse trace-linking mechanism was verified live through the real production graph/node code — but not yet with a genuine OpenRouter-backed run, because OpenRouter's free-tier daily quota was exhausted before the fix landed. See below for exact evidence and what's left for a human with fresh quota to confirm.
 
 ## Environment used for this run

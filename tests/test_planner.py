@@ -1,3 +1,4 @@
+from analyst_crew.llm import credentials_available as llm_credentials_available
 import os
 
 import pytest
@@ -39,8 +40,8 @@ class TestStateShape:
     @pytest.mark.llm
     @pytest.mark.integration
     def test_state_shape(self):
-        if not os.getenv("OPENROUTER_API_KEY"):
-            pytest.skip("OPENROUTER_API_KEY not set")
+        if not llm_credentials_available():
+            pytest.skip("LLM credentials not set")
 
         config = {
             "configurable": {
@@ -76,8 +77,8 @@ class TestStateShape:
 @pytest.mark.llm
 class TestLLMIntegration:
     def test_llm_plan_valid(self):
-        if not os.getenv("OPENROUTER_API_KEY"):
-            pytest.skip("OPENROUTER_API_KEY not set")
+        if not llm_credentials_available():
+            pytest.skip("LLM credentials not set")
 
         result = invoke("Compare revenue trends across Q1 and Q2")
 

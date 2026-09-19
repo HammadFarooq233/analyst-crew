@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.store.postgres import PostgresStore
@@ -18,6 +17,7 @@ from langfuse import Langfuse
 from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 import config
+from analyst_crew.llm import make_chat_model
 from analyst_crew.state import CrewState
 from analyst_crew.tools.analysis import AnalystAgent, BaselineFindings, production_analyst_model
 from analyst_crew.tools.retry import invoke_with_optional_config
@@ -420,7 +420,8 @@ Rules:
 8. Include the exact user_question text in the Plan.
 9. Use these Step keys: `step_id`, `agent`, `objective`, `source_ids`, `expected_output`, `declared_artifacts`, and `depends_on`.
 10. Never invent a Data Source ID, filesystem location, executable SQL, or arithmetic result.
-11. `source_ids` lists only IDs from the "Data Sources" list above — never a `declared_artifacts` name from this or any other Step. A Step that consumes another Step's output declares that through `depends_on`, not `source_ids`. Only a Fetcher Step has a non-empty `source_ids`; every other Step's `source_ids` must be empty."""
+11. `source_ids` lists only IDs from the "Data Sources" list above — never a `declared_artifacts` name from this or any other Step. A Step that consumes another Step's output declares that through `depends_on`, not `source_ids`. Only a Fetcher Step has a non-empty `source_ids`; every other Step's `source_ids` must be empty.
+12. Respond with a single JSON object (the Plan) and nothing else — no prose, no markdown fences."""
 
 
 class PlannerAgent:
@@ -447,22 +448,10 @@ class PlannerAgent:
         )
         self.max_tokens = max_tokens or int(config.get("llm.max_tokens", 4096))
 
-        self._api_key = os.getenv("OPENROUTER_API_KEY")
-        if llm is None and not self._api_key:
-            raise RuntimeError(
-                "OPENROUTER_API_KEY is not set. Add it to your .env file or environment."
-            )
-
-        self._llm = llm or ChatOpenAI(
+        self._llm = llm or make_chat_model(
             model=self.model,
-            api_key=self._api_key,
-            base_url="https://openrouter.ai/api/v1",
             temperature=self.temperature,
             max_tokens=self.max_tokens,
-            default_headers={
-                "HTTP-Referer": "https://github.com/analyst-crew",
-                "X-Title": "Analyst Crew",
-            },
         )
 
         self.validation_retries = 0
@@ -573,8 +562,8 @@ class PlannerAgent:
                 msg = str(e)
                 if "quota" in msg.lower() or "429" in msg:
                     raise RuntimeError(
-                        "OpenRouter free-model quota or rate limit exceeded. "
-                        "Try again later or select another free model in config/settings.toml."
+                        "LLM provider quota or rate limit exceeded. "
+                        "Try again later, or switch model/provider (config/settings.toml, LLM_PROVIDER)."
                     ) from e
                 raise RuntimeError(f"Planner LLM call failed: {msg}") from e
 
@@ -613,6 +602,25 @@ def _extract_question(state: CrewState) -> str:
     return ""
 
 
+def _reusable_prior_plan(state: CrewState, question: str, agent: "PlannerAgent") -> Plan | None:
+    """Return the Plan already in the checkpointed state when it is still valid.
+
+    Resuming a thread must not re-plan: a live Planner words step ids and
+    objectives differently on every call, and those fields are part of each
+    Step's execution key, so re-planning would defeat Step reuse (issue #11).
+    The prior Plan is reused only if it answers the same question and still
+    fits this run's Agents and Data Sources; otherwise the Planner runs again.
+    """
+    prior = state.get("artifacts", {}).get("plan")
+    if not isinstance(prior, Plan) or prior.user_question != question:
+        return None
+    if prior.agents - agent.available_agents:
+        return None
+    if {source for step in prior.steps for source in step.source_ids} - agent.data_sources:
+        return None
+    return prior
+
+
 def planner_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
     question = _extract_question(state)
 
@@ -629,7 +637,9 @@ def planner_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
             data_sources=configurable.get("data_sources", ()),
             llm=planner_model,
         )
-        plan = agent.generate_plan(question, config=config)
+        plan = _reusable_prior_plan(state, question, agent)
+        if plan is None:
+            plan = agent.generate_plan(question, config=config)
     except (RuntimeError, ValueError) as e:
         return {
             "current_step": "planner_node",

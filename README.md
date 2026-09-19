@@ -6,7 +6,7 @@ A multi-agent data analysis copilot. See `CONTEXT.md` for the shared vocabulary 
 
 ```bash
 uv sync   # or: pip install -e .
-cp .env.example .env   # fill in OPENROUTER_API_KEY, LANGFUSE_*, POSTGRES_CONNECTION_STRING; FRED_API_KEY is optional
+cp .env.example .env   # set LLM_PROVIDER and its credentials (OPENROUTER_API_KEY, or the AZURE_OPENAI_* vars), LANGFUSE_*, POSTGRES_CONNECTION_STRING; FRED_API_KEY is optional
 docker compose up -d   # starts Postgres (targets + checkpointer) and Langfuse
 ```
 
@@ -31,7 +31,7 @@ python cli.py \
   --question "Compare this month's sales to last month and flag anything unusual" \
   --thread-id demo-run-1 \
   --sales-csv data/sales.csv \
-  --as-of-date 2025-07-01
+  --as-of-date 2025-06-30
 ```
 
 This one command executes the capability-aware Plan through Planner, Fetcher, and Analyst against the required CSV Data Source, with the optional Postgres sales-targets comparison and optional FRED CPI inflation adjustment enriching the Findings whenever those sources are configured and available. The printed report covers overall performance, all required dimensional drivers (product, category, region, channel, customer segment), Material Changes, the full revenue bridge, target variance (when Postgres targets are configured), inflation-adjusted context (when FRED is configured), data quality and provenance, and limitations.

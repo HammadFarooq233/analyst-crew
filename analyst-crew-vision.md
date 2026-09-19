@@ -206,7 +206,7 @@ progresses. Update this table, don't just the roadmap above.
 | Phase                       | Status      | Notes                                                     |
 | --------------------------- | ----------- | --------------------------------------------------------- |
 | 0 – Walking skeleton        | Complete*   | Implemented across commits; infrastructure is runnable    |
-| 1 – Real tool use           | Not started | Fetcher + Analyst; `execute_python` registered but denied |
+| 1 – Real tool use           | Complete    | Live acceptance passed 2026-09-19 (see docs/phase-1-acceptance-status.md) |
 | 2 – Full orchestration      | Not started | Visualizer, Critic, Reporter join                         |
 | 3 – Memory, deepened        | Not started |                                                           |
 | 4 – Observability, deepened | Not started |                                                           |

@@ -1,3 +1,4 @@
+from analyst_crew.llm import credentials_available as llm_credentials_available
 import csv
 import os
 from uuid import uuid4
@@ -22,7 +23,7 @@ def _postgres_available() -> bool:
 
 
 def _openrouter_available() -> bool:
-    return bool(os.getenv("OPENROUTER_API_KEY"))
+    return llm_credentials_available()
 
 
 @pytest.mark.integration
@@ -31,7 +32,7 @@ class TestStatePersistence:
         if not _postgres_available():
             pytest.skip("Postgres not available")
         if not _openrouter_available():
-            pytest.skip("OPENROUTER_API_KEY not set")
+            pytest.skip("LLM credentials not set")
 
         thread_id = "test-state-persistence-thread-001"
         config = {

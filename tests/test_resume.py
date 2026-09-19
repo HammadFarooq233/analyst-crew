@@ -403,3 +403,42 @@ class TestReusedExternalFetchesAvoidDuplicateCalls:
         # re-querying Postgres / re-calling the FRED API.
         assert len(target_calls) == 1
         assert len(cpi_calls) == 1
+
+
+class TestPriorPlanReuse:
+    """A live Planner words step ids differently on every call, which would
+    change every execution key. Resume must reuse the checkpointed Plan."""
+
+    def _plan(self, question="Q"):
+        return Plan(
+            user_question=question,
+            steps=[
+                Step(step_id="fetch_sales", agent="Fetcher", objective="fetch", expected_output="ds",
+                     source_ids=["sales_csv"], declared_artifacts=["ds"]),
+                Step(step_id="analyze", agent="Analyst", objective="analyze", expected_output="findings",
+                     declared_artifacts=["findings"], depends_on=["fetch_sales"]),
+            ],
+        )
+
+    def _agent(self, agents=("Fetcher", "Analyst"), sources=("sales_csv",)):
+        class _Agent:
+            available_agents = set(agents)
+            data_sources = set(sources)
+        return _Agent()
+
+    def test_reuses_matching_prior_plan(self):
+        plan = self._plan()
+        state = {"artifacts": {"plan": plan}}
+        assert planner_module._reusable_prior_plan(state, "Q", self._agent()) is plan
+
+    def test_replans_when_question_changes(self):
+        state = {"artifacts": {"plan": self._plan("Q")}}
+        assert planner_module._reusable_prior_plan(state, "different", self._agent()) is None
+
+    def test_replans_when_capabilities_no_longer_fit(self):
+        state = {"artifacts": {"plan": self._plan()}}
+        assert planner_module._reusable_prior_plan(state, "Q", self._agent(agents=("Fetcher",))) is None
+        assert planner_module._reusable_prior_plan(state, "Q", self._agent(sources=("other",))) is None
+
+    def test_replans_when_no_prior_plan(self):
+        assert planner_module._reusable_prior_plan({"artifacts": {}}, "Q", self._agent()) is None

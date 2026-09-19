@@ -1,3 +1,4 @@
+from analyst_crew.llm import credentials_available as llm_credentials_available
 import os
 from urllib.request import urlopen
 
@@ -20,7 +21,7 @@ def _langfuse_available() -> bool:
 
 
 def _openrouter_available() -> bool:
-    return bool(os.getenv("OPENROUTER_API_KEY"))
+    return llm_credentials_available()
 
 
 @pytest.mark.integration
@@ -29,7 +30,7 @@ class TestTracing:
         if not _langfuse_available():
             pytest.skip("Langfuse not available")
         if not _openrouter_available():
-            pytest.skip("OPENROUTER_API_KEY not set")
+            pytest.skip("LLM credentials not set")
 
         import uuid
 

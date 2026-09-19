@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 import config
 from langchain_core.runnables import RunnableLambda
-from langchain_openai import ChatOpenAI
+from analyst_crew.llm import make_chat_model
 from pydantic import BaseModel
 
 from analyst_crew.tools.fred import FRED_SERIES_ID
@@ -257,16 +257,7 @@ def production_analyst_model() -> Any:
     PromptValue, str, or list of ``BaseMessage``, so this wraps that dict
     into a single formatted prompt before delegating to the structured call.
     """
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is not set")
-    model = ChatOpenAI(
-        model=config.get("llm.model", "google/gemma-4-26b-a4b-it:free"),
-        api_key=api_key,
-        base_url="https://openrouter.ai/api/v1",
-        temperature=0,
-        max_tokens=int(config.get("llm.max_tokens", 4096)),
-    )
+    model = make_chat_model(temperature=0)
     structured = model.with_structured_output(AnalystToolRequest)
 
     def _invoke(context: dict[str, Any], config: Any = None) -> AnalystToolRequest:
