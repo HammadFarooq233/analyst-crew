@@ -2,9 +2,12 @@ import argparse
 import os
 import sys
 import uuid
+from pathlib import Path
 
 import config  # noqa: F401 — triggers load_dotenv()
 from analyst_crew.agents import invoke
+from analyst_crew.reporting.catalog import EvidenceCatalog, build_evidence_catalog
+from analyst_crew.reporting.report import Report, render_report
 from analyst_crew.tools.analysis import BaselineFindings
 
 
@@ -53,16 +56,61 @@ def format_terminal_failure(result) -> str:
     )
 
 
+def rendered_report(result) -> str | None:
+    """The Markdown Report from a Crew result, or None when the run produced none."""
+    artifacts = result.get("artifacts", {})
+    report = artifacts.get("report")
+    if report is None:
+        return None
+    if not isinstance(report, Report):
+        report = Report.model_validate(report)
+    catalog = artifacts.get("evidence_catalog")
+    if catalog is None:
+        catalog = build_evidence_catalog(_findings(artifacts))
+    elif not isinstance(catalog, EvidenceCatalog):
+        catalog = EvidenceCatalog.model_validate(catalog)
+    return render_report(report, catalog)
+
+
+def format_reporter_failure(failure) -> str:
+    retry_counts = failure.get("retry_counts") or {}
+    validation, provider = retry_counts.get("validation_retries", 0), retry_counts.get("tool_retries", 0)
+    return (
+        f"The Reporter Agent failed after {validation} validation "
+        f"retr{'y' if validation == 1 else 'ies'} and {provider} provider retr{'y' if provider == 1 else 'ies'}: "
+        f"{failure.get('error', 'unknown error')}. The Fallback Report above was generated without the "
+        "Reporter Agent; the failure is recorded in the returned state and on the trace."
+    )
+
+
+def _findings(artifacts) -> BaselineFindings:
+    findings = artifacts["findings"]
+    return findings if isinstance(findings, BaselineFindings) else BaselineFindings.model_validate(findings)
+
+
 def format_result(result) -> str:
-    terminal_failure = result.get("artifacts", {}).get("terminal_failure")
-    if terminal_failure is not None:
+    artifacts = result.get("artifacts", {})
+    terminal_failure = artifacts.get("terminal_failure")
+    # A required-Step failure wins over any Report still on a resumed thread's
+    # state; only a Reporter failure (required False) ships with its Fallback Report.
+    if terminal_failure is not None and terminal_failure.get("required", True):
         return format_terminal_failure(result)
 
-    findings = result.get("artifacts", {}).get("findings")
+    report = rendered_report(result)
+    if report is not None:
+        if terminal_failure is not None:
+            return f"{report}\n{format_reporter_failure(terminal_failure)}"
+        return report
+
+    findings = artifacts.get("findings")
     if findings is None:
         return format_plan(result)
-    if not isinstance(findings, BaselineFindings):
-        findings = BaselineFindings.model_validate(findings)
+    return format_findings(_findings(artifacts))
+
+
+def format_findings(findings: BaselineFindings) -> str:
+    """Findings summary, printed only when a run produced no Report (its Plan
+    had no Reporter Step)."""
     window = findings.window
     def metric(label, comparison, *, decimals=2):
         percent = "n/a" if comparison.percent_change is None else f"{comparison.percent_change:+.1f}%"
@@ -214,6 +262,8 @@ def main() -> None:
     parser.add_argument("--sales-csv", type=str, default=None)
     parser.add_argument("--artifact-dir", type=str, default=".artifacts")
     parser.add_argument("--as-of-date", type=str, required=True)
+    parser.add_argument("--report-file", type=str, default=None,
+                        help="also write the rendered Report to this Markdown file (nothing is written otherwise)")
     args = parser.parse_args()
 
     if not args.sales_csv:
@@ -262,7 +312,19 @@ def main() -> None:
     print(format_result(result))
 
     artifacts = result.get("artifacts", {})
-    if artifacts.get("terminal_failure") is not None or artifacts.get("plan_error") is not None:
+    if args.report_file:
+        report = rendered_report(result)
+        if report is None:
+            print("No Report was produced, so no file was written.", file=sys.stderr)
+        else:
+            path = Path(args.report_file)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(report, encoding="utf-8")
+            print(f"Report saved to {path}", file=sys.stderr)
+
+    terminal_failure = artifacts.get("terminal_failure")
+    required_failure = terminal_failure is not None and terminal_failure.get("required", True)
+    if required_failure or artifacts.get("plan_error") is not None:
         sys.exit(1)
 
 
