@@ -1,0 +1,114 @@
+"""Crew graph wiring and the ``invoke()`` entry point."""
+import os
+import uuid
+from typing import Any
+
+from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.store.memory import InMemoryStore
+from langgraph.store.postgres import PostgresStore
+
+from analyst_crew.agents import planner as planner_module
+from analyst_crew.agents.analyst import analyst_node
+from analyst_crew.agents.contracts import Plan
+from analyst_crew.agents.fetcher import fetcher_node
+from analyst_crew.agents.tracing import _finish_langfuse_trace, _run_metadata, get_langfuse_handler
+from analyst_crew.state import CrewState
+
+
+def build_graph(checkpointer=None, store=None, runtime_config: dict | None = None):
+    def merged_config(config: dict | None) -> dict:
+        base = runtime_config or {}
+        incoming = config or {}
+        return {
+            **base,
+            **incoming,
+            "configurable": {
+                **base.get("configurable", {}),
+                **incoming.get("configurable", {}),
+            },
+        }
+
+    graph = StateGraph(CrewState)
+    graph.add_node("planner_node", lambda state, config=None: planner_module.planner_node(state, merged_config(config)))
+    graph.add_node("fetcher_node", lambda state, config=None: fetcher_node(state, merged_config(config)))
+    graph.add_node("analyst_node", lambda state, config=None: analyst_node(state, merged_config(config)))
+    graph.add_edge(START, "planner_node")
+    def next_node(state: CrewState) -> str:
+        plan = state.get("artifacts", {}).get("plan")
+        return "fetcher_node" if isinstance(plan, Plan) and any(step.agent == "Fetcher" for step in plan.steps) else END
+    graph.add_conditional_edges("planner_node", next_node, {"fetcher_node": "fetcher_node", END: END})
+    def after_fetcher(state: CrewState) -> str:
+        if state.get("artifacts", {}).get("terminal_failure"):
+            return END
+        plan = state.get("artifacts", {}).get("plan")
+        return "analyst_node" if isinstance(plan, Plan) and any(step.agent == "Analyst" for step in plan.steps) else END
+    graph.add_conditional_edges("fetcher_node", after_fetcher, {"analyst_node": "analyst_node", END: END})
+    graph.add_edge("analyst_node", END)
+    return graph.compile(checkpointer=checkpointer, store=store)
+
+
+def invoke(
+    user_question: str,
+    config: dict | None = None,
+    *,
+    checkpointer: Any = None,
+    store: Any = None,
+) -> CrewState:
+    """Run one Crew turn.
+
+    ``checkpointer``/``store`` let a caller supply their own checkpointer
+    (e.g. an in-memory ``langgraph.checkpoint.memory.MemorySaver`` for
+    offline resume tests) instead of the default Postgres-or-nothing
+    selection below. Without a live ``POSTGRES_CONNECTION_STRING`` and no
+    explicit ``checkpointer``, the graph runs uncheckpointed exactly as
+    before — resume/reuse behavior (issue #11) requires a checkpointer that
+    actually persists CrewState across calls with the same ``thread_id``.
+    """
+    if config is None:
+        config = {}
+    config.setdefault("configurable", {})
+    thread_id = config["configurable"].setdefault("thread_id", str(uuid.uuid4()))
+    user_id = config["configurable"].setdefault("user_id", "default")
+
+    state = {"messages": [HumanMessage(content=user_question)]}
+
+    langfuse_client, langfuse_trace, handler = get_langfuse_handler(
+        session_id=thread_id,
+        tags=["agent:Planner"],
+        user_id=user_id,
+    )
+    if handler is not None:
+        config.setdefault("callbacks", [])
+        config["callbacks"].append(handler)
+
+    conn_string = os.getenv("POSTGRES_CONNECTION_STRING")
+
+    def _do_invoke(_state, _config, _checkpointer, _store):
+        graph = build_graph(
+            checkpointer=_checkpointer,
+            store=_store,
+            runtime_config=_config,
+        )
+        return graph.invoke(_state, _config)
+
+    def _run():
+        if checkpointer is not None:
+            return _do_invoke(state, config, checkpointer, store if store is not None else InMemoryStore())
+        if conn_string:
+            with (
+                PostgresSaver.from_conn_string(conn_string) as pg_checkpointer,
+                PostgresStore.from_conn_string(conn_string) as pg_store,
+            ):
+                pg_checkpointer.setup()
+                pg_store.setup()
+                return _do_invoke(state, config, pg_checkpointer, pg_store)
+        return _do_invoke(state, config, None, store if store is not None else InMemoryStore())
+
+    result = _run()
+    _finish_langfuse_trace(langfuse_client, langfuse_trace, metadata=_run_metadata(result))
+    if langfuse_trace is not None:
+        result.setdefault("artifacts", {})["langfuse_trace_id"] = langfuse_trace.id
+
+    return result
