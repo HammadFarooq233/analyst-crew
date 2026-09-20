@@ -17,6 +17,7 @@ from analyst_crew.reporting.report import Report, render_report
 from analyst_crew.tools.fred import fred_cpi_data_source
 from analyst_crew.tools.sales import sales_data_source
 from analyst_crew.tools.targets import sales_targets_data_source
+from tests.report_properties import report_property_violations
 from tests.crew_harness import (
     QUESTION, ScriptedReporterModel, base_rows, body_numbers, crew_plan, displays, invalid_stray_digit,
     invalid_unknown_id, run_crew, valid_content, write_sales,
@@ -228,7 +229,7 @@ class TestMandatoryCaveatsAndMethodology:
         findings = result["artifacts"]["findings"]
         for limitation in findings.revenue_bridge.limitations:
             assert limitation in caveats
-        assert "4 source rows" in caveats and "0 were quarantined" in caveats and "0 were excluded as duplicate" in caveats
+        assert "4 source rows" in caveats and "0 were quarantined" in caveats and "including 0 excluded as duplicate" in caveats
         assert "2025-06-01 to 2025-06-30" in methodology
         assert "15.0%" in methodology and "5.0%" in methodology
         assert findings.dataset_content_hash in methodology and findings.dataset_artifact_id in methodology
@@ -381,3 +382,23 @@ class TestPlannerCapabilities:
         assert reporter.calls == 0
         assert "report" not in result["artifacts"]
         assert isinstance(result["artifacts"]["plan"], Plan)
+
+
+class TestReportPropertyCheck:
+    """Guards the shared property check itself, so the live and eval uses cannot pass vacuously."""
+
+    def test_a_healthy_report_has_no_violations_and_regressions_are_flagged(self, source, tmp_path, monkeypatch):
+        result, _ = run_crew(source, tmp_path, monkeypatch)
+        report, catalog = result["artifacts"]["report"], result["artifacts"]["evidence_catalog"]
+        findings = result["artifacts"]["findings"]
+
+        assert report_property_violations(report, catalog, findings) == []
+
+        broken = report.model_copy(update={
+            "caveats": [], "findings": report.findings[:1],
+            "summary": report.summary.model_copy(update={"text": "Sales grew 33 percent."}),
+        })
+        violations = " | ".join(report_property_violations(broken, catalog, findings))
+        assert "digit outside a placeholder" in violations
+        assert "limitation missing from Caveats" in violations
+        assert "Material Change not covered" in violations

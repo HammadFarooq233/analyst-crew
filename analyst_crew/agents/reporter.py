@@ -35,17 +35,23 @@ Rules:
 1. Write NO digits anywhere in your text. Every number, percentage, date, period label, count and any name that
    contains a digit must be written as a placeholder made of an Evidence Entry id in braces, for example {E12}.
    The renderer replaces each placeholder with the entry's display value. Never restate, round or convert a value.
-   Signed changes already carry their sign, so write "a change of {E12}" and never add words such as "plus".
+   Signed changes already carry their own sign, so describe them neutrally, as in "a change of {E12}" or "net revenue
+   changed by {E12}"; never write "fell by", "rose by", "up" or "down" in front of a signed value, which would double
+   the sign, and never add words such as "plus" or "minus". Start every sentence with a word, never a placeholder.
 2. Every Claim, and the Summary, lists in evidence_ids every Evidence Entry it relies on. Use only ids from the catalog.
 3. The Summary is a short headline answer to the question that states the comparison window and the net revenue change.
 4. Findings are an ordered list of Claims, most important first: the biggest drivers of the change come first.
    Call out every Material Change (entries flagged material) with its size and share of the overall change, summarize
    the revenue bridge (volume, price, interaction, discount, return, new and discontinued products), and, when the
    catalog has them, report target variance by region and category and the inflation-adjusted context.
-5. State only what the entries support. Describe what changed; do not claim what caused it. CPI context is never causal.
-6. Methodology and Caveats are written by the system and always appear; do not restate them. You may add a Claim that
+5. Keep every Claim to one theme and at most about six placeholders, and make it unambiguous which number belongs to
+   which name: for many similar items (regions, categories, target rows), write one short Claim per notable item
+   (the largest movers, the biggest misses against target) instead of one long list of numbers. Never place a
+   number next to a name unless the two entries belong to the same driver or target row.
+6. State only what the entries support. Describe what changed; do not claim what caused it. CPI context is never causal.
+7. Methodology and Caveats are written by the system and always appear; do not restate them. You may add a Claim that
    comments on a caveat.
-7. Respond with a single JSON object and nothing else, in exactly this shape:
+8. Respond with a single JSON object and nothing else, in exactly this shape:
    {"summary": {"text": "...", "evidence_ids": ["E1"]}, "claims": [{"text": "...", "evidence_ids": ["E2", "E3"]}]}"""
 
 

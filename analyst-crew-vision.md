@@ -207,7 +207,7 @@ progresses. Update this table, don't just the roadmap above.
 | --------------------------- | ----------- | --------------------------------------------------------- |
 | 0 – Walking skeleton        | Complete*   | Implemented across commits; infrastructure is runnable    |
 | 1 – Real tool use           | Complete    | Live acceptance passed 2026-09-19 (see docs/phase-1-acceptance-status.md) |
-| 2 – Full orchestration      | Not started | Visualizer, Critic, Reporter join                         |
+| 2 – Full orchestration      | In progress | Slice 1 (Reporter, issue #13) done: cited Reports over an Evidence Catalog, live-accepted 2026-09-20 (see docs/phase-2-reporter-acceptance-status.md). Visualizer and Critic still to join |
 | 3 – Memory, deepened        | Not started |                                                           |
 | 4 – Observability, deepened | Not started |                                                           |
 | 5 – Evals                   | Not started |                                                           |

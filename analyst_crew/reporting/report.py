@@ -150,8 +150,8 @@ def assemble_caveats(catalog: EvidenceCatalog) -> list[Claim]:
 
     caveats.append(template_claim(
         f"Data quality: {ref('data_quality.source_rows')} source rows were read, "
-        f"{ref('data_quality.included_rows')} were included, {ref('data_quality.quarantined_rows')} were "
-        f"quarantined and {ref('data_quality.duplicate_rows')} were excluded as duplicate order ids. "
+        f"{ref('data_quality.included_rows')} were included and {ref('data_quality.quarantined_rows')} were "
+        f"quarantined, including {ref('data_quality.duplicate_rows')} excluded as duplicate order ids. "
         f"The calculable gross revenue impact of the excluded rows is {ref('data_quality.excluded_revenue_impact')}."
     ))
     for entry in catalog.entries:
@@ -270,6 +270,17 @@ def _substitute(text: str, catalog: EvidenceCatalog) -> str:
     return PLACEHOLDER.sub(replace, text)
 
 
+def _sentence(text: str, catalog: EvidenceCatalog) -> str:
+    """Substituted text with its first letter capitalised, because a placeholder
+    (a lower-cased dimension value, say) may open the sentence."""
+    text = _substitute(text, catalog)
+    return text[:1].upper() + text[1:]
+
+
+def _brief(text: str, limit: int = 110) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
 def _citation(claim: Claim) -> str:
     return f" `[{', '.join(claim.evidence_ids)}]`" if claim.evidence_ids else ""
 
@@ -281,8 +292,8 @@ def render_report(report: Report, catalog: EvidenceCatalog) -> str:
     if report.fallback_notice:
         lines += [f"> **Fallback Report.** {report.fallback_notice}", ""]
     lines += [f"**Question:** {report.question}", "", "## Summary", "",
-              _substitute(report.summary.text, catalog) + _citation(report.summary), "", "## Findings", ""]
-    lines += [f"{number}. {_substitute(claim.text, catalog)}{_citation(claim)}"
+              _sentence(report.summary.text, catalog) + _citation(report.summary), "", "## Findings", ""]
+    lines += [f"{number}. {_sentence(claim.text, catalog)}{_citation(claim)}"
               for number, claim in enumerate(report.findings, start=1)]
     lines += ["", "## Charts", ""]
     lines += [f"- {chart}" for chart in report.charts] or [f"_{CHARTS_NOTICE}_"]
@@ -293,5 +304,5 @@ def render_report(report: Report, catalog: EvidenceCatalog) -> str:
     evidence = [entry for entry in catalog.entries if entry.id in cited]
     if evidence:
         lines += ["", "## Evidence", ""]
-        lines += [f"- `{entry.id}` {entry.label}: {entry.display} (`{entry.source}`)" for entry in evidence]
+        lines += [f"- `{entry.id}` {entry.label}: {_brief(entry.display)} (`{entry.source}`)" for entry in evidence]
     return "\n".join(lines) + "\n"

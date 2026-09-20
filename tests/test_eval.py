@@ -4,9 +4,9 @@ import json
 
 import pytest
 from deepeval import assert_test
-from deepeval.metrics import GEval
+from deepeval.metrics import BaseMetric, GEval
 from deepeval.models import DeepEvalBaseLLM
-from deepeval.test_case import LLMTestCase, LLMTestCaseParams
+from deepeval.test_case import LLMTestCase, LLMTestCaseParams, SingleTurnParams
 from langchain_core.messages import HumanMessage
 from analyst_crew.llm import make_chat_model
 from langgraph.store.memory import InMemoryStore
@@ -96,3 +96,66 @@ def test_golden_plan_structure():
     )
 
     assert_test(test_case, [metric])
+
+class ReportPropertiesMetric(BaseMetric):
+    """Deterministic DeepEval metric over a Report's properties (issue #13):
+    no stray digits, every limitation and the data-quality disclosure present,
+    every Material Change covered, every rendered number in the Evidence
+    Catalog. Score is the share of checks that hold; no wording is compared."""
+
+    _required_params = [SingleTurnParams.ACTUAL_OUTPUT]
+
+    def __init__(self, report, catalog, findings, threshold: float = 1.0):
+        self.report, self.catalog, self.findings = report, catalog, findings
+        self.threshold = threshold
+        self.async_mode = False
+        self.include_reason = True
+
+    @property
+    def __name__(self):
+        return "Report Properties"
+
+    def measure(self, test_case, *args, **kwargs) -> float:
+        from tests.report_properties import report_property_violations
+
+        violations = report_property_violations(self.report, self.catalog, self.findings)
+        checks = 4 + len(self.report.findings) + len(violations)  # coarse denominator; any violation fails the threshold
+        self.score = 1.0 if not violations else max(0.0, 1 - len(violations) / checks)
+        self.reason = "all Report properties hold" if not violations else "; ".join(violations)
+        self.success = self.score >= self.threshold
+        return self.score
+
+    async def a_measure(self, test_case, *args, **kwargs) -> float:
+        return self.measure(test_case)
+
+    def is_successful(self) -> bool:
+        return bool(self.success)
+
+
+@pytest.mark.eval
+def test_golden_report_properties(tmp_path):
+    """The live Reporter's Report satisfies the ADR-0002 properties for the documented scenario."""
+    if not llm_credentials_available():
+        pytest.skip("LLM credentials not set")
+    if not os.path.exists("data/sales.csv"):
+        pytest.skip("run scripts/generate_sales_data.py first")
+
+    from analyst_crew.agents import invoke
+    from analyst_crew.reporting.report import render_report
+    from analyst_crew.tools.fred import fred_cpi_data_source
+    from analyst_crew.tools.targets import sales_targets_data_source
+
+    question = "Compare this month's sales to last month and flag anything unusual"
+    result = invoke(question, {"configurable": {
+        "data_sources": {**sales_data_source("data/sales.csv"), **sales_targets_data_source(), **fred_cpi_data_source()},
+        "artifact_dir": str(tmp_path / "artifacts"),
+        "analysis_parameters": {"as_of_date": "2025-06-30"},
+    }})
+    artifacts = result["artifacts"]
+    if artifacts.get("plan_error"):
+        pytest.skip(f"Planner API error: {artifacts['plan_error']}")
+    assert artifacts["report_mode"] == "llm", artifacts.get("terminal_failure")
+
+    rendered = render_report(artifacts["report"], artifacts["evidence_catalog"])
+    metric = ReportPropertiesMetric(artifacts["report"], artifacts["evidence_catalog"], artifacts["findings"])
+    assert_test(LLMTestCase(input=question, actual_output=rendered), [metric])
