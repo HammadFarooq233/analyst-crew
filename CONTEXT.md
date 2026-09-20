@@ -93,6 +93,22 @@ _Avoid_: Input, dataset location, connector
 The Analyst's structured output containing computed metrics, comparisons, material changes, anomalies, and data-quality limitations. Findings are evidence for a later Report; they are not themselves polished narrative prose.
 _Avoid_: Report, answer, analysis text
 
+**Evidence Catalog**:
+A deterministic, code-built flattening of Findings into a numbered list of Evidence Entries. The Reporter selects from it; it never computes or copies values itself.
+_Avoid_: Fact list, context dump
+
+**Evidence Entry**:
+One citable fact in the Evidence Catalog: a stable id, the raw value, its display rendering, and the Findings field it came from. Claims cite Evidence Entries by id.
+_Avoid_: Reference, citation, fact
+
+**Claim**:
+A single statement in a Report's Findings section, written by the Reporter and citing one or more Evidence Entries. A Claim is only valid if every cited id exists in the Evidence Catalog.
+_Avoid_: Statement, insight, finding (the singular is ambiguous with Findings)
+
+**Fallback Report**:
+A deterministic, template-only Report built from the Evidence Catalog when the Reporter fails after its bounded retry. It is visibly marked as generated without the Reporter Agent, and the Reporter's failure is still recorded.
+_Avoid_: Degraded report, default report
+
 **Dataset Artifact**:
 A durable, content-addressed reference to normalized fetched data. It carries provenance, schema, profile, integrity hash, and storage location; full datasets do not live in CrewState.
 _Avoid_: Dataset, raw records, state payload
