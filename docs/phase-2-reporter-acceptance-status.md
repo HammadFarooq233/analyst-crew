@@ -13,7 +13,7 @@ The Phase 1 live-acceptance evidence about Findings (`docs/phase-1-acceptance-st
 | The Reporter is its own span with the LLM generation nested under it | `tests/test_reporter_live.py::test_reporter_is_its_own_trace_span_with_the_llm_generation_nested_under_it` (Langfuse v2 API: a `reporter_node` observation with a `GENERATION` descendant; trace metadata has the run's `report_mode`) |
 | Unchanged resume reuses the Report with no model call | Live through the Postgres checkpointer: second invocation on the same thread recorded `reused / unchanged` for all three Steps and an identical Report. Offline: `tests/test_reporter.py::TestResume` (also changed Findings invalidate it, and a failed Reporter is retried, not reused) |
 
-Full suite on this date: `pytest` (all markers) — 178 passed, 1 skipped.
+Full suite on this date: `pytest` (all markers) — 178 passed, 1 skipped (the live FRED test, no `FRED_API_KEY`). After the code-review fixes the offline suite is 166 passed and the Reporter live, integration and eval tests were re-run and passed (5).
 
 ## What was and was not exercised live
 
