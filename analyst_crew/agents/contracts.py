@@ -7,6 +7,9 @@ from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 AGENTS = ("Fetcher", "Analyst", "Visualizer", "Critic", "Reporter")
 PHASE1_AGENTS = ("Fetcher", "Analyst")
+PHASE2_AGENTS = ("Fetcher", "Analyst", "Reporter")
+# The Agents the Crew can currently execute; the Planner may only assign Steps to these.
+CREW_AGENTS = PHASE2_AGENTS
 
 
 class SourceReference(BaseModel):
@@ -229,7 +232,7 @@ def resolve_handoff(step: Step, plan: Plan, artifacts: Mapping[str, Any],
 class Crew:
     """Capability boundary used by callers to validate and resolve Plans."""
 
-    def __init__(self, available_agents: Sequence[str] = PHASE1_AGENTS,
+    def __init__(self, available_agents: Sequence[str] = CREW_AGENTS,
                  data_sources: Mapping[str, Any] | Sequence[str] = ()):
         self.available_agents = set(available_agents)
         unknown = self.available_agents - set(AGENTS)

@@ -159,6 +159,9 @@ def _run_metadata(result: CrewState) -> dict[str, Any]:
     terminal_failure = artifacts.get("terminal_failure")
     if terminal_failure:
         metadata["terminal_failure"] = terminal_failure
+    report_mode = artifacts.get("report_mode")
+    if report_mode:
+        metadata["report_mode"] = report_mode
     step_outcomes = artifacts.get("step_outcomes")
     if step_outcomes:
         metadata["step_outcomes"] = {

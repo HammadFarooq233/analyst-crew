@@ -1,7 +1,7 @@
 """Fetcher graph node: resolves the Fetcher Handoff and produces the Dataset Artifact."""
 from typing import Any
 
-from analyst_crew.agents.contracts import PHASE1_AGENTS, Crew, Plan
+from analyst_crew.agents.contracts import CREW_AGENTS, Crew, Plan
 from analyst_crew.agents.resume import _resume_decision, _source_content_hash, execution_key
 from analyst_crew.state import CrewState
 from analyst_crew.tools.sales import FetcherAgent, production_fetcher_model
@@ -30,7 +30,7 @@ def fetcher_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
         return {"current_step": "fetcher_node"}
     agent = None
     try:
-        crew = Crew(available_agents=configurable.get("available_agents", PHASE1_AGENTS), data_sources=catalog)
+        crew = Crew(available_agents=configurable.get("available_agents", CREW_AGENTS), data_sources=catalog)
         handoff = crew.resolve_handoff(fetch_step, plan, state.get("artifacts", {}).get("datasets", {}))
 
         source_hash = None

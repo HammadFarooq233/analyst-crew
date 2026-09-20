@@ -13,6 +13,7 @@ from analyst_crew.agents import planner as planner_module
 from analyst_crew.agents.analyst import analyst_node
 from analyst_crew.agents.contracts import Plan
 from analyst_crew.agents.fetcher import fetcher_node
+from analyst_crew.agents.reporter import reporter_node
 from analyst_crew.agents.tracing import _finish_langfuse_trace, _run_metadata, get_langfuse_handler
 from analyst_crew.state import CrewState
 
@@ -45,7 +46,14 @@ def build_graph(checkpointer=None, store=None, runtime_config: dict | None = Non
         plan = state.get("artifacts", {}).get("plan")
         return "analyst_node" if isinstance(plan, Plan) and any(step.agent == "Analyst" for step in plan.steps) else END
     graph.add_conditional_edges("fetcher_node", after_fetcher, {"analyst_node": "analyst_node", END: END})
-    graph.add_edge("analyst_node", END)
+    graph.add_node("reporter_node", lambda state, config=None: reporter_node(state, merged_config(config)))
+    def after_analyst(state: CrewState) -> str:
+        if state.get("artifacts", {}).get("terminal_failure"):
+            return END
+        plan = state.get("artifacts", {}).get("plan")
+        return "reporter_node" if isinstance(plan, Plan) and any(step.agent == "Reporter" for step in plan.steps) else END
+    graph.add_conditional_edges("analyst_node", after_analyst, {"reporter_node": "reporter_node", END: END})
+    graph.add_edge("reporter_node", END)
     return graph.compile(checkpointer=checkpointer, store=store)
 
 

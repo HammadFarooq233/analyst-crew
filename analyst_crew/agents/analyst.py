@@ -2,7 +2,7 @@
 from collections.abc import Mapping
 from typing import Any
 
-from analyst_crew.agents.contracts import PHASE1_AGENTS, Crew, Plan
+from analyst_crew.agents.contracts import CREW_AGENTS, Crew, Plan
 from analyst_crew.agents.resume import _resume_decision, execution_key
 from analyst_crew.state import CrewState
 from analyst_crew.tools.analysis import AnalystAgent, BaselineFindings, production_analyst_model
@@ -34,7 +34,7 @@ def analyst_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
     agent = None
     try:
         crew = Crew(
-            available_agents=configurable.get("available_agents", PHASE1_AGENTS),
+            available_agents=configurable.get("available_agents", CREW_AGENTS),
             data_sources=configurable.get("data_sources", {}),
         )
         analysis_parameters = dict(configurable.get("analysis_parameters", {}))

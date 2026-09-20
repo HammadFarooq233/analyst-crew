@@ -122,6 +122,8 @@ def _resume_decision(state: CrewState, step_id: str, current_key: str) -> tuple[
 
     if isinstance(prior_failure, Mapping) and prior_failure.get("step_id") == step_id:
         return "recomputed", "failed"
+    if isinstance(prior_outcome, Mapping) and prior_outcome.get("status") == "failed":
+        return "recomputed", "failed"
     if isinstance(prior_outcome, Mapping) and prior_outcome.get("status") == "completed":
         if prior_outcome.get("execution_key") == current_key:
             return "reused", "unchanged"

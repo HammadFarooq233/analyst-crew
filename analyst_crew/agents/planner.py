@@ -6,7 +6,7 @@ from langgraph.config import get_store
 
 import config
 from analyst_crew.agents.contracts import (  # noqa: F401 — re-exported for existing importers
-    AGENTS, PHASE1_AGENTS, ArtifactBinding, Crew, Handoff, Plan, SourceReference, Step, resolve_handoff,
+    AGENTS, CREW_AGENTS, PHASE1_AGENTS, PHASE2_AGENTS, ArtifactBinding, Crew, Handoff, Plan, SourceReference, Step, resolve_handoff,
 )
 from analyst_crew.agents.resume import _resume_decision, _source_content_hash, execution_key  # noqa: F401
 from analyst_crew.llm import make_chat_model
@@ -34,8 +34,8 @@ Rules:
 3. Each Step must name exactly one Agent from the list above.
 4. depends_on must reference only step_ids from earlier Steps in the plan (never itself, never a later Step).
 5. The Steps must form a valid dependency order — no cycles, no forward references.
-6. For the Phase 1 sales comparison, produce exactly a Fetcher Step followed by a dependent Analyst Step.
-7. The Fetcher must use a supplied Data Source and declare one Dataset Artifact output. The Analyst must depend on that Fetcher output and declare Findings.
+6. For the sales comparison, produce exactly a Fetcher Step followed by a dependent Analyst Step, and, when Reporter is among the validated capabilities for this run, a final Reporter Step that depends on the Analyst Step.
+7. The Fetcher must use a supplied Data Source and declare one Dataset Artifact output. The Analyst must depend on that Fetcher output and declare Findings. The Reporter, when present, must depend only on the Analyst Step, declare one Report output, and have empty source_ids.
 8. Include the exact user_question text in the Plan.
 9. Use these Step keys: `step_id`, `agent`, `objective`, `source_ids`, `expected_output`, `declared_artifacts`, and `depends_on`.
 10. Never invent a Data Source ID, filesystem location, executable SQL, or arithmetic result.
@@ -54,7 +54,7 @@ class PlannerAgent:
         data_sources: Mapping[str, Any] | Sequence[str] = (),
         llm=None,
     ):
-        self.available_agents = set(PHASE1_AGENTS if available_agents is None else available_agents)
+        self.available_agents = set(CREW_AGENTS if available_agents is None else available_agents)
         invalid = self.available_agents - set(AGENTS)
         if invalid:
             raise ValueError(f"Unknown available Agents: {sorted(invalid)}")
@@ -145,10 +145,14 @@ class PlannerAgent:
             unknown_sources = {source for step in plan.steps for source in step.source_ids} - catalog
             if unknown_sources:
                 raise ValueError(f"Plan references unknown Data Sources: {sorted(unknown_sources)}")
-            if allowed_agents == set(PHASE1_AGENTS) and "sales_csv" in catalog:
-                if len(plan.steps) != 2 or [step.agent for step in plan.steps] != ["Fetcher", "Analyst"]:
-                    raise ValueError("Phase 1 sales Plan must contain exactly Fetcher then Analyst Steps")
-                fetch_step, analyst_step = plan.steps
+            if allowed_agents in (set(PHASE1_AGENTS), set(PHASE2_AGENTS)) and "sales_csv" in catalog:
+                expected_agents = ["Fetcher", "Analyst", "Reporter"] if "Reporter" in allowed_agents else ["Fetcher", "Analyst"]
+                if [step.agent for step in plan.steps] != expected_agents:
+                    raise ValueError(
+                        "Sales Plan must contain exactly " + ", ".join(expected_agents[:-1])
+                        + f" then {expected_agents[-1]} Steps"
+                    )
+                fetch_step, analyst_step = plan.steps[0], plan.steps[1]
                 if fetch_step.source_ids != ["sales_csv"]:
                     raise ValueError("Phase 1 Fetcher must use the catalogued sales_csv Data Source")
                 if analyst_step.depends_on != [fetch_step.step_id]:
@@ -157,6 +161,12 @@ class PlannerAgent:
                     raise ValueError("Phase 1 Fetcher must declare a Dataset Artifact output")
                 if not (analyst_step.declared_artifacts or [analyst_step.expected_output]):
                     raise ValueError("Phase 1 Analyst must declare a Findings output")
+                if len(plan.steps) == 3:
+                    reporter_step = plan.steps[2]
+                    if reporter_step.depends_on != [analyst_step.step_id]:
+                        raise ValueError("Reporter must depend on the Analyst Step")
+                    if reporter_step.source_ids:
+                        raise ValueError("Reporter Step must not name Data Sources; it consumes Findings")
 
         # Contract-invalid Plan output — malformed JSON or a structurally
         # valid Plan that still violates a Planner rule (unavailable Agent,
