@@ -68,3 +68,7 @@ Checkpoint resume uses a Step execution key derived from the Step, analysis para
 - Exact CSV columns keep correctness testable; flexible schema inference is deferred.
 - The deterministic analysis boundary is auditable and does not weaken the established safety model.
 - Reporter prose, visualization, critique, arbitrary analysis code, and remembered analytical preferences remain later-phase work.
+
+## Amendment
+
+ADR-0002 adds the Reporter as a third available Agent, so the Crew's default capability set is now Fetcher, Analyst and Reporter, and the sales Plan is Fetcher, Analyst, Reporter. The bounded-failure, Handoff and resume rules above apply to the Reporter Step unchanged; the Reporter's failure degrades to a Fallback Report instead of stopping the run.

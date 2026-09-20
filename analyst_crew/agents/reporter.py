@@ -225,11 +225,16 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
             available_agents=configurable.get("available_agents", CREW_AGENTS),
             data_sources=configurable.get("data_sources", {}),
         )
-        handoff = crew.resolve_handoff(
-            reporter_step, plan,
-            {**artifacts.get("step_outputs", {}), **{name: findings_reference for name in findings_names}},
-            analysis_parameters,
-        )
+        handoff, handoff_error = None, None
+        try:
+            handoff = crew.resolve_handoff(
+                reporter_step, plan,
+                {**artifacts.get("step_outputs", {}), **{name: findings_reference for name in findings_names}},
+                analysis_parameters,
+            )
+        except ValueError as exc:
+            # The Findings and catalog are fine, so this still degrades to a Fallback Report below.
+            handoff_error = exc
         current_key = execution_key(
             reporter_step, analysis_parameters=analysis_parameters, input_artifact_hashes=[current_hash],
         )
@@ -237,6 +242,8 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
 
         prior_outcome = artifacts.get("step_outcomes", {}).get(reporter_step.step_id, {})
         report = None
+        if handoff_error is not None and resume_outcome == "reused":
+            resume_outcome, resume_reason = "recomputed", "invalidated"
         if resume_outcome == "reused":
             stored = artifacts.get("report")
             if stored is None:
@@ -250,6 +257,8 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
             retry_counts = prior_outcome.get("retry_counts") or {"validation_retries": 0, "tool_retries": 0}
         else:
             try:
+                if handoff_error is not None:
+                    raise handoff_error
                 model = configurable.get("reporter_model") or production_reporter_model()
                 agent = ReporterAgent(model)
                 content = agent.run(handoff, catalog, config=config)
@@ -283,7 +292,9 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
                     "retry_counts": retry_counts,
                     "degraded_to": "fallback_report",
                 },
-                "handoffs": {**artifacts.get("handoffs", {}), reporter_step.step_id: handoff.model_dump(mode="json")},
+                "handoffs": artifacts.get("handoffs", {}) if handoff is None else {
+                    **artifacts.get("handoffs", {}), reporter_step.step_id: handoff.model_dump(mode="json"),
+                },
                 "step_outcomes": {
                     **artifacts.get("step_outcomes", {}),
                     reporter_step.step_id: {

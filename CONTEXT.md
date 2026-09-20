@@ -98,11 +98,11 @@ A deterministic, code-built flattening of Findings into a numbered list of Evide
 _Avoid_: Fact list, context dump
 
 **Evidence Entry**:
-One citable fact in the Evidence Catalog: a stable id, the raw value, its display rendering, and the Findings field it came from. Claims cite Evidence Entries by id.
+One citable fact in the Evidence Catalog: a stable id, the raw value, its display rendering, and the Findings field it came from. It also carries a human-readable label for the Reporter and, for a driver or target row, a group key and a Material Change flag. Claims cite Evidence Entries by id.
 _Avoid_: Reference, citation, fact
 
 **Claim**:
-A single statement in a Report's Findings section, written by the Reporter and citing one or more Evidence Entries. A Claim is only valid if every cited id exists in the Evidence Catalog.
+A single item of a Report's Summary or Findings section, written by the Reporter and citing one or more Evidence Entries. Code-assembled Caveats and Methodology lines are not Claims. A Claim is only valid if every cited id exists in the Evidence Catalog.
 _Avoid_: Statement, insight, finding (the singular is ambiguous with Findings)
 
 **Fallback Report**:

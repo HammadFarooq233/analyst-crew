@@ -23,12 +23,21 @@ FALLBACK_NOTICE = (
 CHARTS_NOTICE = "Reserved. Charts are not generated yet; no Visualizer Agent is part of the Crew."
 
 
-class Claim(BaseModel):
-    """A statement whose numbers are placeholders (``{E3}``) that the renderer
-    replaces with an Evidence Entry's display string, plus the ids it cites."""
+class CitedText(BaseModel):
+    """Text whose numbers are placeholders (``{E3}``) that the renderer replaces
+    with an Evidence Entry's display string, plus the ids it cites."""
 
     text: str
     evidence_ids: list[str] = Field(default_factory=list)
+
+
+class Claim(CitedText):
+    """One item of the Summary or the Findings section, written by the Reporter
+    (or, in a Fallback Report, by a fixed template)."""
+
+
+class ReportLine(CitedText):
+    """One code-assembled line of the Caveats or Methodology section; never model-written."""
 
 
 class ReporterContent(BaseModel):
@@ -46,8 +55,8 @@ class Report(BaseModel):
     summary: Claim
     findings: list[Claim]
     charts: list[str] = Field(default_factory=list)
-    caveats: list[Claim]
-    methodology: list[Claim]
+    caveats: list[ReportLine]
+    methodology: list[ReportLine]
 
     @model_validator(mode="after")
     def fallback_is_marked(self) -> "Report":
@@ -69,9 +78,18 @@ def placeholders_in(text: str) -> list[str]:
     return PLACEHOLDER.findall(text)
 
 
+def _cited_ids(text: str) -> list[str]:
+    return list(dict.fromkeys(placeholders_in(text)))
+
+
 def template_claim(text: str) -> Claim:
     """A code-written Claim citing exactly the entries its placeholders name."""
-    return Claim(text=text, evidence_ids=list(dict.fromkeys(placeholders_in(text))))
+    return Claim(text=text, evidence_ids=_cited_ids(text))
+
+
+def template_line(text: str) -> ReportLine:
+    """A code-assembled Caveats or Methodology line citing the entries its placeholders name."""
+    return ReportLine(text=text, evidence_ids=_cited_ids(text))
 
 
 def validate_reporter_content(content: ReporterContent, catalog: EvidenceCatalog) -> ReporterContent:
@@ -117,18 +135,18 @@ def validate_reporter_content(content: ReporterContent, catalog: EvidenceCatalog
     return ReporterContent(summary=summary, claims=claims)
 
 
-def _entry_placeholder(entry: EvidenceEntry | None) -> str:
-    return "" if entry is None else "{" + entry.id + "}"
+def _entry_placeholder(entry: EvidenceEntry) -> str:
+    return "{" + entry.id + "}"
 
 
-def assemble_caveats(catalog: EvidenceCatalog) -> list[Claim]:
+def assemble_caveats(catalog: EvidenceCatalog) -> list[ReportLine]:
     """Every Findings limitation, every non-available optional source status,
     the CPI non-causality caveat when CPI is present, and the quarantine and
     duplicate disclosure. Mandatory: not selectable by the Reporter."""
-    caveats: list[Claim] = []
+    caveats: list[ReportLine] = []
     for entry in catalog.entries:
         if entry.source.startswith(("limitations.", "revenue_bridge.limitations.")):
-            caveats.append(template_claim("{" + entry.id + "}"))
+            caveats.append(template_line("{" + entry.id + "}"))
 
     optional_sources = (
         ("target_comparison.status", "Sales-target comparison", "no sales-targets Data Source was configured"),
@@ -137,18 +155,18 @@ def assemble_caveats(catalog: EvidenceCatalog) -> list[Claim]:
     for source, name, absent_reason in optional_sources:
         status = catalog.find_source(source)
         if status is None:
-            caveats.append(template_claim(f"{name} was not part of this run ({absent_reason})."))
+            caveats.append(template_line(f"{name} was not part of this run ({absent_reason})."))
         elif status.value != "available":
-            caveats.append(template_claim(f"{name} is not included in this Report. Source status: {{{status.id}}}."))
+            caveats.append(template_line(f"{name} is not included in this Report. Source status: {{{status.id}}}."))
 
     non_causality = catalog.find_source("cpi_adjustment.non_causality_caveat")
     if non_causality is not None:
-        caveats.append(template_claim("{" + non_causality.id + "}"))
+        caveats.append(template_line("{" + non_causality.id + "}"))
 
     def ref(source: str) -> str:
-        return _entry_placeholder(catalog.find_source(source))
+        return _entry_placeholder(catalog.by_source(source))
 
-    caveats.append(template_claim(
+    caveats.append(template_line(
         f"Data quality: {ref('data_quality.source_rows')} source rows were read, "
         f"{ref('data_quality.included_rows')} were included and {ref('data_quality.quarantined_rows')} were "
         f"quarantined, including {ref('data_quality.duplicate_rows')} excluded as duplicate order ids. "
@@ -156,13 +174,13 @@ def assemble_caveats(catalog: EvidenceCatalog) -> list[Claim]:
     ))
     for entry in catalog.entries:
         if entry.source.startswith("data_quality.quarantine_reasons."):
-            caveats.append(template_claim(f"{entry.label}: {{{entry.id}}}."))
+            caveats.append(template_line(f"{entry.label}: {{{entry.id}}}."))
     return caveats
 
 
-def assemble_methodology(catalog: EvidenceCatalog) -> list[Claim]:
+def assemble_methodology(catalog: EvidenceCatalog) -> list[ReportLine]:
     def ref(source: str) -> str:
-        return _entry_placeholder(catalog.find_source(source))
+        return _entry_placeholder(catalog.by_source(source))
 
     lines = [
         f"Comparison window: {ref('window.current_period')} compared with {ref('window.prior_period')}, "
@@ -188,7 +206,7 @@ def assemble_methodology(catalog: EvidenceCatalog) -> list[Claim]:
         f"Row counts: {ref('data_quality.source_rows')} source, {ref('data_quality.included_rows')} included, "
         f"{ref('data_quality.quarantined_rows')} quarantined, {ref('data_quality.duplicate_rows')} duplicates excluded."
     )
-    return [template_claim(line) for line in lines]
+    return [template_line(line) for line in lines]
 
 
 def build_report(content: ReporterContent, catalog: EvidenceCatalog, question: str) -> Report:
@@ -205,7 +223,7 @@ def build_fallback_report(catalog: EvidenceCatalog, question: str) -> Report:
     Caveats and Methodology. Visibly marked as generated without the Reporter."""
 
     def ref(source: str) -> str:
-        return _entry_placeholder(catalog.find_source(source))
+        return _entry_placeholder(catalog.by_source(source))
 
     change = f"a change of {ref('net_revenue.absolute_change')}"
     if catalog.find_source("net_revenue.percent_change") is not None:
@@ -277,7 +295,7 @@ def _sentence(text: str, catalog: EvidenceCatalog) -> str:
     return text[:1].upper() + text[1:]
 
 
-def _brief(text: str, limit: int = 110) -> str:
+def _truncate(text: str, limit: int = 110) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
@@ -304,5 +322,5 @@ def render_report(report: Report, catalog: EvidenceCatalog) -> str:
     evidence = [entry for entry in catalog.entries if entry.id in cited]
     if evidence:
         lines += ["", "## Evidence", ""]
-        lines += [f"- `{entry.id}` {entry.label}: {_brief(entry.display)} (`{entry.source}`)" for entry in evidence]
+        lines += [f"- `{entry.id}` {entry.label}: {_truncate(entry.display)} (`{entry.source}`)" for entry in evidence]
     return "\n".join(lines) + "\n"

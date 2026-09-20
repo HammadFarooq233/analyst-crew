@@ -402,3 +402,25 @@ class TestReportPropertyCheck:
         assert "digit outside a placeholder" in violations
         assert "limitation missing from Caveats" in violations
         assert "Material Change not covered" in violations
+
+
+def test_a_reporter_handoff_that_cannot_be_resolved_still_degrades_to_a_fallback_report():
+    """Defensive path the Planner's own validation normally prevents (a Reporter Step naming an unknown
+    Data Source): with sound Findings the Crew still owes Priya a cited answer, and records the failure."""
+    from analyst_crew.agents.reporter import reporter_node
+    from tests.findings_factory import make_findings
+
+    plan = crew_plan()
+    plan.steps[2] = plan.steps[2].model_copy(update={"source_ids": ["not_catalogued"]})
+    reporter = ScriptedReporterModel()
+
+    update = reporter_node(
+        {"artifacts": {"plan": plan, "findings": make_findings()}},
+        {"configurable": {"reporter_model": reporter, "data_sources": sales_data_source("sales.csv")}},
+    )
+
+    assert reporter.calls == 0
+    assert update["artifacts"]["report_mode"] == "fallback"
+    failure = update["artifacts"]["terminal_failure"]
+    assert failure["agent"] == "Reporter" and failure["required"] is False and "not_catalogued" in failure["error"]
+    assert "write_report" not in update["artifacts"].get("handoffs", {})

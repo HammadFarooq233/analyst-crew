@@ -154,13 +154,13 @@ class PlannerAgent:
                     )
                 fetch_step, analyst_step = plan.steps[0], plan.steps[1]
                 if fetch_step.source_ids != ["sales_csv"]:
-                    raise ValueError("Phase 1 Fetcher must use the catalogued sales_csv Data Source")
+                    raise ValueError("Sales Plan Fetcher must use the catalogued sales_csv Data Source")
                 if analyst_step.depends_on != [fetch_step.step_id]:
-                    raise ValueError("Phase 1 Analyst must depend on the Fetcher Step")
+                    raise ValueError("Sales Plan Analyst must depend on the Fetcher Step")
                 if not (fetch_step.declared_artifacts or [fetch_step.expected_output]):
-                    raise ValueError("Phase 1 Fetcher must declare a Dataset Artifact output")
+                    raise ValueError("Sales Plan Fetcher must declare a Dataset Artifact output")
                 if not (analyst_step.declared_artifacts or [analyst_step.expected_output]):
-                    raise ValueError("Phase 1 Analyst must declare a Findings output")
+                    raise ValueError("Sales Plan Analyst must declare a Findings output")
                 if len(plan.steps) == 3:
                     reporter_step = plan.steps[2]
                     if reporter_step.depends_on != [analyst_step.step_id]:
