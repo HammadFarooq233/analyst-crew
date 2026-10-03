@@ -272,7 +272,8 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
         if handoff_error is not None and resume_outcome == "reused":
             resume_outcome, resume_reason = "recomputed", "invalidated"
         if resume_outcome == "reused":
-            stored = artifacts.get("report")
+            # The Critic may have stored a Report with Reviewer Notes under "report"; reuse the draft.
+            stored = artifacts.get("draft_report") or artifacts.get("report")
             if stored is None:
                 # Defensive: never trust a reuse we cannot actually produce output for.
                 resume_outcome, resume_reason = "recomputed", "invalidated"
@@ -308,6 +309,7 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
             "steps_completed": [reporter_step.step_id] if completed else [],
             "artifacts": {
                 "report": report,
+                "draft_report": report,
                 "report_mode": report.report_mode,
                 "evidence_catalog": catalog,
                 "terminal_failure": None if completed else {

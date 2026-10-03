@@ -13,6 +13,7 @@ from analyst_crew.agents import planner as planner_module
 from analyst_crew.agents.analyst import analyst_node
 from analyst_crew.agents.contracts import Plan
 from analyst_crew.agents.fetcher import fetcher_node
+from analyst_crew.agents.critic import critic_node
 from analyst_crew.agents.reporter import reporter_node
 from analyst_crew.agents.visualizer import visualizer_node
 from analyst_crew.agents.tracing import _finish_langfuse_trace, _run_metadata, get_langfuse_handler
@@ -69,7 +70,16 @@ def build_graph(checkpointer=None, store=None, runtime_config: dict | None = Non
         # A chart failure is recorded on the Step and never stops the run; the Report ships without charts.
         return "reporter_node" if has_step(state, "Reporter") else END
     graph.add_conditional_edges("visualizer_node", after_visualizer, {"reporter_node": "reporter_node", END: END})
-    graph.add_edge("reporter_node", END)
+    graph.add_node("critic_node", lambda state, config=None: critic_node(state, merged_config(config)))
+
+    def after_reporter(state: CrewState) -> str:
+        # A Reporter failure still ships its Fallback Report; the Critic reviews whichever Report exists.
+        failure = state.get("artifacts", {}).get("terminal_failure")
+        if failure and failure.get("required", True):
+            return END
+        return "critic_node" if has_step(state, "Critic") and state.get("artifacts", {}).get("report") is not None else END
+    graph.add_conditional_edges("reporter_node", after_reporter, {"critic_node": "critic_node", END: END})
+    graph.add_edge("critic_node", END)
     return graph.compile(checkpointer=checkpointer, store=store)
 
 

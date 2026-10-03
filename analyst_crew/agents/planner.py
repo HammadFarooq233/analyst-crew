@@ -23,7 +23,7 @@ Available Agents:
 - Fetcher: Retrieves data from sources (CSV, Postgres, FRED API). Returns raw data — no analysis, no interpretation.
 - Analyst: Performs computation on data — statistics, joins, comparisons, trend detection. Consumes data, produces findings.
 - Visualizer: Generates charts from findings. Code supplies every plotted value from the findings; it never computes.
-- Critic: Reviews a draft report for uncited claims, missing caveats, and logical gaps.
+- Critic: Reviews the draft report for judgment errors (causal overreach, misread evidence, overstated drivers). Has no Tools; it flags issues and never adds claims.
 - Reporter: Writes the narrative report from findings and charts. Synthesizes results into prose, cites specific numbers.
 
 Any relevant facts, preferences, or conventions the user has established in prior sessions are supplied below under "Relevant memory," already retrieved for you — incorporate them into your Plan decisions. If none are supplied, there is no prior memory to draw on.
@@ -34,8 +34,8 @@ Rules:
 3. Each Step must name exactly one Agent from the list above.
 4. depends_on must reference only step_ids from earlier Steps in the plan (never itself, never a later Step).
 5. The Steps must form a valid dependency order — no cycles, no forward references.
-6. For the sales comparison, produce exactly a Fetcher Step followed by a dependent Analyst Step, then, when Visualizer is among the validated capabilities for this run, a Visualizer Step that depends on the Analyst Step, and, when Reporter is among the validated capabilities for this run, a final Reporter Step. Leave out any Step whose Agent is not among the validated capabilities.
-7. The Fetcher must use a supplied Data Source and declare one Dataset Artifact output. The Analyst must depend on that Fetcher output and declare Findings. The Visualizer, when present, must depend only on the Analyst Step, declare one Chart Artifacts output, and have empty source_ids. The Reporter, when present, must declare one Report output, have empty source_ids, and depend on the Analyst and Visualizer Steps (only on the Analyst Step when there is no Visualizer Step).
+6. For the sales comparison, produce exactly a Fetcher Step followed by a dependent Analyst Step, then, when Visualizer is among the validated capabilities for this run, a Visualizer Step that depends on the Analyst Step, and, when Reporter is among the validated capabilities for this run, a Reporter Step, and, when Critic is also among the validated capabilities, a final Critic Step that depends only on the Reporter Step. Leave out any Step whose Agent is not among the validated capabilities. When Fetcher, Analyst, Visualizer, Reporter and Critic are all available, the Plan has exactly those five Steps in that order, and the last Step is always the Critic.
+7. The Fetcher must use a supplied Data Source and declare one Dataset Artifact output. The Analyst must depend on that Fetcher output and declare Findings. The Visualizer, when present, must depend only on the Analyst Step, declare one Chart Artifacts output, and have empty source_ids. The Reporter, when present, must declare one Report output, have empty source_ids, and depend on the Analyst and Visualizer Steps (only on the Analyst Step when there is no Visualizer Step). The Critic, when present, must declare one Critique output, have empty source_ids, and depend only on the Reporter Step.
 8. Include the exact user_question text in the Plan.
 9. Use these Step keys: `step_id`, `agent`, `objective`, `source_ids`, `expected_output`, `declared_artifacts`, and `depends_on`.
 10. Never invent a Data Source ID, filesystem location, executable SQL, or arithmetic result.
@@ -148,7 +148,11 @@ class PlannerAgent:
             sales_shaped = set(PHASE1_AGENTS) <= allowed_agents <= set(PHASE2_AGENTS)
             if sales_shaped and "sales_csv" in catalog:
                 # Fetcher, Analyst, then each of Visualizer and Reporter that this Crew has, in that order.
-                expected_agents = [agent for agent in PHASE2_AGENTS if agent in allowed_agents]
+                # The Critic reviews a Report, so without a Reporter there is nothing for it to do.
+                expected_agents = [
+                    agent for agent in PHASE2_AGENTS
+                    if agent in allowed_agents and (agent != "Critic" or "Reporter" in allowed_agents)
+                ]
                 if [step.agent for step in plan.steps] != expected_agents:
                     raise ValueError(
                         "Sales Plan must contain exactly " + ", ".join(expected_agents[:-1])
@@ -179,6 +183,12 @@ class PlannerAgent:
                         )
                     if reporter_step.source_ids:
                         raise ValueError("Reporter Step must not name Data Sources; it consumes Findings")
+                critic_step = next((step for step in plan.steps if step.agent == "Critic"), None)
+                if critic_step is not None:
+                    if reporter_step is None or critic_step.depends_on != [reporter_step.step_id]:
+                        raise ValueError("Critic must depend only on the Reporter Step")
+                    if critic_step.source_ids:
+                        raise ValueError("Critic Step must not name Data Sources; it consumes the draft Report")
 
         # Contract-invalid Plan output — malformed JSON or a structurally
         # valid Plan that still violates a Planner rule (unavailable Agent,

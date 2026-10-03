@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from analyst_crew.reporting.catalog import EvidenceCatalog, EvidenceEntry
 from analyst_crew.reporting.charts import ChartReference
+from analyst_crew.reporting.critique import CritiqueIssue, target_label
 
 PLACEHOLDER = re.compile(r"\{([^{}]*)\}")
 
@@ -67,6 +68,8 @@ class Report(BaseModel):
     chart_mode: Literal["llm", "fallback"] | None = None
     caveats: list[ReportLine]
     methodology: list[ReportLine]
+    # Critique issues that remain; the section is absent when empty (set only by the Critic Step).
+    reviewer_notes: list[CritiqueIssue] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def fallback_is_marked(self) -> "Report":
@@ -357,6 +360,13 @@ def render_report(report: Report, catalog: EvidenceCatalog) -> str:
         lines.append(f"_{CHARTS_NOTICE}_")
     lines += ["", "## Caveats", ""] + [f"- {_substitute(claim.text, catalog)}" for claim in report.caveats]
     lines += ["", "## Methodology", ""] + [f"- {_substitute(claim.text, catalog)}" for claim in report.methodology]
+
+    if report.reviewer_notes:
+        lines += ["", "## Reviewer Notes", ""]
+        lines += [
+            f"- **{target_label(note.target)}** ({note.category.replace('_', ' ')}): {_sentence(note.rationale, catalog)}"
+            for note in report.reviewer_notes
+        ]
 
     cited = {entry_id for claim in [report.summary, *report.findings] for entry_id in claim.evidence_ids}
     evidence = [entry for entry in catalog.entries if entry.id in cited]

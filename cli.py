@@ -116,6 +116,17 @@ def format_reporter_failure(failure) -> str:
     )
 
 
+def format_critic_failure(result) -> str:
+    """A visible note that the Critic failed and the Report above was not reviewed (the run itself succeeded)."""
+    artifacts = result.get("artifacts", {})
+    if artifacts.get("critic_outcome") != "failed":
+        return ""
+    error = next((o.get("error") for o in artifacts.get("step_outcomes", {}).values()
+                  if o.get("critic_outcome") == "failed"), None)
+    return (f"\nThe Critic Agent failed ({error or 'unknown error'}), so the Report above was not reviewed. "
+            "The failure is recorded in the returned state and on the trace.\n")
+
+
 def _findings(artifacts) -> BaselineFindings:
     findings = artifacts["findings"]
     return findings if isinstance(findings, BaselineFindings) else BaselineFindings.model_validate(findings)
@@ -132,6 +143,7 @@ def format_result(result) -> str:
     report = rendered_report(result)
     if report is not None:
         report += format_charts(result)
+        report += format_critic_failure(result)
         if terminal_failure is not None:
             return f"{report}\n{format_reporter_failure(terminal_failure)}"
         return report
