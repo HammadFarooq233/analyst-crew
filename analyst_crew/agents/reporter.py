@@ -50,7 +50,10 @@ Rules:
    (the largest movers, the biggest misses against target) instead of one long list of numbers. Never place a
    number next to a name unless the two entries belong to the same driver or target row.
 6. State only what the entries support. Describe what changed; do not claim what caused it. CPI context is never causal.
-7. Methodology and Caveats are written by the system and always appear; do not restate them. You may add a Claim that
+7. When the Charts list below is not empty, a Claim may point the reader to a chart by writing {chart:<chart_id>}
+   with a chart_id from that list, for example "the revenue bridge is drawn in {chart:revenue_bridge}". Only use
+   listed chart ids, and never describe what a chart shows beyond the Evidence Entries the Claim cites. The Charts
+   section itself is assembled by the system. Methodology and Caveats are written by the system and always appear; do not restate them. You may add a Claim that
    comments on a caveat.
 8. Respond with a single JSON object and nothing else, in exactly this shape:
    {"summary": {"text": "...", "evidence_ids": ["E1"]}, "claims": [{"text": "...", "evidence_ids": ["E2", "E3"]}]}"""
@@ -92,8 +95,11 @@ def production_reporter_model() -> Any:
     )
 
     def _invoke(context: dict[str, Any], config: Any = None) -> ReporterContent:
-        system = REPORTER_SYSTEM_PROMPT + "\n\nEvidence Catalog (id | label | display):\n" + _catalog_prompt(
-            context["evidence_catalog"]
+        charts = context.get("charts") or []
+        charts_text = "\n".join(f"{chart['chart_id']} | {chart['title']}" for chart in charts) or "none"
+        system = (
+            REPORTER_SYSTEM_PROMPT + "\n\nCharts (chart_id | title):\n" + charts_text
+            + "\n\nEvidence Catalog (id | label | display):\n" + _catalog_prompt(context["evidence_catalog"])
         )
         user = (
             f"User question: {context['user_question']}\n"
@@ -141,7 +147,9 @@ class ReporterAgent:
             "step_objective": handoff.step.objective,
             "user_question": handoff.user_question,
             "evidence_catalog": [entry.model_dump() for entry in catalog.entries],
+            "charts": _handoff_charts(handoff),
         }
+        chart_ids = {chart["chart_id"] for chart in context["charts"]}
         feedback = ""
         for attempt in range(2):
             calls = 0
@@ -169,7 +177,7 @@ class ReporterAgent:
                     content = raw if isinstance(raw, ReporterContent) else ReporterContent.model_validate(raw)
                 except ValidationError as exc:
                     raise ValueError(f"response does not match the required JSON shape: {_summarize_schema_error(exc)}") from exc
-                return validate_reporter_content(content, catalog)
+                return validate_reporter_content(content, catalog, chart_ids)
             except ValueError as exc:
                 self.last_validation_error = str(exc)
                 if attempt:
@@ -177,9 +185,19 @@ class ReporterAgent:
                 self.validation_retries += 1
                 feedback = (
                     f"Your previous response was invalid: {exc}. Return the corrected JSON object only, "
-                    "with no digits outside {E<id>} placeholders and only ids from the catalog."
+                    "with no digits outside {E<id>} placeholders, only ids from the catalog and only chart ids from the Charts list."
                 )
         raise RuntimeError("Reporter request loop exhausted")
+
+
+def _handoff_charts(handoff: Handoff) -> list[dict[str, str]]:
+    """Chart ids and titles the Handoff carries from the Visualizer output."""
+    return [
+        {"chart_id": chart["chart_id"], "title": chart["title"]}
+        for reference in handoff.input_artifacts.values()
+        if isinstance(reference, Mapping) and reference.get("kind") == "Chart Artifacts"
+        for chart in reference.get("charts", [])
+    ]
 
 
 def findings_hash(findings: BaselineFindings) -> str:
