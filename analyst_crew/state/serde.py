@@ -15,12 +15,12 @@ from pydantic import BaseModel
 def crew_state_types() -> list[type[BaseModel]]:
     # Imported here because analyst_crew.agents imports this module.
     from analyst_crew.agents import contracts
-    from analyst_crew.reporting import catalog, report
+    from analyst_crew.reporting import catalog, charts, report
     from analyst_crew.tools import analysis
 
     return [
         cls
-        for module in (contracts, analysis, catalog, report)
+        for module in (contracts, analysis, catalog, charts, report)
         for _, cls in inspect.getmembers(module, inspect.isclass)
         if issubclass(cls, BaseModel) and cls.__module__ == module.__name__
     ]

@@ -18,6 +18,7 @@ from analyst_crew.agents.contracts import CREW_AGENTS, Crew, Handoff, Plan
 from analyst_crew.agents.resume import _resume_decision, execution_key
 from analyst_crew.llm import make_chat_model
 from analyst_crew.reporting.catalog import EvidenceCatalog, build_evidence_catalog
+from analyst_crew.reporting.charts import chart_set_reference, load_charts
 from analyst_crew.reporting.report import (
     Report, ReporterContent, build_fallback_report, build_report, validate_reporter_content,
 )
@@ -221,6 +222,12 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
         analyst_step = next((step for step in plan.steps if step.agent == "Analyst"), None)
         findings_names = (analyst_step.declared_artifacts or [analyst_step.expected_output]) if analyst_step else []
         analysis_parameters = dict(configurable.get("analysis_parameters", {}))
+        # Charts come from the Visualizer Step (when the Plan has one); the Report only references them.
+        visualizer_step = next((step for step in plan.steps if step.agent == "Visualizer"), None)
+        charts = load_charts(artifacts.get("charts")) if visualizer_step is not None else []
+        chart_refs = [chart.reference() for chart in charts]
+        chart_mode = artifacts.get("chart_mode") if charts else None
+        chart_names = (visualizer_step.declared_artifacts or [visualizer_step.expected_output]) if visualizer_step else []
         crew = Crew(
             available_agents=configurable.get("available_agents", CREW_AGENTS),
             data_sources=configurable.get("data_sources", {}),
@@ -229,14 +236,16 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
         try:
             handoff = crew.resolve_handoff(
                 reporter_step, plan,
-                {**artifacts.get("step_outputs", {}), **{name: findings_reference for name in findings_names}},
+                {**artifacts.get("step_outputs", {}), **{name: findings_reference for name in findings_names},
+                 **{name: chart_set_reference(charts) for name in chart_names}},
                 analysis_parameters,
             )
         except ValueError as exc:
             # The Findings and catalog are fine, so this still degrades to a Fallback Report below.
             handoff_error = exc
         current_key = execution_key(
-            reporter_step, analysis_parameters=analysis_parameters, input_artifact_hashes=[current_hash],
+            reporter_step, analysis_parameters=analysis_parameters,
+            input_artifact_hashes=[current_hash, *(chart.content_hash for chart in charts)],
         )
         resume_outcome, resume_reason = _resume_decision(state, reporter_step.step_id, current_key)
 
@@ -262,10 +271,10 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
                 model = configurable.get("reporter_model") or production_reporter_model()
                 agent = ReporterAgent(model)
                 content = agent.run(handoff, catalog, config=config)
-                report = build_report(content, catalog, plan.user_question)
+                report = build_report(content, catalog, plan.user_question, chart_refs, chart_mode)
             except Exception as exc:  # noqa: BLE001 — any Reporter failure degrades visibly, never silently
                 failure = exc
-                report = build_fallback_report(catalog, plan.user_question)
+                report = build_fallback_report(catalog, plan.user_question, chart_refs, chart_mode)
             retry_counts = {
                 "validation_retries": getattr(agent, "validation_retries", 0),
                 "tool_retries": getattr(agent, "tool_retries", 0),
@@ -300,7 +309,7 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
                     reporter_step.step_id: {
                         "status": "completed" if completed else "failed",
                         "artifact_ids": reporter_step.declared_artifacts or [reporter_step.expected_output],
-                        "input_artifact_ids": [findings_reference["artifact_id"]],
+                        "input_artifact_ids": [findings_reference["artifact_id"], *(chart.artifact_id for chart in charts)],
                         "retry_counts": retry_counts,
                         "execution_key": current_key,
                         "resume_outcome": resume_outcome,

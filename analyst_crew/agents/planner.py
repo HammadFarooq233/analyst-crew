@@ -22,7 +22,7 @@ Each Step names a target Agent, describes what it produces, and lists which prio
 Available Agents:
 - Fetcher: Retrieves data from sources (CSV, Postgres, FRED API). Returns raw data — no analysis, no interpretation.
 - Analyst: Performs computation on data — statistics, joins, comparisons, trend detection. Consumes data, produces findings.
-- Visualizer: Generates charts and tables from findings.
+- Visualizer: Generates charts from findings. Code supplies every plotted value from the findings; it never computes.
 - Critic: Reviews a draft report for uncited claims, missing caveats, and logical gaps.
 - Reporter: Writes the narrative report from findings and charts. Synthesizes results into prose, cites specific numbers.
 
@@ -34,8 +34,8 @@ Rules:
 3. Each Step must name exactly one Agent from the list above.
 4. depends_on must reference only step_ids from earlier Steps in the plan (never itself, never a later Step).
 5. The Steps must form a valid dependency order — no cycles, no forward references.
-6. For the sales comparison, produce exactly a Fetcher Step followed by a dependent Analyst Step, and, when Reporter is among the validated capabilities for this run, a final Reporter Step that depends on the Analyst Step.
-7. The Fetcher must use a supplied Data Source and declare one Dataset Artifact output. The Analyst must depend on that Fetcher output and declare Findings. The Reporter, when present, must depend only on the Analyst Step, declare one Report output, and have empty source_ids.
+6. For the sales comparison, produce exactly a Fetcher Step followed by a dependent Analyst Step, then, when Visualizer is among the validated capabilities for this run, a Visualizer Step that depends on the Analyst Step, and, when Reporter is among the validated capabilities for this run, a final Reporter Step. Leave out any Step whose Agent is not among the validated capabilities.
+7. The Fetcher must use a supplied Data Source and declare one Dataset Artifact output. The Analyst must depend on that Fetcher output and declare Findings. The Visualizer, when present, must depend only on the Analyst Step, declare one Chart Artifacts output, and have empty source_ids. The Reporter, when present, must declare one Report output, have empty source_ids, and depend on the Analyst and Visualizer Steps (only on the Analyst Step when there is no Visualizer Step).
 8. Include the exact user_question text in the Plan.
 9. Use these Step keys: `step_id`, `agent`, `objective`, `source_ids`, `expected_output`, `declared_artifacts`, and `depends_on`.
 10. Never invent a Data Source ID, filesystem location, executable SQL, or arithmetic result.
@@ -145,8 +145,10 @@ class PlannerAgent:
             unknown_sources = {source for step in plan.steps for source in step.source_ids} - catalog
             if unknown_sources:
                 raise ValueError(f"Plan references unknown Data Sources: {sorted(unknown_sources)}")
-            if allowed_agents in (set(PHASE1_AGENTS), set(PHASE2_AGENTS)) and "sales_csv" in catalog:
-                expected_agents = ["Fetcher", "Analyst", "Reporter"] if "Reporter" in allowed_agents else ["Fetcher", "Analyst"]
+            sales_shaped = set(PHASE1_AGENTS) <= allowed_agents <= set(PHASE2_AGENTS)
+            if sales_shaped and "sales_csv" in catalog:
+                # Fetcher, Analyst, then each of Visualizer and Reporter that this Crew has, in that order.
+                expected_agents = [agent for agent in PHASE2_AGENTS if agent in allowed_agents]
                 if [step.agent for step in plan.steps] != expected_agents:
                     raise ValueError(
                         "Sales Plan must contain exactly " + ", ".join(expected_agents[:-1])
@@ -161,10 +163,20 @@ class PlannerAgent:
                     raise ValueError("Sales Plan Fetcher must declare a Dataset Artifact output")
                 if not (analyst_step.declared_artifacts or [analyst_step.expected_output]):
                     raise ValueError("Sales Plan Analyst must declare a Findings output")
-                if len(plan.steps) == 3:
-                    reporter_step = plan.steps[2]
-                    if reporter_step.depends_on != [analyst_step.step_id]:
-                        raise ValueError("Reporter must depend on the Analyst Step")
+                visualizer_step = next((step for step in plan.steps if step.agent == "Visualizer"), None)
+                reporter_step = next((step for step in plan.steps if step.agent == "Reporter"), None)
+                if visualizer_step is not None:
+                    if visualizer_step.depends_on != [analyst_step.step_id]:
+                        raise ValueError("Visualizer must depend on the Analyst Step")
+                    if visualizer_step.source_ids:
+                        raise ValueError("Visualizer Step must not name Data Sources; it consumes Findings")
+                if reporter_step is not None:
+                    required = [analyst_step.step_id] + ([visualizer_step.step_id] if visualizer_step else [])
+                    if set(reporter_step.depends_on) != set(required) or len(reporter_step.depends_on) != len(required):
+                        raise ValueError(
+                            "Reporter must depend on the Analyst and Visualizer Steps"
+                            if visualizer_step else "Reporter must depend on the Analyst Step"
+                        )
                     if reporter_step.source_ids:
                         raise ValueError("Reporter Step must not name Data Sources; it consumes Findings")
 

@@ -36,3 +36,29 @@ def report_property_violations(report, catalog, findings) -> list[str]:
     violations += [f"number in the rendered Report not in the catalog: {number}"
                    for number in body_numbers(rendered) if number not in catalog_text]
     return violations
+
+
+def chart_property_violations(charts, catalog) -> list[str]:
+    """Properties of a Chart Artifact set: at most three charts, every plotted value equal to an Evidence
+    Entry raw value, every label the catalog label, and the stored PNG matching its content hash."""
+    import hashlib
+    from pathlib import Path
+
+    violations: list[str] = []
+    if len(charts) > 3:
+        violations.append(f"{len(charts)} charts, at most 3 allowed")
+    for chart in charts:
+        for series in chart.series:
+            for point in series.points:
+                entry = catalog.get(point.entry_id)
+                if entry is None:
+                    violations.append(f"{chart.chart_id}: plotted point cites unknown entry {point.entry_id}")
+                    continue
+                if point.value != entry.value:
+                    violations.append(f"{chart.chart_id}: plotted {point.value} is not entry {entry.id} value {entry.value}")
+                if point.label != entry.label:
+                    violations.append(f"{chart.chart_id}: label {point.label!r} is not the catalog label")
+        path = Path(chart.location)
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != chart.content_hash:
+            violations.append(f"{chart.chart_id}: stored PNG missing or not matching its content hash")
+    return violations

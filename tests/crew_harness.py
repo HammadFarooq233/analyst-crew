@@ -40,17 +40,26 @@ def base_rows():
     ]
 
 
-def crew_plan(*, reporter=True):
+FULL_AGENTS = ("Fetcher", "Analyst", "Visualizer", "Reporter")
+
+
+def crew_plan(*, reporter=True, visualizer=False):
     steps = [
         Step(step_id="fetch_sales", agent="Fetcher", objective="Fetch normalized sales",
              source_ids=["sales_csv"], expected_output="sales_dataset", declared_artifacts=["sales_dataset"]),
         Step(step_id="analyze_baseline", agent="Analyst", objective="Compare baseline sales periods",
              expected_output="baseline_findings", declared_artifacts=["baseline_findings"], depends_on=["fetch_sales"]),
     ]
+    if visualizer:
+        steps.append(Step(
+            step_id="visualize_findings", agent="Visualizer", objective="Chart the revenue change from the Findings",
+            expected_output="sales_charts", declared_artifacts=["sales_charts"], depends_on=["analyze_baseline"],
+        ))
     if reporter:
         steps.append(Step(
             step_id="write_report", agent="Reporter", objective="Write the cited Report",
-            expected_output="sales_report", declared_artifacts=["sales_report"], depends_on=["analyze_baseline"],
+            expected_output="sales_report", declared_artifacts=["sales_report"],
+            depends_on=["analyze_baseline", "visualize_findings"] if visualizer else ["analyze_baseline"],
         ))
     return Plan(steps=steps, user_question=QUESTION)
 
@@ -193,4 +202,6 @@ def body_numbers(rendered):
     appendix and the `[E3]` citation markers."""
     body = rendered.split("## Evidence")[0]
     body = re.sub(r"`\[[^\]]*\]`", "", body)
+    # Chart image links carry content-hash filenames; the title shown to the reader stays in the check.
+    body = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", body)
     return re.findall(r"\d+(?:,\d{3})*(?:\.\d+)?", body)

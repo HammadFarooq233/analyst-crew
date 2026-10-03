@@ -94,7 +94,7 @@ def test_scripted_planner_respects_capabilities_and_crew_api():
     assert "MUST use only these Agents" in model.messages[0].content
     assert "Agents: Fetcher" in model.messages[0].content
     default_planner = PlannerAgent(llm=ScriptedModel(plan))
-    assert default_planner.available_agents == {"Fetcher", "Analyst", "Reporter"}
+    assert default_planner.available_agents == {"Fetcher", "Analyst", "Visualizer", "Reporter"}
 
     with pytest.raises(ValueError, match="unavailable Agents"):
         PlannerAgent(llm=ScriptedModel(plan), available_agents=["Analyst"]).generate_plan("q")

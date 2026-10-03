@@ -13,6 +13,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, model_validator
 
 from analyst_crew.reporting.catalog import EvidenceCatalog, EvidenceEntry
+from analyst_crew.reporting.charts import ChartReference
 
 PLACEHOLDER = re.compile(r"\{([^{}]*)\}")
 
@@ -20,7 +21,11 @@ FALLBACK_NOTICE = (
     "This Report was generated without the Reporter Agent. It is a deterministic template built directly "
     "from the computed Findings, not a written analysis."
 )
-CHARTS_NOTICE = "Reserved. Charts are not generated yet; no Visualizer Agent is part of the Crew."
+FALLBACK_CHARTS_NOTE = (
+    "Fallback chart set: chosen by code from the Evidence Catalog, with no Visualizer judgment. "
+    "Every plotted value is an Evidence Entry value."
+)
+CHARTS_NOTICE ="Reserved. Charts are not generated yet; no Visualizer Agent is part of the Crew."
 
 
 class CitedText(BaseModel):
@@ -54,7 +59,8 @@ class Report(BaseModel):
     question: str
     summary: Claim
     findings: list[Claim]
-    charts: list[str] = Field(default_factory=list)
+    charts: list[ChartReference] = Field(default_factory=list)
+    chart_mode: Literal["llm", "fallback"] | None = None
     caveats: list[ReportLine]
     methodology: list[ReportLine]
 
@@ -209,15 +215,19 @@ def assemble_methodology(catalog: EvidenceCatalog) -> list[ReportLine]:
     return [template_line(line) for line in lines]
 
 
-def build_report(content: ReporterContent, catalog: EvidenceCatalog, question: str) -> Report:
-    """An ``llm``-mode Report: model-written Summary and Claims, code-assembled rest."""
+def build_report(content: ReporterContent, catalog: EvidenceCatalog, question: str,
+                 charts: list[ChartReference] | None = None, chart_mode: str | None = None) -> Report:
+    """An ``llm``-mode Report: model-written Summary and Claims, code-assembled rest.
+    ``charts`` are the Chart Artifact references for the code-assembled Charts section."""
     return Report(
         report_mode="llm", question=question, summary=content.summary, findings=content.claims,
+        charts=charts or [], chart_mode=chart_mode if charts else None,
         caveats=assemble_caveats(catalog), methodology=assemble_methodology(catalog),
     )
 
 
-def build_fallback_report(catalog: EvidenceCatalog, question: str) -> Report:
+def build_fallback_report(catalog: EvidenceCatalog, question: str,
+                          charts: list[ChartReference] | None = None, chart_mode: str | None = None) -> Report:
     """Deterministic template Report: fixed Summary (window and net revenue
     change), Material Changes as templated Claims, plus the same code-assembled
     Caveats and Methodology. Visibly marked as generated without the Reporter."""
@@ -276,7 +286,8 @@ def build_fallback_report(catalog: EvidenceCatalog, question: str) -> Report:
 
     return Report(
         report_mode="fallback", fallback_notice=FALLBACK_NOTICE, question=question, summary=summary,
-        findings=claims, caveats=assemble_caveats(catalog), methodology=assemble_methodology(catalog),
+        findings=claims, charts=charts or [], chart_mode=chart_mode if charts else None,
+        caveats=assemble_caveats(catalog), methodology=assemble_methodology(catalog),
     )
 
 
@@ -314,7 +325,14 @@ def render_report(report: Report, catalog: EvidenceCatalog) -> str:
     lines += [f"{number}. {_sentence(claim.text, catalog)}{_citation(claim)}"
               for number, claim in enumerate(report.findings, start=1)]
     lines += ["", "## Charts", ""]
-    lines += [f"- {chart}" for chart in report.charts] or [f"_{CHARTS_NOTICE}_"]
+    if report.charts:
+        if report.chart_mode == "fallback":
+            lines += [f"_{FALLBACK_CHARTS_NOTE}_", ""]
+        for chart in report.charts:
+            lines += [f"![{chart.title}]({chart.filename})", ""]
+        lines.pop()
+    else:
+        lines.append(f"_{CHARTS_NOTICE}_")
     lines += ["", "## Caveats", ""] + [f"- {_substitute(claim.text, catalog)}" for claim in report.caveats]
     lines += ["", "## Methodology", ""] + [f"- {_substitute(claim.text, catalog)}" for claim in report.methodology]
 
