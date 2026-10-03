@@ -1,10 +1,11 @@
-"""Critic Agent and graph node (ADR-0003), flag only.
+"""Critic Agent and graph node (ADR-0003).
 
 The Critic has no Tools. Its inputs are the draft Report and the Evidence
 Catalog; it returns a Critique whose issues each target the Summary or an
 existing Claim. It cannot add Claims. Code validates the Critique, turns the
 issues into Reviewer Notes on a copy of the draft, and records ``critic_outcome``
-as ``clean``, ``unresolved`` or ``failed``. A Critic failure ships the
+as ``clean``, ``revised``, ``unresolved`` or ``failed``. A non-empty Critique triggers one validated
+Reporter revision (see ``_apply_critique``). A Critic failure ships the
 un-reviewed Report with the failure recorded; it never fails the run.
 """
 import hashlib
@@ -16,13 +17,13 @@ from pydantic import ValidationError
 
 from analyst_crew.agents.contracts import CREW_AGENTS, Crew, Handoff, Plan
 from analyst_crew.agents.reporter import (
-    _catalog_prompt, _is_transient_provider_error, _summarize_schema_error,
+    _catalog_prompt, _is_transient_provider_error, _summarize_schema_error, production_reporter_model, revise_content,
 )
 from analyst_crew.agents.resume import _resume_decision, execution_key
 from analyst_crew.llm import make_chat_model
 from analyst_crew.reporting.catalog import EvidenceCatalog
 from analyst_crew.reporting.critique import Critique, report_targets, validate_critique
-from analyst_crew.reporting.report import Report, _substitute
+from analyst_crew.reporting.report import Report, _substitute, build_report
 from analyst_crew.state import CrewState
 from analyst_crew.tools.retry import invoke_with_optional_config, retry_with_backoff
 
@@ -153,6 +154,43 @@ def with_reviewer_notes(draft: Report, critique: Critique) -> Report:
     return draft.model_copy(update={"reviewer_notes": list(critique.issues)})
 
 
+def _apply_critique(agent: "CriticAgent", handoff: Handoff, draft: Report, critique: Critique,
+                    catalog: EvidenceCatalog, configurable: dict, config: Any) -> dict[str, Any]:
+    """Turn a Critique of the draft into the final Report and outcome (ADR-0003).
+
+    A clean Critique ships the draft. A non-empty one triggers exactly one Reporter revision, validated by the
+    first draft's rules; the revised Report is reviewed once more, and whatever the Critic still flags becomes
+    Reviewer Notes. A revision that fails keeps the draft with the original issues as Reviewer Notes. A Fallback
+    Report is not revised (the Reporter model just failed to write it).
+    """
+    result: dict[str, Any] = {"report": draft, "outcome": "clean", "revised_critique": None,
+                              "revision_failure": None, "rereview_error": None}
+    if not critique.issues:
+        return result
+    result["outcome"] = "unresolved"
+    result["report"] = with_reviewer_notes(draft, critique)
+    if draft.report_mode == "fallback":
+        result["revision_failure"] = "not attempted: the draft is a Fallback Report"
+        return result
+    try:
+        model = configurable.get("reporter_model") or production_reporter_model()
+        content = revise_content(model, handoff, catalog, draft, critique, config=config)
+        revised = build_report(content, catalog, draft.question, draft.charts, draft.chart_mode)
+    except Exception as exc:  # noqa: BLE001 — a failed revision never ships; the draft stays
+        result["revision_failure"] = str(exc) if isinstance(exc, (RuntimeError, ValueError)) else f"{type(exc).__name__}: {exc}"
+        return result
+    try:
+        second = agent.run(handoff, revised, catalog, config=config)
+    except Exception as exc:  # noqa: BLE001 — cannot confirm the fix: keep the revision, keep the original issues visible
+        result["report"] = with_reviewer_notes(revised, critique)
+        result["rereview_error"] = str(exc) if isinstance(exc, (RuntimeError, ValueError)) else f"{type(exc).__name__}: {exc}"
+        return result
+    result["revised_critique"] = second
+    result["report"] = with_reviewer_notes(revised, second)
+    result["outcome"] = "unresolved" if second.issues else "revised"
+    return result
+
+
 def _as_report(value: Any) -> Report | None:
     if value is None:
         return None
@@ -185,6 +223,10 @@ def critic_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
     failure: Exception | None = None
     critique: Critique | None = None
     final_report = draft
+    critic_outcome = "failed"
+    revised_critique: Critique | None = None
+    revision_failure: str | None = None
+    rereview_error: str | None = None
     try:
         catalog = artifacts.get("evidence_catalog")
         if not isinstance(catalog, EvidenceCatalog):
@@ -201,21 +243,33 @@ def critic_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
         )
         if resume_outcome == "reused":
             stored = artifacts.get("critique")
-            if stored is None:
+            stored_report = artifacts.get("reviewed_report")
+            stored_outcome = artifacts.get("critic_outcome")
+            if stored is None or stored_report is None or stored_outcome in (None, "failed"):
                 # Defensive: never trust a reuse whose output we cannot actually produce.
                 resume_outcome, resume_reason = "recomputed", "invalidated"
             else:
                 critique = stored if isinstance(stored, Critique) else Critique.model_validate(stored)
+                final_report = _as_report(stored_report)
+                critic_outcome = stored_outcome
+                second = artifacts.get("revised_critique")
+                revised_critique = None if second is None else (
+                    second if isinstance(second, Critique) else Critique.model_validate(second))
+                revision_failure = artifacts.get("revision_failure")
+                rereview_error = artifacts.get("rereview_error")
         if resume_outcome != "reused":
             model = configurable.get("critic_model") or production_critic_model()
             agent = CriticAgent(model)
             critique = agent.run(handoff, draft, catalog, config=config)
-        final_report = with_reviewer_notes(draft, critique)
+            applied = _apply_critique(agent, handoff, draft, critique, catalog, configurable, config)
+            final_report, critic_outcome = applied["report"], applied["outcome"]
+            revised_critique, revision_failure = applied["revised_critique"], applied["revision_failure"]
+            rereview_error = applied["rereview_error"]
     except Exception as exc:  # noqa: BLE001 — a Critic failure ships the un-reviewed Report, never fails the run
-        failure, critique, final_report = exc, None, draft
+        failure, critique, final_report, critic_outcome = exc, None, draft, "failed"
+        revised_critique = revision_failure = rereview_error = None
 
     completed = failure is None
-    critic_outcome = "failed" if not completed else ("unresolved" if critique.issues else "clean")
     retry_counts = (
         (artifacts.get("step_outcomes", {}).get(step.step_id, {}).get("retry_counts")
          or {"validation_retries": 0, "tool_retries": 0})
@@ -233,6 +287,10 @@ def critic_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
         "resume_reason": resume_reason,
         "critic_outcome": critic_outcome,
     }
+    if revision_failure:
+        outcome["revision_failure"] = revision_failure
+    if rereview_error:
+        outcome["rereview_error"] = rereview_error
     if failure is not None:
         outcome["error"] = (
             str(failure) if isinstance(failure, (RuntimeError, ValueError)) else f"{type(failure).__name__}: {failure}"
@@ -243,7 +301,11 @@ def critic_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
         "artifacts": {
             "report": final_report,
             "draft_report": draft,
+            "reviewed_report": final_report,
             "critique": critique,
+            "revised_critique": revised_critique,
+            "revision_failure": revision_failure,
+            "rereview_error": rereview_error,
             "critic_outcome": critic_outcome,
             "handoffs": artifacts.get("handoffs", {}) if handoff is None else {
                 **artifacts.get("handoffs", {}), step.step_id: handoff.model_dump(mode="json"),

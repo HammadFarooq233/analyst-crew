@@ -203,7 +203,7 @@ class TestCriticOutcomes:
         critic = ScriptedCriticModel(Critique(issues=[issue("claim_99")]), Critique(issues=[issue("claim_1")]))
         result, _ = run_with_critic(source, tmp_path, monkeypatch, critic)
 
-        assert critic.calls == 2
+        assert critic.calls == 3, "the invalid response, its one retry, then the review of the revised Report (#19)"
         assert "claim_99" in critic.contexts[1]["validation_feedback"]
         assert not critic.contexts[0]["validation_feedback"]
         assert result["artifacts"]["critic_outcome"] == "unresolved"
@@ -250,7 +250,7 @@ class TestCriticResume:
         second_critic = ScriptedCriticModel(Critique())
         second, _ = self._rerun(source, tmp_path, monkeypatch, saver, second_critic)
 
-        assert critic.calls == 1 and second_critic.calls == 0
+        assert critic.calls == 2 and second_critic.calls == 0  # review + re-review of the revision (#19)
         assert (outcome(second)["resume_outcome"], outcome(second)["resume_reason"]) == ("reused", "unchanged")
         assert outcome(second)["execution_key"] == outcome(first)["execution_key"]
         assert second["artifacts"]["critic_outcome"] == "unresolved"

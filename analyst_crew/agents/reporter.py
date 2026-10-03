@@ -19,6 +19,7 @@ from analyst_crew.agents.resume import _resume_decision, execution_key
 from analyst_crew.llm import make_chat_model
 from analyst_crew.reporting.catalog import EvidenceCatalog, build_evidence_catalog
 from analyst_crew.reporting.charts import chart_set_reference, load_charts
+from analyst_crew.reporting.critique import Critique
 from analyst_crew.reporting.report import (
     Report, ReporterContent, build_fallback_report, build_report, validate_reporter_content,
 )
@@ -101,9 +102,26 @@ def production_reporter_model() -> Any:
             REPORTER_SYSTEM_PROMPT + "\n\nCharts (chart_id | title):\n" + charts_text
             + "\n\nEvidence Catalog (id | label | display):\n" + _catalog_prompt(context["evidence_catalog"])
         )
+        revision = context.get("revision")
+        revision_text = ""
+        if revision:
+            draft_lines = "\n".join(
+                f"{item['target']} | {item['text']} | cites: {', '.join(item['evidence_ids'])}" for item in revision["draft"]
+            )
+            issue_lines = "\n".join(
+                f"{found['target']} | {found['category']} | {found['rationale']}" for found in revision["issues"]
+            )
+            revision_text = (
+                "REVISION PASS. A reviewer flagged issues in your draft. Rewrite the Summary and Findings so each "
+                "flagged item is corrected (soften or remove causal wording, fix misread evidence, drop overstatement). "
+                "All the rules above still apply: placeholders only, no digits, only catalog ids.\n"
+                f"Your draft (target | text | cited entries):\n{draft_lines}\n"
+                f"Issues (target | category | rationale):\n{issue_lines}\n"
+            )
         user = (
             f"User question: {context['user_question']}\n"
             f"Step objective: {context['step_objective']}\n"
+            f"{revision_text}"
             f"Validation feedback from a prior attempt (empty if this is the first): "
             f"{context.get('validation_feedback') or 'none'}\n"
             "Return the JSON object now."
@@ -188,6 +206,46 @@ class ReporterAgent:
                     "with no digits outside {E<id>} placeholders, only ids from the catalog and only chart ids from the Charts list."
                 )
         raise RuntimeError("Reporter request loop exhausted")
+
+
+REVISION_RUN_NAME = "Reporter (revision)"
+
+
+def revise_content(model: Any, handoff: Handoff, catalog: EvidenceCatalog, draft: Report, critique: Critique,
+                   *, config: Any = None) -> ReporterContent:
+    """One Reporter revision of ``draft`` against ``critique`` (Crew-internal, not a Step).
+
+    A single model call with no retry: the result is validated by exactly the rules the first draft meets
+    (``validate_reporter_content`` with the draft's chart ids) and any failure raises, so the caller keeps the
+    draft. The call is its own run labelled ``Reporter (revision)`` so it shows as a second Reporter span.
+    """
+    from langchain_core.runnables import RunnableLambda
+
+    chart_ids = {chart.chart_id for chart in draft.charts}
+    context = {
+        "step_objective": handoff.step.objective,
+        "user_question": handoff.user_question,
+        "evidence_catalog": [entry.model_dump() for entry in catalog.entries],
+        "charts": [{"chart_id": chart.chart_id, "title": chart.title} for chart in draft.charts],
+        "validation_feedback": "",
+        "revision": {
+            "issues": [issue.model_dump() for issue in critique.issues],
+            "draft": [
+                {"target": target, "text": claim.text, "evidence_ids": claim.evidence_ids}
+                for target, claim in [("summary", draft.summary),
+                                      *[(f"claim_{n}", c) for n, c in enumerate(draft.findings, start=1)]]
+            ],
+        },
+    }
+    span = RunnableLambda(
+        lambda ctx, config=None: invoke_with_optional_config(model, ctx, config),
+    ).with_config(run_name=REVISION_RUN_NAME, tags=["agent:Reporter", "revision"])
+    raw = span.invoke(context, config)
+    try:
+        content = raw if isinstance(raw, ReporterContent) else ReporterContent.model_validate(raw)
+    except ValidationError as exc:
+        raise ValueError(f"revision does not match the required JSON shape: {_summarize_schema_error(exc)}") from exc
+    return validate_reporter_content(content, catalog, chart_ids)
 
 
 def _handoff_charts(handoff: Handoff) -> list[dict[str, str]]:
