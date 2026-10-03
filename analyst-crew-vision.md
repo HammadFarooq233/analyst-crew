@@ -207,7 +207,7 @@ progresses. Update this table, don't just the roadmap above.
 | --------------------------- | ----------- | --------------------------------------------------------- |
 | 0 – Walking skeleton        | Complete*   | Implemented across commits; infrastructure is runnable    |
 | 1 – Real tool use           | Complete    | Live acceptance passed 2026-09-19 (see docs/phase-1-acceptance-status.md) |
-| 2 – Full orchestration      | In progress | Slice 1 (Reporter, issue #13) done: cited Reports over an Evidence Catalog, live-accepted 2026-09-20 (see docs/phase-2-reporter-acceptance-status.md). Visualizer and Critic still to join |
+| 2 – Full orchestration      | In progress | Slice 1 (Reporter, issue #13) done: cited Reports over an Evidence Catalog, live-accepted 2026-09-20 (see docs/phase-2-reporter-acceptance-status.md). Visualizer and Critic still to join (spec: GitHub issue #14; see ADR-0003) |
 | 3 – Memory, deepened        | Not started |                                                           |
 | 4 – Observability, deepened | Not started |                                                           |
 | 5 – Evals                   | Not started |                                                           |
@@ -252,10 +252,12 @@ Resolved during a deep Q&A pass with the coding agent, kept here so the reasonin
 **Code execution (Analyst/Visualizer).** Code execution is a Tool, never an implicit LLM
 capability — the LLM only produces code text; a separate process (`execute_python`, backed by
 `LocalShellBackend`) runs it and returns the result as the next observation. Analyst gets this
-tool; Visualizer instead uses **structured chart-spec output** (JSON: mark/x/y/data) rendered by
-our own fixed code — safer and eval-friendly, since chart shape is a closed, checkable space.
-Fetcher/Planner/Reporter get no execution access; Critic reuses Fetcher's read-only query tools
-to verify citations, never gains execution access itself.
+tool; Visualizer instead uses **structured chart-spec output** rendered by our own fixed code —
+safer and eval-friendly, since chart shape is a closed, checkable space. Refined in Phase 2
+(ADR-0003): the Visualizer's LLM selects what to plot and code supplies the data from the
+Evidence Catalog. Fetcher/Planner/Reporter get no execution access. The Critic has no Tools at
+all (superseding the earlier "reuses Fetcher's read-only query tools" idea): citation validity
+is guaranteed by code, so it reviews judgment only.
 
 **Memory access.** Per-agent, via each agent's own scoped `search_memory` tool — not a single
 Planner-mediated fetch. Each agent queries memory at the point it needs it, scoped to its own

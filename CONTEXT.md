@@ -31,7 +31,7 @@ Generates charts and tables from findings.
 _Avoid_: Chart maker, plotter, graph builder
 
 **Critic**:
-Reviews a draft report for uncited claims, missing caveats, and logical gaps.
+Reviews a draft Report for judgment problems: causal overreach, Claims whose wording misreads their cited Evidence Entries, and overstated drivers. Citation validity and Caveat completeness are guaranteed by code, not by the Critic. Has no Tools; it reads the Report and the Evidence Catalog only.
 _Avoid_: Reviewer, verifier, checker
 
 **Reporter**:
@@ -75,7 +75,22 @@ Reads a CSV file from disk and returns its contents as structured data.
 _Avoid_: File reader, data loader
 
 **chart**:
-Generates a chart image from a structured JSON spec (`mark`, `x`, `y`, `data`). Used exclusively by the Visualizer.
+Renders a Chart Spec to a Chart Artifact (PNG). Used exclusively by the Visualizer.
+
+**Chart Spec**:
+A structured description of one chart: mark type, title, and which Evidence Entries or Findings series to plot. The Visualizer's LLM chooses these; code fills in the data from the Evidence Catalog, so a chart can never contain a number that is not a Tool value.
+_Avoid_: Chart config, plot definition
+
+**Chart Artifact**:
+A durable, content-addressed rendered image of one Chart Spec. The Report's Charts section holds references to Chart Artifacts, never prose.
+_Avoid_: Chart image, figure
+
+**Critique**:
+The Critic's structured verdict on a draft Report: a list of issues, each pointing at a Claim. Triggers at most one Reporter revision pass; issues that remain afterwards are shown in the Report as unresolved Reviewer Notes.
+_Avoid_: Review, feedback
+
+**Reviewer Notes**:
+The Report section listing Critique issues the revision pass did not resolve. Absent when the Critique is clean.
 
 **Report**:
 The final output returned to Priya. Contains a Summary (headline answer), Findings (cited claims), Charts (embedded from the Visualizer), Caveats (known limitations), and Methodology (sources and computations used).
