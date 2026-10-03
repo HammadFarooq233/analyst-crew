@@ -4,13 +4,14 @@ validation. Asserts outcomes, the stored Critique, Reviewer Notes and resume lab
 import logging
 
 import pytest
+from langchain_core.callbacks import BaseCallbackHandler
 from langgraph.checkpoint.memory import MemorySaver
 from pydantic import ValidationError
 
 from analyst_crew.agents import Step
 from analyst_crew.agents.planner import PlannerAgent
 from analyst_crew.agents.tracing import _run_metadata
-from analyst_crew.reporting.critique import Critique, CritiqueIssue, validate_critique
+from analyst_crew.reporting.critique import MAX_RATIONALE_CHARS, Critique, CritiqueIssue, validate_critique
 from analyst_crew.reporting.report import Report, render_report
 from analyst_crew.state.serde import crew_serde, crew_state_types
 from analyst_crew.tools.sales import sales_data_source
@@ -96,15 +97,25 @@ class TestCritiqueValidation:
             with pytest.raises(ValueError, match="target"):
                 validate_critique(Critique(issues=[issue(bad)]), report, catalog)
 
-    def test_a_rationale_may_not_carry_a_bare_digit_or_an_unknown_evidence_id(self, source, tmp_path, monkeypatch):
+    def test_a_rationale_may_carry_digits_but_not_an_unknown_evidence_id(self, source, tmp_path, monkeypatch):
         result, _ = run_with_critic(source, tmp_path, monkeypatch)
         report, catalog = result["artifacts"]["report"], result["artifacts"]["evidence_catalog"]
-        with pytest.raises(ValueError, match="digit"):
-            validate_critique(Critique(issues=[issue(rationale="It grew 33 percent")]), report, catalog)
+        digits = Critique(issues=[issue(rationale="It grew 33 percent")])
+        assert validate_critique(digits, report, catalog).issues[0].rationale == "It grew 33 percent"
         with pytest.raises(ValueError, match="E9999"):
             validate_critique(Critique(issues=[issue(rationale="See {E9999}")]), report, catalog)
         known = next(iter(catalog.ids))
         validate_critique(Critique(issues=[issue(rationale="Compare with {" + known + "}")]), report, catalog)
+
+    def test_an_over_long_rationale_is_truncated_not_rejected(self, source, tmp_path, monkeypatch):
+        result, _ = run_with_critic(source, tmp_path, monkeypatch)
+        report, catalog = result["artifacts"]["report"], result["artifacts"]["evidence_catalog"]
+        known = next(iter(catalog.ids))
+        # A placeholder straddling the cap must not be left half-open.
+        long = "x" * (MAX_RATIONALE_CHARS - 3) + " {" + known + "} and more"
+        rationale = validate_critique(Critique(issues=[issue(rationale=long)]), report, catalog).issues[0].rationale
+        assert len(rationale) <= MAX_RATIONALE_CHARS and rationale.endswith("…")
+        assert "{" not in rationale
 
     def test_an_empty_critique_is_valid(self, source, tmp_path, monkeypatch):
         result, _ = run_with_critic(source, tmp_path, monkeypatch)
@@ -237,6 +248,36 @@ class TestCriticOutcomes:
         assert "provider exploded" in outcome(result)["error"]
         assert result["artifacts"].get("terminal_failure") is None
         assert isinstance(result["artifacts"]["report"], Report)
+        failure = result["artifacts"]["critic_failure"]
+        assert failure["agent"] == "Critic" and "provider exploded" in failure["error"]
+        assert _run_metadata(result)["critic_failure"] == failure
+
+    def test_a_successful_review_records_no_critic_failure(self, source, tmp_path, monkeypatch):
+        result, _ = run_with_critic(source, tmp_path, monkeypatch)
+        assert result["artifacts"]["critic_failure"] is None
+        assert "critic_failure" not in _run_metadata(result)
+
+
+class _Spans(BaseCallbackHandler):
+    def __init__(self):
+        self.names = []
+
+    def on_chain_start(self, serialized, inputs, **kwargs):
+        self.names.append(kwargs.get("name") or (serialized or {}).get("name"))
+
+
+class TestCriticSpans:
+    def test_the_review_is_its_own_named_span(self, source, tmp_path, monkeypatch):
+        spans = _Spans()
+        run_with_critic(source, tmp_path, monkeypatch, ScriptedCriticModel(), callbacks=[spans])
+        assert spans.names.count("critic_node") == 1 and spans.names.count("Critic") == 1
+        assert "Critic (re-review)" not in spans.names
+
+    def test_the_re_review_after_a_revision_is_a_second_labelled_span(self, source, tmp_path, monkeypatch):
+        spans = _Spans()
+        critic = ScriptedCriticModel(Critique(issues=[issue("claim_1")]), Critique())
+        run_with_critic(source, tmp_path, monkeypatch, critic, callbacks=[spans])
+        assert spans.names.count("Critic") == 1 and spans.names.count("Critic (re-review)") == 1
 
 
 class TestCriticResume:

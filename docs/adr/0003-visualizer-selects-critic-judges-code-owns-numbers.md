@@ -26,3 +26,9 @@ Phase 2 adds the Visualizer and Critic. Vision §13 originally sketched the Visu
 - The Critic's value is judgment the code cannot check, so its quality must be evaluated by properties (a seeded causal-overreach Claim must be flagged), not exact wording.
 - Reviving a tool-using Critic later (for example for multi-source use cases) is a new decision that supersedes this one.
 - `chart_mode` and `critic_outcome` (`clean | revised | unresolved | failed`) become part of run metadata.
+
+## Addendum: the revision pass in detail
+
+- **Re-review.** After a Reporter revision the Critic reviews the revised Report once more. This second pass decides the outcome: no issues means `revised`; issues that remain mean `unresolved`, and they (not the first Critique's) become the Reviewer Notes on the revised Report. If the revision fails validation, the draft ships with the first Critique's issues as Reviewer Notes and the outcome is `unresolved`. If the re-review itself fails, the revision ships with the first Critique's issues kept as Reviewer Notes, the outcome is `unresolved` and the failure is recorded as `rereview_error`. The revised Report is never judged "fixed" on the Reporter's word alone. There is still at most one revision, so this adds a Critic call but no loop.
+- **Fallback Reports are not revised.** A Fallback Report is a code-built template made because the Reporter model just failed; asking the same model to rewrite it would likely fail again, and the template wording is not model judgment to correct. The Critic still reviews it, its issues become Reviewer Notes, the outcome is `unresolved` and `revision_failure` says the revision was not attempted.
+- **Rationales are notes.** A Critique rationale may contain digits (it is not Report body text, so the no-digit rule for Claims does not apply) and an over-long one is truncated rather than rejected, so a sound Critique is not lost to a style limit. Unknown `{E<id>}` placeholders are still invalid.

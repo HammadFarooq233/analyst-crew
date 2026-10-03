@@ -171,6 +171,9 @@ def _run_metadata(result: CrewState) -> dict[str, Any]:
     critic_outcome = artifacts.get("critic_outcome")
     if critic_outcome:
         metadata["critic_outcome"] = critic_outcome
+    critic_failure = artifacts.get("critic_failure")
+    if critic_failure:
+        metadata["critic_failure"] = critic_failure
     step_outcomes = artifacts.get("step_outcomes")
     if step_outcomes:
         metadata["step_outcomes"] = {

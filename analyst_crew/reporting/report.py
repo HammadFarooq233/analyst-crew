@@ -27,7 +27,7 @@ FALLBACK_CHARTS_NOTE = (
     "Fallback chart set: chosen by code from the Evidence Catalog, with no Visualizer judgment. "
     "Every plotted value is an Evidence Entry value."
 )
-CHARTS_NOTICE ="Reserved. Charts are not generated yet; no Visualizer Agent is part of the Crew."
+CHARTS_NOTICE = "No charts were produced for this Report."
 
 
 class CitedText(BaseModel):
@@ -235,13 +235,18 @@ def assemble_methodology(catalog: EvidenceCatalog) -> list[ReportLine]:
     return [template_line(line) for line in lines]
 
 
+def _chart_mode(charts: list[ChartReference] | None, chart_mode: str | None) -> str | None:
+    """``chart_mode`` describes the charts, so a Report without charts carries none."""
+    return chart_mode if charts else None
+
+
 def build_report(content: ReporterContent, catalog: EvidenceCatalog, question: str,
                  charts: list[ChartReference] | None = None, chart_mode: str | None = None) -> Report:
     """An ``llm``-mode Report: model-written Summary and Claims, code-assembled rest.
     ``charts`` are the Chart Artifact references for the code-assembled Charts section."""
     return Report(
         report_mode="llm", question=question, summary=content.summary, findings=content.claims,
-        charts=charts or [], chart_mode=chart_mode if charts else None,
+        charts=charts or [], chart_mode=_chart_mode(charts, chart_mode),
         caveats=assemble_caveats(catalog), methodology=assemble_methodology(catalog),
     )
 
@@ -306,12 +311,12 @@ def build_fallback_report(catalog: EvidenceCatalog, question: str,
 
     return Report(
         report_mode="fallback", fallback_notice=FALLBACK_NOTICE, question=question, summary=summary,
-        findings=claims, charts=charts or [], chart_mode=chart_mode if charts else None,
+        findings=claims, charts=charts or [], chart_mode=_chart_mode(charts, chart_mode),
         caveats=assemble_caveats(catalog), methodology=assemble_methodology(catalog),
     )
 
 
-def _substitute(text: str, catalog: EvidenceCatalog, charts: Mapping[str, str] | None = None) -> str:
+def substitute(text: str, catalog: EvidenceCatalog, charts: Mapping[str, str] | None = None) -> str:
     def replace(match: re.Match[str]) -> str:
         token = match.group(1)
         if token.startswith(CHART_PREFIX):
@@ -326,7 +331,7 @@ def _substitute(text: str, catalog: EvidenceCatalog, charts: Mapping[str, str] |
 def _sentence(text: str, catalog: EvidenceCatalog, charts: Mapping[str, str] | None = None) -> str:
     """Substituted text with its first letter capitalised, because a placeholder
     (a lower-cased dimension value, say) may open the sentence."""
-    text = _substitute(text, catalog, charts)
+    text = substitute(text, catalog, charts)
     return text[:1].upper() + text[1:]
 
 
@@ -358,8 +363,8 @@ def render_report(report: Report, catalog: EvidenceCatalog) -> str:
         lines.pop()
     else:
         lines.append(f"_{CHARTS_NOTICE}_")
-    lines += ["", "## Caveats", ""] + [f"- {_substitute(claim.text, catalog)}" for claim in report.caveats]
-    lines += ["", "## Methodology", ""] + [f"- {_substitute(claim.text, catalog)}" for claim in report.methodology]
+    lines += ["", "## Caveats", ""] + [f"- {substitute(claim.text, catalog)}" for claim in report.caveats]
+    lines += ["", "## Methodology", ""] + [f"- {substitute(claim.text, catalog)}" for claim in report.methodology]
 
     if report.reviewer_notes:
         lines += ["", "## Reviewer Notes", ""]

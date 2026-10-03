@@ -109,10 +109,6 @@ class ChartSpecError(ValueError):
         super().__init__("; ".join(errors))
 
 
-def _is_numeric(entry: EvidenceEntry) -> bool:
-    return isinstance(entry.value, (int, float)) and not isinstance(entry.value, bool)
-
-
 def validate_chart_specs(specs: list[ChartSpec], catalog: EvidenceCatalog) -> list[ChartSpec]:
     errors: list[str] = []
     if len(specs) > MAX_CHARTS:
@@ -134,7 +130,7 @@ def validate_chart_specs(specs: list[ChartSpec], catalog: EvidenceCatalog) -> li
                 entry = catalog.get(entry_id)
                 if entry is None:
                     errors.append(f"{name} references '{entry_id}', which is not an Evidence Entry id")
-                elif not _is_numeric(entry):
+                elif not entry.is_numeric:
                     errors.append(f"{name} references '{entry_id}', which has no numeric value to plot")
         if spec.mark in ("bar", "waterfall") and len(spec.series) > 1:
             errors.append(f"{name} mark '{spec.mark}' takes exactly one series")
@@ -157,7 +153,7 @@ def fill_chart_data(spec: ChartSpec, catalog: EvidenceCatalog) -> list[ChartSeri
         points = []
         for entry_id in series.entry_ids:
             entry = catalog.get(entry_id)
-            if entry is None or not _is_numeric(entry):
+            if entry is None or not entry.is_numeric:
                 raise ChartSpecError([f"'{entry_id}' is not a plottable Evidence Entry"])
             points.append(ChartPoint(entry_id=entry.id, label=entry.label, value=float(entry.value),
                                      display=entry.display))

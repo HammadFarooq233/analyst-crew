@@ -9,6 +9,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 import analyst_crew.agents as agents
 import cli
+from analyst_crew.reporting.report import CHARTS_NOTICE
 from tests.crew_harness import (
     FULL_AGENTS, QUESTION, ScriptedAnalystModel, ScriptedFetcherModel, ScriptedPlannerModel, ScriptedReporterModel,
     ScriptedVisualizerModel, base_rows, crew_plan, write_sales,
@@ -141,7 +142,7 @@ def test_default_output_lists_chart_titles_and_paths(monkeypatch, tmp_path, caps
     out, _, exit_code = _full_cli(monkeypatch, tmp_path, capsys)
 
     assert exit_code == 0
-    assert "## Charts" in out and "Reserved" not in out
+    assert "## Charts" in out and CHARTS_NOTICE not in out
     listing = out.split("Charts generated:")[1].strip().splitlines()
     assert len(listing) == 2
     assert "Net revenue bridge: prior to current period" in listing[0]

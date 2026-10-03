@@ -10,22 +10,23 @@ un-reviewed Report with the failure recorded; it never fails the run.
 """
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.runnables import RunnableLambda
 from pydantic import ValidationError
 
-from analyst_crew.agents.contracts import CREW_AGENTS, Crew, Handoff, Plan
-from analyst_crew.agents.reporter import (
-    _catalog_prompt, _is_transient_provider_error, _summarize_schema_error, production_reporter_model, revise_content,
+from analyst_crew.agents.agent_support import (
+    catalog_prompt, format_failure, named_span, run_validated, summarize_schema_error,
 )
+from analyst_crew.agents.contracts import CREW_AGENTS, Crew, Handoff, Plan
+from analyst_crew.agents.reporter import production_reporter_model, revise_content
 from analyst_crew.agents.resume import _resume_decision, execution_key
 from analyst_crew.llm import make_chat_model
 from analyst_crew.reporting.catalog import EvidenceCatalog
-from analyst_crew.reporting.critique import Critique, report_targets, validate_critique
-from analyst_crew.reporting.report import Report, _substitute, build_report
+from analyst_crew.reporting.critique import Critique, report_items, report_targets, validate_critique
+from analyst_crew.reporting.report import Report, build_report, substitute
 from analyst_crew.state import CrewState
-from analyst_crew.tools.retry import invoke_with_optional_config, retry_with_backoff
 
 CRITIC_SYSTEM_PROMPT = """You are the Critic Agent for Analyst Crew, a multi-agent data analysis copilot.
 
@@ -42,20 +43,19 @@ cites. Categories (use exactly these):
 
 Rules:
 1. Each issue targets exactly one item: "summary" or "claim_<n>" where <n> is the Finding number shown below.
-2. Give a short rationale. Write NO digits in it; refer to an entry only by placeholder, for example {E12}.
+2. Give a short rationale (at most a few sentences). Refer to an entry by placeholder, for example {E12}, rather than restating its value.
 3. If nothing needs flagging, return an empty list of issues.
 4. Respond with a single JSON object and nothing else, in exactly this shape:
    {"issues": [{"category": "causal_overreach", "target": "claim_1", "rationale": "..."}]}"""
 
 
 def _report_context(report: Report, catalog: EvidenceCatalog) -> dict[str, Any]:
-    items = [("summary", report.summary), *[(f"claim_{n}", claim) for n, claim in enumerate(report.findings, start=1)]]
     return {
         "targets": report_targets(report),
         "items": [
-            {"target": target, "text": claim.text, "rendered": _substitute(claim.text, catalog),
+            {"target": target, "text": claim.text, "rendered": substitute(claim.text, catalog),
              "evidence_ids": claim.evidence_ids}
-            for target, claim in items
+            for target, claim in report_items(report)
         ],
     }
 
@@ -68,7 +68,7 @@ def production_critic_model() -> Any:
     structured = make_chat_model(temperature=0).with_structured_output(Critique, method="json_mode", include_raw=True)
 
     def _invoke(context: dict[str, Any], config: Any = None) -> Critique:
-        system = CRITIC_SYSTEM_PROMPT + "\n\nEvidence Catalog (id | label | display):\n" + _catalog_prompt(
+        system = CRITIC_SYSTEM_PROMPT + "\n\nEvidence Catalog (id | label | display):\n" + catalog_prompt(
             context["evidence_catalog"]
         )
         draft = "\n".join(
@@ -92,9 +92,15 @@ def production_critic_model() -> Any:
     return RunnableLambda(_invoke)
 
 
+CRITIC_RUN_NAME = "Critic"
+REREVIEW_RUN_NAME = "Critic (re-review)"
+
+
 class CriticAgent:
     """Validated Critic loop: invalid output gets exactly one repair retry with the problems fed back;
-    provider failures get a bounded retry. Terminal failure raises, and the node records it."""
+    provider failures get a bounded retry. Terminal failure raises, and the node records it. Each review is
+    its own named run (``Critic``, or ``Critic (re-review)`` after a revision) so the trace shows the Critic
+    as a span with the LLM generation nested under it."""
 
     max_provider_attempts = 2
     backoff_seconds = 0.0
@@ -103,45 +109,30 @@ class CriticAgent:
         self.model = model
         self.validation_retries = 0
         self.tool_retries = 0
+        self.last_validation_error: str | None = None
 
-    def run(self, handoff: Handoff, report: Report, catalog: EvidenceCatalog, *, config: Any = None) -> Critique:
+    def run(self, handoff: Handoff, report: Report, catalog: EvidenceCatalog, *, config: Any = None,
+            run_name: str = CRITIC_RUN_NAME) -> Critique:
         context = {
             "step_objective": handoff.step.objective,
             "user_question": handoff.user_question,
             "evidence_catalog": [entry.model_dump() for entry in catalog.entries],
             "report": _report_context(report, catalog),
         }
-        feedback = ""
-        for attempt in range(2):
-            calls = 0
 
-            def call() -> Any:
-                nonlocal calls
-                calls += 1
-                return invoke_with_optional_config(self.model, {**context, "validation_feedback": feedback}, config)
-
+        def parse(raw: Any) -> Critique:
             try:
-                try:
-                    raw, _ = retry_with_backoff(
-                        call, is_transient=_is_transient_provider_error,
-                        max_attempts=self.max_provider_attempts, backoff_seconds=self.backoff_seconds,
-                    )
-                finally:
-                    self.tool_retries += calls - 1
-                try:
-                    critique = raw if isinstance(raw, Critique) else Critique.model_validate(raw)
-                except ValidationError as exc:
-                    raise ValueError(f"response does not match the required JSON shape: {_summarize_schema_error(exc)}") from exc
-                return validate_critique(critique, report, catalog)
-            except ValueError as exc:
-                if attempt:
-                    raise
-                self.validation_retries += 1
-                feedback = (
-                    f"Your previous response was invalid: {exc}. Return the corrected JSON object only, using only "
-                    "the targets listed, a category from the closed set and no digits outside {E<id>} placeholders."
-                )
-        raise RuntimeError("Critic request loop exhausted")
+                critique = raw if isinstance(raw, Critique) else Critique.model_validate(raw)
+            except ValidationError as exc:
+                raise ValueError(f"response does not match the required JSON shape: {summarize_schema_error(exc)}") from exc
+            return validate_critique(critique, report, catalog)
+
+        return run_validated(
+            self, context, parse, label="Critic", config=config,
+            model=named_span(self.model, run_name, ["agent:Critic"]),
+            retry_hint=("Return the corrected JSON object only, using only the targets listed, a category from "
+                        "the closed set and only Evidence Entry ids inside braces."),
+        )
 
 
 def report_hash(report: Report) -> str:
@@ -154,8 +145,19 @@ def with_reviewer_notes(draft: Report, critique: Critique) -> Report:
     return draft.model_copy(update={"reviewer_notes": list(critique.issues)})
 
 
+@dataclass(frozen=True)
+class CritiqueApplication:
+    """What applying a Critique produced: the Report to ship, the outcome and the revision bookkeeping."""
+
+    report: Report
+    outcome: str
+    revised_critique: Critique | None = None
+    revision_failure: str | None = None
+    rereview_error: str | None = None
+
+
 def _apply_critique(agent: "CriticAgent", handoff: Handoff, draft: Report, critique: Critique,
-                    catalog: EvidenceCatalog, configurable: dict, config: Any) -> dict[str, Any]:
+                    catalog: EvidenceCatalog, configurable: dict, config: Any) -> CritiqueApplication:
     """Turn a Critique of the draft into the final Report and outcome (ADR-0003).
 
     A clean Critique ships the draft. A non-empty one triggers exactly one Reporter revision, validated by the
@@ -163,32 +165,25 @@ def _apply_critique(agent: "CriticAgent", handoff: Handoff, draft: Report, criti
     Reviewer Notes. A revision that fails keeps the draft with the original issues as Reviewer Notes. A Fallback
     Report is not revised (the Reporter model just failed to write it).
     """
-    result: dict[str, Any] = {"report": draft, "outcome": "clean", "revised_critique": None,
-                              "revision_failure": None, "rereview_error": None}
     if not critique.issues:
-        return result
-    result["outcome"] = "unresolved"
-    result["report"] = with_reviewer_notes(draft, critique)
+        return CritiqueApplication(draft, "clean")
+    unresolved = with_reviewer_notes(draft, critique)
     if draft.report_mode == "fallback":
-        result["revision_failure"] = "not attempted: the draft is a Fallback Report"
-        return result
+        return CritiqueApplication(unresolved, "unresolved",
+                                   revision_failure="not attempted: the draft is a Fallback Report")
     try:
         model = configurable.get("reporter_model") or production_reporter_model()
         content = revise_content(model, handoff, catalog, draft, critique, config=config)
         revised = build_report(content, catalog, draft.question, draft.charts, draft.chart_mode)
     except Exception as exc:  # noqa: BLE001 — a failed revision never ships; the draft stays
-        result["revision_failure"] = str(exc) if isinstance(exc, (RuntimeError, ValueError)) else f"{type(exc).__name__}: {exc}"
-        return result
+        return CritiqueApplication(unresolved, "unresolved", revision_failure=format_failure(exc))
     try:
-        second = agent.run(handoff, revised, catalog, config=config)
+        second = agent.run(handoff, revised, catalog, config=config, run_name=REREVIEW_RUN_NAME)
     except Exception as exc:  # noqa: BLE001 — cannot confirm the fix: keep the revision, keep the original issues visible
-        result["report"] = with_reviewer_notes(revised, critique)
-        result["rereview_error"] = str(exc) if isinstance(exc, (RuntimeError, ValueError)) else f"{type(exc).__name__}: {exc}"
-        return result
-    result["revised_critique"] = second
-    result["report"] = with_reviewer_notes(revised, second)
-    result["outcome"] = "unresolved" if second.issues else "revised"
-    return result
+        return CritiqueApplication(with_reviewer_notes(revised, critique), "unresolved",
+                                   rereview_error=format_failure(exc))
+    return CritiqueApplication(with_reviewer_notes(revised, second), "unresolved" if second.issues else "revised",
+                               revised_critique=second)
 
 
 def _as_report(value: Any) -> Report | None:
@@ -262,9 +257,9 @@ def critic_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
             agent = CriticAgent(model)
             critique = agent.run(handoff, draft, catalog, config=config)
             applied = _apply_critique(agent, handoff, draft, critique, catalog, configurable, config)
-            final_report, critic_outcome = applied["report"], applied["outcome"]
-            revised_critique, revision_failure = applied["revised_critique"], applied["revision_failure"]
-            rereview_error = applied["rereview_error"]
+            final_report, critic_outcome = applied.report, applied.outcome
+            revised_critique, revision_failure = applied.revised_critique, applied.revision_failure
+            rereview_error = applied.rereview_error
     except Exception as exc:  # noqa: BLE001 — a Critic failure ships the un-reviewed Report, never fails the run
         failure, critique, final_report, critic_outcome = exc, None, draft, "failed"
         revised_critique = revision_failure = rereview_error = None
@@ -292,9 +287,10 @@ def critic_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
     if rereview_error:
         outcome["rereview_error"] = rereview_error
     if failure is not None:
-        outcome["error"] = (
-            str(failure) if isinstance(failure, (RuntimeError, ValueError)) else f"{type(failure).__name__}: {failure}"
-        )
+        outcome["error"] = format_failure(failure)
+    critic_failure = None if failure is None else {
+        "agent": "Critic", "step_id": step.step_id, "error": outcome["error"], "degraded_to": "unreviewed_report",
+    }
     return {
         "current_step": "critic_node",
         "steps_completed": [step.step_id] if completed else [],
@@ -306,6 +302,7 @@ def critic_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
             "revised_critique": revised_critique,
             "revision_failure": revision_failure,
             "rereview_error": rereview_error,
+            "critic_failure": critic_failure,
             "critic_outcome": critic_outcome,
             "handoffs": artifacts.get("handoffs", {}) if handoff is None else {
                 **artifacts.get("handoffs", {}), step.step_id: handoff.model_dump(mode="json"),

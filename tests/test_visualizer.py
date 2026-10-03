@@ -8,7 +8,7 @@ from analyst_crew.agents import Plan
 from analyst_crew.agents.planner import PlannerAgent
 from analyst_crew.agents.tracing import _run_metadata
 from analyst_crew.reporting.charts import ChartArtifact
-from analyst_crew.reporting.report import render_report
+from analyst_crew.reporting.report import CHARTS_NOTICE, render_report
 from analyst_crew.tools.sales import sales_data_source
 from tests.crew_harness import (
     FULL_AGENTS, QUESTION, ScriptedReporterModel, ScriptedVisualizerModel, base_rows, crew_plan, entry_id, run_crew,
@@ -116,7 +116,7 @@ class TestChartsEndToEnd:
         for chart in charts:
             assert f"![{chart.spec.title}]({chart.filename})" in charts_section
             assert (tmp_path / "artifacts" / "charts" / chart.filename).is_file()
-        assert "Reserved" not in rendered
+        assert CHARTS_NOTICE not in rendered
 
     def test_plotted_values_are_evidence_entry_raw_values(self, source, tmp_path, monkeypatch):
         result, _ = run_full(source, tmp_path, monkeypatch)

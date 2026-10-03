@@ -22,7 +22,8 @@ from pydantic import ValidationError
 from analyst_crew.agents.contracts import CREW_AGENTS, Crew, Handoff, Plan
 from analyst_crew.agents.resume import _resume_decision, execution_key
 from analyst_crew.reporting.catalog import build_evidence_catalog
-from analyst_crew.agents.reporter import _is_transient_provider_error, findings_hash
+from analyst_crew.agents.agent_support import catalog_prompt, format_failure, run_validated, summarize_schema_error
+from analyst_crew.agents.reporter import findings_hash
 from analyst_crew.llm import make_chat_model
 from analyst_crew.reporting.catalog import EvidenceCatalog
 from analyst_crew.reporting.chart_choice import VisualizerContent, chart_specs_from_content
@@ -32,7 +33,6 @@ from analyst_crew.reporting.charts import (
 )
 from analyst_crew.state import CrewState
 from analyst_crew.tools.analysis import BaselineFindings
-from analyst_crew.tools.retry import invoke_with_optional_config, retry_with_backoff
 
 VISUALIZER_SYSTEM_PROMPT = f"""You are the Visualizer Agent for Analyst Crew, a multi-agent data analysis copilot.
 
@@ -55,14 +55,6 @@ Rules:
    {{"charts": [{{"mark": "waterfall", "series": [{{"entry_ids": ["E1", "E2"]}}]}}]}}"""
 
 
-def _catalog_prompt(entries: list[dict[str, Any]]) -> str:
-    lines = []
-    for entry in entries:
-        flag = " [MATERIAL CHANGE]" if entry.get("material") else ""
-        lines.append(f"{entry['id']} | {entry['label']} | {entry['display']} | {entry['source']}{flag}")
-    return "\n".join(lines)
-
-
 def production_visualizer_model() -> Any:
     """Build the live Visualizer seam: invoked with a plain context ``dict``, returns ``VisualizerContent``.
     A response that does not parse raises ``ValueError`` so the single validation retry can feed it back."""
@@ -73,8 +65,8 @@ def production_visualizer_model() -> Any:
     )
 
     def _invoke(context: dict[str, Any], config: Any = None) -> VisualizerContent:
-        system = VISUALIZER_SYSTEM_PROMPT + "\n\nEvidence Catalog (id | label | display | source):\n" + _catalog_prompt(
-            context["evidence_catalog"]
+        system = VISUALIZER_SYSTEM_PROMPT + "\n\nEvidence Catalog (id | label | display | source):\n" + catalog_prompt(
+            context["evidence_catalog"], with_source=True,
         )
         user = (
             f"User question: {context['user_question']}\n"
@@ -93,13 +85,6 @@ def production_visualizer_model() -> Any:
     return RunnableLambda(_invoke)
 
 
-def _summarize_schema_error(exc: ValidationError) -> str:
-    return "; ".join(
-        f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']} (got {error.get('input')!r})"
-        for error in exc.errors()
-    )
-
-
 class VisualizerAgent:
     """Validated Visualizer loop, mirroring the Reporter's bounded-retry rule: invalid output gets exactly one
     repair retry with the validation errors fed back; provider failures (timeouts, connection errors, 429/5xx)
@@ -112,49 +97,31 @@ class VisualizerAgent:
         self.model = model
         self.validation_retries = 0
         self.tool_retries = 0
+        self.last_validation_error: str | None = None
 
     def run(self, handoff: Handoff, catalog: EvidenceCatalog, *, config: Any = None) -> list[ChartSpec]:
         context = {
             "step_objective": handoff.step.objective,
             "user_question": handoff.user_question,
             "evidence_catalog": [
-                entry.model_dump() for entry in catalog.entries
-                if isinstance(entry.value, (int, float)) and not isinstance(entry.value, bool)
+                entry.model_dump() for entry in catalog.entries if entry.is_numeric
             ],
         }
-        feedback = ""
-        for attempt in range(2):
-            calls = 0
 
-            def call() -> Any:
-                nonlocal calls
-                calls += 1
-                return invoke_with_optional_config(self.model, {**context, "validation_feedback": feedback}, config)
-
+        def parse(raw: Any) -> list[ChartSpec]:
             try:
-                try:
-                    raw, _ = retry_with_backoff(
-                        call, is_transient=_is_transient_provider_error,
-                        max_attempts=self.max_provider_attempts, backoff_seconds=self.backoff_seconds,
-                    )
-                finally:
-                    self.tool_retries += calls - 1
-                try:
-                    content = raw if isinstance(raw, VisualizerContent) else VisualizerContent.model_validate(raw)
-                except ValidationError as exc:
-                    raise ValueError(
-                        f"response does not match the required JSON shape: {_summarize_schema_error(exc)}"
-                    ) from exc
-                return chart_specs_from_content(content, catalog)
-            except ValueError as exc:
-                if attempt:
-                    raise
-                self.validation_retries += 1
-                feedback = (
-                    f"Your previous response was invalid: {exc}. Return the corrected JSON object only, "
-                    "choosing only marks bar, grouped_bar or waterfall, and only numeric ids from the catalog."
-                )
-        raise RuntimeError("Visualizer request loop exhausted")
+                content = raw if isinstance(raw, VisualizerContent) else VisualizerContent.model_validate(raw)
+            except ValidationError as exc:
+                raise ValueError(
+                    f"response does not match the required JSON shape: {summarize_schema_error(exc, include_input=True)}"
+                ) from exc
+            return chart_specs_from_content(content, catalog)
+
+        return run_validated(
+            self, context, parse, label="Visualizer", config=config,
+            retry_hint=("Return the corrected JSON object only, "
+                        "choosing only marks bar, grouped_bar or waterfall, and only numeric ids from the catalog."),
+        )
 
 
 def visualizer_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
@@ -240,10 +207,7 @@ def visualizer_node(state: CrewState, config: dict | None = None) -> dict[str, A
     }
     chart_failure = None
     if failure is not None:
-        outcome["error"] = (
-            str(failure) if isinstance(failure, (RuntimeError, ValueError))
-            else f"{type(failure).__name__}: {failure}"
-        )
+        outcome["error"] = format_failure(failure)
         chart_failure = {
             "agent": "Visualizer", "step_id": step.step_id, "error": outcome["error"], "retry_counts": retry_counts,
             "degraded_to": "fallback_charts" if chart_mode == "fallback" else "no_charts",
