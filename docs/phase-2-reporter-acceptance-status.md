@@ -22,6 +22,6 @@ Full suite on this date: `pytest` (all markers) — 178 passed, 1 skipped (the l
 
 ## Known constraints
 
-- LangGraph logs a "Deserializing unregistered type" warning when it loads `Report` and `EvidenceCatalog` from a Postgres checkpoint, exactly as it already does for `Plan` and `BaselineFindings`. It becomes an error only under `LANGGRAPH_STRICT_MSGPACK=true`; registering the state types is a follow-up for all four together.
+- Resolved 2026-10-03: the Postgres checkpointer now uses `analyst_crew/state/serde.py`, which allowlists every Pydantic state model (`Plan`, `BaselineFindings`, `Report`, `EvidenceCatalog` and their nested models), so there is no "Deserializing unregistered type" warning and `LANGGRAPH_STRICT_MSGPACK=true` works. Covered offline by `tests/test_state_serde.py`; not re-run against live Postgres (Docker was not running).
 - The model, not the code, decides which numbers sit next to which names in prose. Code guarantees every number is a Tool value and every Claim cites real entries; whether a Claim's wording is a fair reading of its cited entries is the later Critic Agent's job.
 - Signed display values (`-269,534.66`) are substituted verbatim, so the Reporter prompt tells the model to write "changed by {E10}" rather than "fell by {E10}".

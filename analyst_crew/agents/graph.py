@@ -16,6 +16,7 @@ from analyst_crew.agents.fetcher import fetcher_node
 from analyst_crew.agents.reporter import reporter_node
 from analyst_crew.agents.tracing import _finish_langfuse_trace, _run_metadata, get_langfuse_handler
 from analyst_crew.state import CrewState
+from analyst_crew.state.serde import crew_serde
 
 
 def build_graph(checkpointer=None, store=None, runtime_config: dict | None = None):
@@ -109,6 +110,7 @@ def invoke(
                 PostgresSaver.from_conn_string(conn_string) as pg_checkpointer,
                 PostgresStore.from_conn_string(conn_string) as pg_store,
             ):
+                pg_checkpointer.serde = crew_serde()
                 pg_checkpointer.setup()
                 pg_store.setup()
                 return _do_invoke(state, config, pg_checkpointer, pg_store)
