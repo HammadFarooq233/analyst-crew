@@ -10,8 +10,8 @@ from langgraph.checkpoint.memory import MemorySaver
 import analyst_crew.agents as agents
 import cli
 from tests.crew_harness import (
-    FULL_AGENTS, QUESTION, ScriptedAnalystModel, ScriptedFetcherModel, ScriptedPlannerModel, ScriptedReporterModel, base_rows,
-    crew_plan, write_sales,
+    FULL_AGENTS, QUESTION, ScriptedAnalystModel, ScriptedFetcherModel, ScriptedPlannerModel, ScriptedReporterModel,
+    ScriptedVisualizerModel, base_rows, crew_plan, write_sales,
 )
 
 
@@ -32,6 +32,7 @@ def _run_cli(monkeypatch, tmp_path, capsys, *extra_args, reporter=None, plan=Non
         config["configurable"].update(
             planner_model=ScriptedPlannerModel(plan or crew_plan()), fetcher_model=ScriptedFetcherModel(),
             analyst_model=ScriptedAnalystModel(), reporter_model=reporter,
+            visualizer_model=ScriptedVisualizerModel(),  # offline: no model, so the fallback chart set
         )
         # A Crew without the Visualizer unless a test asks for one: the default Plan has no Visualizer Step.
         config["configurable"]["available_agents"] = available_agents or ["Fetcher", "Analyst", "Reporter"]

@@ -168,12 +168,15 @@ USE_DEFAULT = object()
 
 def run_crew(source, tmp_path, monkeypatch, *, thread_id="thread-1", as_of_date="2025-06-30", checkpointer=None,
              plan=None, reporter_model=USE_DEFAULT, planner_model=None, fetcher_model=None, analyst_model=None,
-             extra_sources=None, available_agents=("Fetcher", "Analyst", "Reporter")):
+             extra_sources=None, available_agents=("Fetcher", "Analyst", "Reporter"), visualizer_model=USE_DEFAULT):
     planner_model = planner_model or ScriptedPlannerModel(plan or crew_plan())
     fetcher_model = fetcher_model or ScriptedFetcherModel()
     analyst_model = analyst_model or ScriptedAnalystModel()
     if reporter_model is USE_DEFAULT:
         reporter_model = ScriptedReporterModel()
+    if visualizer_model is USE_DEFAULT:
+        # Offline default: the Visualizer model is unavailable, so a Visualizer Step uses the fallback chart set.
+        visualizer_model = ScriptedVisualizerModel()
     monkeypatch.setenv("POSTGRES_CONNECTION_STRING", "")
     monkeypatch.setenv("LANGFUSE_HOST", "")
     monkeypatch.delenv("FRED_API_KEY", raising=False)
@@ -189,6 +192,8 @@ def run_crew(source, tmp_path, monkeypatch, *, thread_id="thread-1", as_of_date=
     }}
     if reporter_model is not None:
         runtime["configurable"]["reporter_model"] = reporter_model
+    if visualizer_model is not None:
+        runtime["configurable"]["visualizer_model"] = visualizer_model
     result = planner_module.invoke(QUESTION, runtime, checkpointer=checkpointer or MemorySaver())
     return result, reporter_model
 
@@ -205,3 +210,25 @@ def body_numbers(rendered):
     # Chart image links carry content-hash filenames; the title shown to the reader stays in the check.
     body = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", body)
     return re.findall(r"\d+(?:,\d{3})*(?:\.\d+)?", body)
+
+
+class ScriptedVisualizerModel:
+    """Plays back one response per call (the last repeats), like ``ScriptedReporterModel``. A response may be a
+    ``VisualizerContent``, a dict, an Exception to raise, or a callable taking the Visualizer's context."""
+
+    def __init__(self, *responses):
+        self.responses = list(responses) or [ConnectionError("no Visualizer model scripted")]
+        self.contexts = []
+
+    @property
+    def calls(self):
+        return len(self.contexts)
+
+    def invoke(self, context):
+        self.contexts.append(context)
+        response = self.responses[min(len(self.contexts), len(self.responses)) - 1]
+        if callable(response):
+            response = response(context)
+        if isinstance(response, BaseException):
+            raise response
+        return response

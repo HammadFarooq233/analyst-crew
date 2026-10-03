@@ -89,7 +89,9 @@ def format_charts(result) -> str:
     charts = stored_charts(result)
     if not charts:
         return ""
-    return "\nCharts generated:\n" + "\n".join(f"  - {chart.spec.title}: {chart.location}" for chart in charts)
+    mode = (result.get("artifacts") or {}).get("chart_mode")
+    prefix = f"\nchart_mode: {mode}" if mode else ""
+    return prefix + "\nCharts generated:\n" + "\n".join(f"  - {chart.spec.title}: {chart.location}" for chart in charts)
 
 
 def save_charts(result, directory: Path) -> list[Path]:

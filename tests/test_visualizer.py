@@ -11,7 +11,8 @@ from analyst_crew.reporting.charts import ChartArtifact
 from analyst_crew.reporting.report import render_report
 from analyst_crew.tools.sales import sales_data_source
 from tests.crew_harness import (
-    FULL_AGENTS, QUESTION, ScriptedReporterModel, base_rows, crew_plan, run_crew, sales_row, write_sales,
+    FULL_AGENTS, QUESTION, ScriptedReporterModel, ScriptedVisualizerModel, base_rows, crew_plan, entry_id, run_crew,
+    sales_row, write_sales,
 )
 from tests.report_properties import chart_property_violations, report_property_violations
 
@@ -25,6 +26,19 @@ def _engines():
 @pytest.fixture
 def source(tmp_path):
     return write_sales(tmp_path / "sales.csv", base_rows())
+
+
+def drivers_choice(context):
+    """A valid Visualizer response: the revenue bridge waterfall and the net revenue driver changes."""
+    bridge = [f"revenue_bridge.{name}" for name in (
+        "volume_effect", "price_effect", "interaction_effect", "discount_effect", "return_effect",
+        "new_product_effect", "discontinued_product_effect", "total_effect")]
+    drivers = [e["id"] for e in context["evidence_catalog"]
+               if e["source"].startswith("dimensions.") and e["source"].endswith(".absolute_change")]
+    return {"charts": [
+        {"mark": "waterfall", "series": [{"entry_ids": [entry_id(context, s) for s in bridge]}]},
+        {"mark": "bar", "series": [{"entry_ids": drivers}]},
+    ]}
 
 
 def run_full(source, tmp_path, monkeypatch, **kwargs):
@@ -126,11 +140,11 @@ class TestChartsEndToEnd:
         assert "is not entry" in violations and "missing" in violations
 
     def test_the_visualizer_step_records_a_completed_outcome_and_a_handoff_without_secrets(self, source, tmp_path, monkeypatch):
-        result, _ = run_full(source, tmp_path, monkeypatch)
+        result, _ = run_full(source, tmp_path, monkeypatch, visualizer_model=ScriptedVisualizerModel(drivers_choice))
         artifacts = result["artifacts"]
 
         outcome = artifacts["step_outcomes"]["visualize_findings"]
-        assert outcome["status"] == "completed" and outcome["chart_mode"] == "fallback"
+        assert outcome["status"] == "completed" and outcome["chart_mode"] == "llm"
         assert (outcome["resume_outcome"], outcome["resume_reason"]) == ("recomputed", "never_ran")
         assert "visualize_findings" in result["steps_completed"]
         handoff = artifacts["handoffs"]["visualize_findings"]
@@ -156,27 +170,29 @@ class TestChartsEndToEnd:
 
 class TestResume:
     def test_unchanged_rerun_reuses_charts_and_the_report_with_no_model_call_or_render(self, source, tmp_path, monkeypatch):
-        saver = MemorySaver()
-        first, reporter = run_full(source, tmp_path, monkeypatch, checkpointer=saver)
+        saver, model = MemorySaver(), ScriptedVisualizerModel(drivers_choice)
+        first, reporter = run_full(source, tmp_path, monkeypatch, checkpointer=saver, visualizer_model=model)
         renders = []
         import analyst_crew.reporting.charts as charts_module
 
         real = charts_module.render_chart_png
         monkeypatch.setattr(charts_module, "render_chart_png", lambda *a: renders.append(1) or real(*a))
-        second, _ = run_full(source, tmp_path, monkeypatch, checkpointer=saver, reporter_model=reporter)
+        second, _ = run_full(source, tmp_path, monkeypatch, checkpointer=saver, reporter_model=reporter,
+                             visualizer_model=model)
 
-        assert renders == [] and reporter.calls == 1
+        assert renders == [] and reporter.calls == 1 and model.calls == 1
         outcomes = second["artifacts"]["step_outcomes"]
         assert (outcomes["visualize_findings"]["resume_outcome"], outcomes["visualize_findings"]["resume_reason"]) == ("reused", "unchanged")
         assert (outcomes["write_report"]["resume_outcome"], outcomes["write_report"]["resume_reason"]) == ("reused", "unchanged")
         assert second["artifacts"]["charts"] == first["artifacts"]["charts"]
-        assert second["artifacts"]["chart_mode"] == "fallback"
+        assert second["artifacts"]["chart_mode"] == "llm"
 
     def test_changed_source_data_recomputes_the_charts_and_cascades_to_the_report(self, source, tmp_path, monkeypatch):
-        saver = MemorySaver()
-        first, reporter = run_full(source, tmp_path, monkeypatch, checkpointer=saver)
+        saver, model = MemorySaver(), ScriptedVisualizerModel(drivers_choice)
+        first, reporter = run_full(source, tmp_path, monkeypatch, checkpointer=saver, visualizer_model=model)
         write_sales(source, base_rows() + [sales_row("J3", "2025-06-10", quantity=4)])
-        second, _ = run_full(source, tmp_path, monkeypatch, checkpointer=saver, reporter_model=reporter)
+        second, _ = run_full(source, tmp_path, monkeypatch, checkpointer=saver, reporter_model=reporter,
+                             visualizer_model=model)
 
         outcomes = second["artifacts"]["step_outcomes"]
         assert (outcomes["visualize_findings"]["resume_outcome"], outcomes["visualize_findings"]["resume_reason"]) == ("recomputed", "invalidated")
@@ -212,12 +228,13 @@ class TestResume:
         assert artifacts["step_outcomes"]["write_report"]["execution_key"] == expected != without_charts
 
     def test_a_deleted_chart_file_is_regenerated_not_reused(self, source, tmp_path, monkeypatch):
-        saver = MemorySaver()
-        first, reporter = run_full(source, tmp_path, monkeypatch, checkpointer=saver)
+        saver, model = MemorySaver(), ScriptedVisualizerModel(drivers_choice)
+        first, reporter = run_full(source, tmp_path, monkeypatch, checkpointer=saver, visualizer_model=model)
         for chart in first["artifacts"]["charts"]:
             (tmp_path / "artifacts" / "charts" / chart.filename).unlink()
 
-        second, _ = run_full(source, tmp_path, monkeypatch, checkpointer=saver, reporter_model=reporter)
+        second, _ = run_full(source, tmp_path, monkeypatch, checkpointer=saver, reporter_model=reporter,
+                             visualizer_model=model)
 
         outcome = second["artifacts"]["step_outcomes"]["visualize_findings"]
         assert (outcome["resume_outcome"], outcome["resume_reason"]) == ("recomputed", "invalidated")
@@ -251,9 +268,10 @@ class TestDegradation:
         saver = MemorySaver()
         with monkeypatch.context() as broken:
             self._break_rendering(broken)
-            run_full(source, tmp_path, monkeypatch, checkpointer=saver)
+            run_full(source, tmp_path, monkeypatch, checkpointer=saver, visualizer_model=ScriptedVisualizerModel(drivers_choice))
 
-        second, _ = run_full(source, tmp_path, monkeypatch, checkpointer=saver)
+        second, _ = run_full(source, tmp_path, monkeypatch, checkpointer=saver,
+                             visualizer_model=ScriptedVisualizerModel(drivers_choice))
 
         outcome = second["artifacts"]["step_outcomes"]["visualize_findings"]
         assert (outcome["status"], outcome["resume_reason"]) == ("completed", "failed")
