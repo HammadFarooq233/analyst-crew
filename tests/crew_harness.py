@@ -168,7 +168,7 @@ USE_DEFAULT = object()
 
 def run_crew(source, tmp_path, monkeypatch, *, thread_id="thread-1", as_of_date="2025-06-30", checkpointer=None,
              plan=None, reporter_model=USE_DEFAULT, planner_model=None, fetcher_model=None, analyst_model=None,
-             extra_sources=None, available_agents=("Fetcher", "Analyst", "Reporter")):
+             extra_sources=None, available_agents=("Fetcher", "Analyst", "Reporter"), critic_model=None):
     planner_model = planner_model or ScriptedPlannerModel(plan or crew_plan())
     fetcher_model = fetcher_model or ScriptedFetcherModel()
     analyst_model = analyst_model or ScriptedAnalystModel()
@@ -189,6 +189,8 @@ def run_crew(source, tmp_path, monkeypatch, *, thread_id="thread-1", as_of_date=
     }}
     if reporter_model is not None:
         runtime["configurable"]["reporter_model"] = reporter_model
+    if critic_model is not None:
+        runtime["configurable"]["critic_model"] = critic_model
     result = planner_module.invoke(QUESTION, runtime, checkpointer=checkpointer or MemorySaver())
     return result, reporter_model
 

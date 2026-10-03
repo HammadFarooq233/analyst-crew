@@ -165,6 +165,9 @@ def _run_metadata(result: CrewState) -> dict[str, Any]:
     chart_mode = artifacts.get("chart_mode")
     if chart_mode:
         metadata["chart_mode"] = chart_mode
+    critic_outcome = artifacts.get("critic_outcome")
+    if critic_outcome:
+        metadata["critic_outcome"] = critic_outcome
     step_outcomes = artifacts.get("step_outcomes")
     if step_outcomes:
         metadata["step_outcomes"] = {
