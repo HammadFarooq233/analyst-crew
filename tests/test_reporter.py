@@ -94,7 +94,7 @@ class TestValidReporter:
         _, reporter = run_crew(source, tmp_path, monkeypatch)
 
         context = reporter.contexts[0]
-        assert set(context) == {"step_objective", "user_question", "evidence_catalog", "validation_feedback"}
+        assert set(context) == {"step_objective", "user_question", "evidence_catalog", "charts", "validation_feedback"}
         assert context["user_question"] == QUESTION
         assert all({"id", "label", "display", "source"} <= set(entry) for entry in context["evidence_catalog"])
         assert "sales.csv" not in str(context)

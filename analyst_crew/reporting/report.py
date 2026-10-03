@@ -8,6 +8,7 @@ Rendering is a pure function of the stored Report and the catalog.
 from __future__ import annotations
 
 import re
+from collections.abc import Collection, Mapping
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -39,7 +40,10 @@ class CitedText(BaseModel):
 
 class Claim(CitedText):
     """One item of the Summary or the Findings section, written by the Reporter
-    (or, in a Fallback Report, by a fixed template)."""
+    (or, in a Fallback Report, by a fixed template). ``chart_ids`` lists the charts its
+    text mentions by ``{chart:<id>}`` placeholder; they are references, never evidence."""
+
+    chart_ids: list[str] = Field(default_factory=list)
 
 
 class ReportLine(CitedText):
@@ -101,13 +105,19 @@ def template_line(text: str) -> ReportLine:
     return ReportLine(text=text, evidence_ids=_cited_ids(text))
 
 
-def validate_reporter_content(content: ReporterContent, catalog: EvidenceCatalog) -> ReporterContent:
+CHART_PREFIX = "chart:"
+
+
+def validate_reporter_content(content: ReporterContent, catalog: EvidenceCatalog,
+                              chart_ids: Collection[str] = ()) -> ReporterContent:
     """Enforce the ADR-0002 rules and return the content with each Claim's
     ``evidence_ids`` completed with every id its text places.
 
     Rules: every cited id and every placeholder exists in the catalog; no digit
     remains once placeholders are removed (no number parsing, no tolerance); no
-    stray braces; every Claim cites evidence; there is at least one Claim.
+    stray braces; every Claim cites evidence; there is at least one Claim. A
+    ``{chart:<id>}`` placeholder must name one of ``chart_ids`` (the charts the
+    Handoff carries); it is a reference, so it is neither evidence nor a number.
     """
     known = catalog.ids
     errors: list[str] = []
@@ -115,7 +125,13 @@ def validate_reporter_content(content: ReporterContent, catalog: EvidenceCatalog
     def check(name: str, claim: Claim) -> Claim:
         if not claim.text.strip():
             errors.append(f"{name} has no text")
-        placed = placeholders_in(claim.text)
+        all_placed = placeholders_in(claim.text)
+        placed_charts = [p[len(CHART_PREFIX):] for p in all_placed if p.startswith(CHART_PREFIX)]
+        placed = [p for p in all_placed if not p.startswith(CHART_PREFIX)]
+        for chart_id in placed_charts:
+            if chart_id not in chart_ids:
+                errors.append(f"{name} references chart '{chart_id}', which is not a chart of this Report "
+                              f"(available chart ids: {', '.join(sorted(chart_ids)) or 'none'})")
         for entry_id in placed:
             if entry_id not in known:
                 errors.append(f"{name} uses placeholder '{{{entry_id}}}', which is not an Evidence Entry id")
@@ -133,7 +149,8 @@ def validate_reporter_content(content: ReporterContent, catalog: EvidenceCatalog
                 errors.append(f"{name} cites unknown Evidence Entry id '{entry_id}'")
         if not claim.evidence_ids and not placed:
             errors.append(f"{name} cites no Evidence Entry")
-        return Claim(text=claim.text, evidence_ids=list(dict.fromkeys([*claim.evidence_ids, *placed])))
+        return Claim(text=claim.text, evidence_ids=list(dict.fromkeys([*claim.evidence_ids, *placed])),
+                     chart_ids=list(dict.fromkeys(placed_charts)))
 
     summary = check("Summary", content.summary)
     claims = [check(f"Claim {index}", claim) for index, claim in enumerate(content.claims, start=1)]
@@ -294,18 +311,22 @@ def build_fallback_report(catalog: EvidenceCatalog, question: str,
     )
 
 
-def _substitute(text: str, catalog: EvidenceCatalog) -> str:
+def _substitute(text: str, catalog: EvidenceCatalog, charts: Mapping[str, str] | None = None) -> str:
     def replace(match: re.Match[str]) -> str:
-        entry = catalog.get(match.group(1))
+        token = match.group(1)
+        if token.startswith(CHART_PREFIX):
+            title = (charts or {}).get(token[len(CHART_PREFIX):])
+            return match.group(0) if title is None else f"\u201c{title}\u201d"
+        entry = catalog.get(token)
         return match.group(0) if entry is None else entry.display
 
     return PLACEHOLDER.sub(replace, text)
 
 
-def _sentence(text: str, catalog: EvidenceCatalog) -> str:
+def _sentence(text: str, catalog: EvidenceCatalog, charts: Mapping[str, str] | None = None) -> str:
     """Substituted text with its first letter capitalised, because a placeholder
     (a lower-cased dimension value, say) may open the sentence."""
-    text = _substitute(text, catalog)
+    text = _substitute(text, catalog, charts)
     return text[:1].upper() + text[1:]
 
 
@@ -320,12 +341,13 @@ def _citation(claim: Claim) -> str:
 def render_report(report: Report, catalog: EvidenceCatalog) -> str:
     """Markdown for a stored Report. A pure function of the Report and the
     catalog; no model is ever involved."""
+    titles = {chart.chart_id: chart.title for chart in report.charts}
     lines: list[str] = ["# Analyst Crew Report", ""]
     if report.fallback_notice:
         lines += [f"> **Fallback Report.** {report.fallback_notice}", ""]
     lines += [f"**Question:** {report.question}", "", "## Summary", "",
-              _sentence(report.summary.text, catalog) + _citation(report.summary), "", "## Findings", ""]
-    lines += [f"{number}. {_sentence(claim.text, catalog)}{_citation(claim)}"
+              _sentence(report.summary.text, catalog, titles) + _citation(report.summary), "", "## Findings", ""]
+    lines += [f"{number}. {_sentence(claim.text, catalog, titles)}{_citation(claim)}"
               for number, claim in enumerate(report.findings, start=1)]
     lines += ["", "## Charts", ""]
     if report.charts:
