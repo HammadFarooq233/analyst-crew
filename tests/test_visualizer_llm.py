@@ -2,12 +2,15 @@
 models), plus pure unit tests of Chart Spec validation for model output. Asserts external behavior: chart_mode,
 plotted values equal Evidence Entry raw values, labels come from the catalog, retry/fallback outcomes, trace
 metadata. Never pixels or exact model wording."""
+import re
+
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 
 from analyst_crew.agents.tracing import _run_metadata
 from analyst_crew.reporting.catalog import build_evidence_catalog
-from analyst_crew.reporting.chart_choice import VisualizerContent, chart_specs_from_content
+from analyst_crew.agents.visualizer import visualizer_prompts
+from analyst_crew.reporting.chart_choice import VisualizerContent, build_chart_menu, chart_specs_from_content
 from analyst_crew.reporting.charts import ChartSpecError
 from tests.crew_harness import (
     FULL_AGENTS, ScriptedVisualizerModel, base_rows, crew_plan, entry_id, run_crew, write_sales,
@@ -234,3 +237,52 @@ class TestChartSpecValidationForModelOutput:
         mode = next(e.id for e in catalog.entries if e.source == "window.mode")
         with pytest.raises(ChartSpecError, match="numeric"):
             chart_specs_from_content(self.content(catalog, series=[{"entry_ids": [mode]}]), catalog)
+
+
+class TestChartMenu:
+    """The menu is code-built from catalog ids so the prompt shows which entries pair up (equal-length lists)."""
+
+    @pytest.fixture
+    def catalog(self):
+        return build_evidence_catalog(make_findings())
+
+    @staticmethod
+    def entries(catalog):
+        return [e.model_dump() for e in catalog.entries if e.is_numeric]
+
+    def test_prior_and_current_lists_pair_up_item_for_item(self, catalog):
+        menu = build_chart_menu(self.entries(catalog))
+
+        expected = {
+            field: ", ".join(catalog.by_source(f"dimensions.region.{name}.{field}").id for name in ("North", "South"))
+            for field in ("prior", "current")
+        }
+        assert f"prior period: {expected['prior']}" in menu
+        assert f"current period: {expected['current']}" in menu
+        assert "North, South" in menu
+
+    def test_the_menu_offers_the_bridge_and_only_ids_that_exist(self, catalog):
+        menu = build_chart_menu(self.entries(catalog))
+
+        bridge = ", ".join(catalog.by_source(f"revenue_bridge.{name}").id for name in (
+            "volume_effect", "price_effect", "interaction_effect", "discount_effect", "return_effect",
+            "new_product_effect", "discontinued_product_effect", "total_effect"))
+        assert bridge in menu
+        assert set(re.findall(r"\bE\d+\b", menu)) <= catalog.ids
+
+    def test_a_grouped_bar_built_from_the_menu_lists_validates(self, catalog):
+        menu = build_chart_menu(self.entries(catalog))
+        lists = [line.split(": ", 1)[1].split(", ") for line in menu.splitlines()
+                 if line.strip().startswith(("prior period:", "current period:"))][:2]
+        content = VisualizerContent.model_validate(
+            {"charts": [{"mark": "grouped_bar", "series": [{"entry_ids": ids} for ids in lists]}]})
+
+        assert chart_specs_from_content(content, catalog)
+
+    def test_the_live_prompt_includes_the_menu(self, catalog):
+        entries = self.entries(catalog)
+        system, _ = visualizer_prompts({
+            "evidence_catalog": entries, "user_question": "q", "step_objective": "o", "validation_feedback": "",
+        })
+
+        assert build_chart_menu(entries) in system

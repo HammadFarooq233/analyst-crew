@@ -26,7 +26,7 @@ from analyst_crew.agents.agent_support import catalog_prompt, format_failure, ru
 from analyst_crew.agents.reporter import findings_hash
 from analyst_crew.llm import make_chat_model
 from analyst_crew.reporting.catalog import EvidenceCatalog
-from analyst_crew.reporting.chart_choice import VisualizerContent, chart_specs_from_content
+from analyst_crew.reporting.chart_choice import VisualizerContent, build_chart_menu, chart_specs_from_content
 from analyst_crew.reporting.charts import (
     MAX_CHARTS, ChartArtifact, ChartSpec, build_chart_artifacts, build_fallback_chart_specs,
     chart_set_reference, load_charts,
@@ -44,15 +44,41 @@ The system fills in every value and label from the catalog and renders the chart
 Rules:
 1. Choose at most {MAX_CHARTS} charts, most informative first. Use only these marks:
    - "bar": one series; one horizontal bar per entry (for example the absolute change of the biggest drivers).
-   - "grouped_bar": two or more series with the same number of entries each, compared side by side (for example
-     the prior-period and current-period entries of the same items, listed in the same order).
+   - "grouped_bar": two or more series, each with EXACTLY the same number of entries, compared side by side. Entry
+     k of every series must describe the same item (for example series 1 = the prior-period entries of items A, B,
+     C and series 2 = the current-period entries of A, B, C, in that order). Never put an item in one series
+     that is missing from another; count the entries of each series before answering. When the question is
+     "this period versus last", use the prior-period and current-period lists from the chart menu.
    - "waterfall": one series; every entry but the last is a step and the last is the total (the revenue bridge:
      the effect entries in order, then the total of all effects).
 2. Every entry id must exist in the catalog and be numeric. Do not mix money, counts and percentages in one chart.
-3. Prefer: the revenue bridge as a waterfall, the largest drivers of the net revenue change as a bar, and target
+3. The chart menu below lists id lists you can copy as a series. Prefer copying a menu list unchanged; you may
+   take a leading slice of one (for example the first five entries) but, in a grouped_bar, take the same slice
+   of every series. Do not mix lists of different kinds (prior, current, change) inside one series.
+   Prefer: the revenue bridge as a waterfall, the largest drivers of the net revenue change as a bar, and target
    variance as a bar when the catalog has it. Skip a chart the catalog cannot support.
 4. Respond with a single JSON object and nothing else, in exactly this shape and with no other fields:
    {{"charts": [{{"mark": "waterfall", "series": [{{"entry_ids": ["E1", "E2"]}}]}}]}}"""
+
+
+def visualizer_prompts(context: dict[str, Any]) -> tuple[str, str]:
+    """The (system, user) prompt texts for one Visualizer call."""
+    entries = context["evidence_catalog"]
+    system = (
+        VISUALIZER_SYSTEM_PROMPT
+        + "\n\nChart menu (ready-made id lists built from the catalog; every list within a group has the same "
+          "number of entries, in the same item order, so lists from one group pair up item for item):\n"
+        + (build_chart_menu(entries) or "(none: build charts from the catalog entries directly)")
+        + "\n\nEvidence Catalog (id | label | display | source):\n" + catalog_prompt(entries, with_source=True)
+    )
+    user = (
+        f"User question: {context['user_question']}\n"
+        f"Step objective: {context['step_objective']}\n"
+        f"Validation feedback from a prior attempt (empty if this is the first): "
+        f"{context.get('validation_feedback') or 'none'}\n"
+        "Return the JSON object now."
+    )
+    return system, user
 
 
 def production_visualizer_model() -> Any:
@@ -65,16 +91,7 @@ def production_visualizer_model() -> Any:
     )
 
     def _invoke(context: dict[str, Any], config: Any = None) -> VisualizerContent:
-        system = VISUALIZER_SYSTEM_PROMPT + "\n\nEvidence Catalog (id | label | display | source):\n" + catalog_prompt(
-            context["evidence_catalog"], with_source=True,
-        )
-        user = (
-            f"User question: {context['user_question']}\n"
-            f"Step objective: {context['step_objective']}\n"
-            f"Validation feedback from a prior attempt (empty if this is the first): "
-            f"{context.get('validation_feedback') or 'none'}\n"
-            "Return the JSON object now."
-        )
+        system, user = visualizer_prompts(context)
         result = structured.invoke([SystemMessage(content=system), HumanMessage(content=user)], config=config)
         if isinstance(result, dict) and "parsed" in result:
             if result["parsed"] is None:
@@ -120,7 +137,8 @@ class VisualizerAgent:
         return run_validated(
             self, context, parse, label="Visualizer", config=config,
             retry_hint=("Return the corrected JSON object only, "
-                        "choosing only marks bar, grouped_bar or waterfall, and only numeric ids from the catalog."),
+                        "choosing only marks bar, grouped_bar or waterfall, and only numeric ids from the catalog; "
+                        "copy lists from the chart menu, and give every grouped_bar series the same number of entries."),
         )
 
 

@@ -79,6 +79,24 @@ def outcome(result, step_id="review_report"):
     return result["artifacts"]["step_outcomes"][step_id]
 
 
+class TestCriticPrompt:
+    """Guards the calibration rules that keep a sound Report from being flagged (checked live by the eval)."""
+
+    def test_the_prompt_expects_an_empty_list_and_exempts_verifiable_comparisons(self):
+        from analyst_crew.agents.critic import CRITIC_SYSTEM_PROMPT
+
+        assert "empty list of issues is the expected outcome" in CRITIC_SYSTEM_PROMPT
+        assert "superlative or comparison" in CRITIC_SYSTEM_PROMPT and "is NOT an issue" in CRITIC_SYSTEM_PROMPT
+        assert "never begin" in CRITIC_SYSTEM_PROMPT
+        for category in ("causal_overreach", "misread_evidence", "overstated_driver", "unsupported_emphasis"):
+            assert category in CRITIC_SYSTEM_PROMPT
+
+    def test_the_scratch_review_the_prompt_asks_for_is_discarded_not_stored(self):
+        critique = Critique.model_validate({"review": "claim_1: supported", "issues": []})
+
+        assert critique.issues == [] and "review" not in critique.model_dump()
+
+
 class TestCritiqueValidation:
     def test_a_category_outside_the_closed_set_is_invalid(self):
         with pytest.raises(ValidationError):

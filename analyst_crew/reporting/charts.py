@@ -140,7 +140,16 @@ def validate_chart_specs(specs: list[ChartSpec], catalog: EvidenceCatalog) -> li
             if len(spec.series) < 2:
                 errors.append(f"{name} grouped_bar needs at least two series")
             if len({len(series.entry_ids) for series in spec.series}) > 1:
-                errors.append(f"{name} grouped_bar series must have the same number of entries")
+                described = "; ".join(
+                    f"series {number} has {len(series.entry_ids)} ({', '.join(series.entry_ids)})"
+                    for number, series in enumerate(spec.series, 1)
+                )
+                errors.append(
+                    f"{name} grouped_bar series must have the same number of entries: {described}. Give every "
+                    f"series exactly the same number of entries, pairing them item for item (for example item 1's "
+                    f"prior-period entry in one series and item 1's current-period entry in the other, in the same "
+                    f"order); drop the unpaired entries from the longer series, or use a bar chart instead"
+                )
     if errors:
         raise ChartSpecError(errors)
     return specs

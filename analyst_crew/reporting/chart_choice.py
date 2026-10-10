@@ -8,7 +8,8 @@ three charts, every reference resolves to a numeric entry).
 """
 from __future__ import annotations
 
-from typing import Literal
+from collections.abc import Mapping
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -74,6 +75,58 @@ def chart_title(series_entries: list[list[EvidenceEntry]]) -> str:
     if len(dimensions) == 1 and all(entry.source.startswith("dimensions.") for entry in flat):
         title += f" by {next(iter(dimensions))}"
     return title
+
+
+_ITEM_FIELDS = (("prior", "prior period"), ("current", "current period"), ("absolute_change", "absolute change"))
+_HEADLINE_MONEY = ("gross_revenue", "net_revenue")
+
+
+def build_chart_menu(entries: list[Mapping[str, Any]]) -> str:
+    """Ready-made id lists a model can pick from, built only from catalog ids and sources.
+
+    Entries of one kind (every driver's prior-period net revenue, say) are listed in catalog order, so two lists
+    for the same dimension pair up item for item and a grouped_bar built from them cannot have mismatched
+    series lengths. The menu carries ids only; values and labels still come from the catalog at render time."""
+    lines: list[str] = []
+
+    bridge = [e["id"] for e in entries if e["source"].startswith("revenue_bridge.") and e["source"].endswith("_effect")]
+    if bridge:
+        lines.append(f"- Revenue bridge waterfall (one series: the effects in order, then the total): {', '.join(bridge)}")
+
+    fields = dict(_ITEM_FIELDS)
+    dimensions = dict.fromkeys(e["source"].split(".")[1] for e in entries if e["source"].startswith("dimensions."))
+    for dimension in dimensions:
+        rows: dict[str, dict[str, str]] = {}
+        for entry in entries:
+            parts = entry["source"].split(".")
+            if parts[0] == "dimensions" and parts[1] == dimension and len(parts) >= 4 and parts[-1] in fields:
+                rows.setdefault(".".join(parts[2:-1]), {})[parts[-1]] = entry["id"]
+        rows = {key: row for key, row in rows.items() if len(row) == len(fields)}
+        if not rows:
+            continue
+        lines.append(f"- Net revenue by {dimension.replace('_', ' ')}: {len(rows)} items in this order: "
+                     f"{', '.join(rows)}. Each list below has exactly {len(rows)} entries, one per item in that order:")
+        for field, text in _ITEM_FIELDS:
+            lines.append(f"    {text}: {', '.join(row[field] for row in rows.values())}")
+        lines.append("    prior vs current as a grouped_bar = two series, the prior-period list then the current-period "
+                     "list; changes as a bar = the absolute change list (one series, or a leading slice of it)")
+
+    headline = {
+        period: [e["id"] for e in entries if e["source"] in {f"{m}.{period}" for m in _HEADLINE_MONEY}]
+        for period in ("prior", "current")
+    }
+    if headline["prior"] and len(headline["prior"]) == len(headline["current"]):
+        lines.append("- Gross vs net revenue (money only; do not add orders or units): prior period "
+                     f"{', '.join(headline['prior'])}; current period {', '.join(headline['current'])}")
+
+    actual = [e["id"] for e in entries if e["source"].endswith(".actual_net_revenue")]
+    target = [e["id"] for e in entries if e["source"].endswith(".target_net_revenue")]
+    variance = [e["id"] for e in entries if e["source"].endswith(".net_revenue_variance")]
+    if actual and len(actual) == len(target):
+        lines.append(f"- Sales targets ({len(actual)} rows, same order in each list): actual net revenue "
+                     f"{', '.join(actual)}; target net revenue {', '.join(target)}; variance to target "
+                     f"{', '.join(variance)}")
+    return "\n".join(lines)
 
 
 def chart_specs_from_content(content: VisualizerContent, catalog: EvidenceCatalog) -> list[ChartSpec]:

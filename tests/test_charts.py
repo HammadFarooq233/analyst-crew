@@ -146,6 +146,21 @@ class TestChartSpecValidation:
         with pytest.raises(ChartSpecError, match="same number"):
             validate_chart_specs([spec], catalog)
 
+    def test_unequal_grouped_bar_feedback_names_the_lengths_and_the_series(self):
+        catalog = catalog_for()
+        spec = ChartSpec(chart_id="chart_3", mark="grouped_bar", title="t", series=[
+            ChartSeries(name="a", entry_ids=ids(catalog, "net_revenue.current", "net_revenue.prior")),
+            ChartSeries(name="b", entry_ids=ids(catalog, "net_revenue.current")),
+        ])
+
+        with pytest.raises(ChartSpecError) as caught:
+            validate_chart_specs([spec], catalog)
+
+        message = str(caught.value)
+        assert "chart_3" in message and "series 1 has 2" in message and "series 2 has 1" in message
+        assert all(entry_id in message for entry_id in spec.series[0].entry_ids)
+        assert "pair" in message
+
 
 class TestRendering:
     def test_same_findings_give_identical_chart_artifact_hashes(self, tmp_path):
