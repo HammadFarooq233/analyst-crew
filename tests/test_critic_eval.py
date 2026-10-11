@@ -8,6 +8,12 @@ wording (the vision's eval risk mitigation).
 
 The Report and Catalog fixtures are pure and run offline; only the live Critic tests are gated
 by ``eval`` and skip without LLM credentials.
+
+Issue #25 adds the negative case: a clean Report (every Claim accurately states its cited
+Evidence Entries) must draw an empty Critique, so a Critic that flags everything cannot pass.
+A live model can pass or fail by chance on one run, so the clean case runs ``CLEAN_RUNS`` times
+and prints how many returned no issues (run with ``-s`` to see it, and record it in the
+acceptance doc). The assertion is on the issue list only, never on wording.
 """
 import pytest
 
@@ -20,6 +26,7 @@ from tests.findings_factory import make_findings
 
 QUESTION = "Compare this month's sales to last month and flag anything unusual"
 PLANTED = "claim_1"
+CLEAN_RUNS = 3
 
 
 def _entry_id(catalog: EvidenceCatalog, source: str) -> str:
@@ -60,6 +67,12 @@ def build_reports() -> tuple[Report, Report, EvidenceCatalog]:
     return report(planted), report(control), catalog
 
 
+def build_clean_report() -> tuple[Report, EvidenceCatalog]:
+    """A hand-built Report whose Claims accurately state their cited Evidence Entries."""
+    _, control, catalog = build_reports()
+    return control, catalog
+
+
 def _real_critique(report: Report, catalog: EvidenceCatalog):
     step = Step(step_id="review_report", agent="Critic", objective="Review the draft Report for judgment errors",
                 expected_output="report_critique", declared_artifacts=["report_critique"], depends_on=[])
@@ -83,6 +96,14 @@ def test_eval_reports_are_valid_and_differ_only_in_the_first_finding():
             assert claim.evidence_ids and set(claim.evidence_ids) <= catalog.ids
 
 
+def test_clean_report_is_valid_and_every_claim_cites_catalog_entries():
+    report, catalog = build_clean_report()
+
+    assert len(report.findings) == 3
+    for claim in [report.summary, *report.findings]:
+        assert claim.evidence_ids and set(claim.evidence_ids) <= catalog.ids
+
+
 @pytest.mark.eval
 def test_critic_flags_a_planted_causal_overreach_claim():
     _skip_without_llm()
@@ -104,3 +125,22 @@ def test_critic_does_not_flag_causal_overreach_on_a_control_report():
     claim_overreach = [i.target for i in critique.issues
                        if i.category == "causal_overreach" and i.target.startswith("claim_")]
     assert claim_overreach == [], f"Critic flagged causal overreach on {claim_overreach}"
+
+
+@pytest.mark.eval
+def test_critic_returns_no_issues_on_a_clean_report(capsys):
+    """Negative case (#25): a Critic that flags everything would pass the seeded-flaw eval alone.
+
+    An empty issue list is what the Crew records as ``critic_outcome == "clean"``. Every run
+    must be empty; the count is printed so it can be recorded with the live eval runs.
+    """
+    _skip_without_llm()
+    report, catalog = build_clean_report()
+
+    flagged_runs = [[(i.category, i.target) for i in _real_critique(report, catalog).issues]
+                    for _ in range(CLEAN_RUNS)]
+
+    clean = sum(1 for issues in flagged_runs if not issues)
+    with capsys.disabled():
+        print(f"\ncritic clean-report eval: {clean}/{CLEAN_RUNS} runs returned no issues")
+    assert clean == CLEAN_RUNS, f"Critic flagged issues on a clean Report: {flagged_runs}"
