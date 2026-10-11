@@ -22,6 +22,11 @@ def effective_parameters(artifacts: dict[str, Any], configurable: dict[str, Any]
     return {**(artifacts.get("memory_parameters") or {}), **dict(configurable.get("analysis_parameters", {}))}
 
 
+def framing_facts(artifacts: dict[str, Any]) -> list[str]:
+    """The Free-text Facts the Reporter may use to shape framing (never to change a number)."""
+    return [item["content"] for item in artifacts.get("memory_facts") or []]
+
+
 def applied_memories(artifacts: dict[str, Any]) -> list[AppliedMemory]:
     return [item if isinstance(item, AppliedMemory) else AppliedMemory.model_validate(item)
             for item in artifacts.get("applied_memories") or []]
@@ -34,17 +39,22 @@ def memory_node(state: dict[str, Any], config: dict | None = None) -> dict[str, 
     plan = state.get("artifacts", {}).get("plan")
     messages = state.get("messages", [])
     question = getattr(plan, "user_question", None) or (messages[0].content if messages else "")
-    artifacts: dict[str, Any] = {"memory_parameters": {}, "applied_memories": []}
+    artifacts: dict[str, Any] = {"memory_parameters": {}, "applied_memories": [], "memory_facts": []}
     try:
         store = get_store()
     except RuntimeError:
         return {"current_step": "memory_node", "artifacts": artifacts}
     try:
-        records = MemoryStore(store).read_for_role("Analyst", user_id)
+        memory = MemoryStore(store)
+        records = memory.read_for_role("Analyst", user_id)
+        facts = memory.read_for_role("Reporter", user_id)  # the Reporter's scope is Free-text Facts only
     except MemoryUnavailable:
         artifacts["memory_status"] = "unavailable"
         return {"current_step": "memory_node", "artifacts": artifacts}
     resolution = resolve_preferences(records, question)
     artifacts["memory_parameters"] = resolution.parameters
-    artifacts["applied_memories"] = resolution.applied
+    # The Planner read the same facts before this step; listing them here discloses them for the whole run.
+    artifacts["applied_memories"] = resolution.applied + [
+        AppliedMemory(memory_id=fact.id, kind="fact", origin=fact.origin) for fact in facts]
+    artifacts["memory_facts"] = [{"id": fact.id, "content": fact.content} for fact in facts]
     return {"current_step": "memory_node", "artifacts": artifacts}

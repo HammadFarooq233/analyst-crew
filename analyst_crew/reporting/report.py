@@ -264,6 +264,10 @@ def assemble_applied_memories(catalog: EvidenceCatalog, applied: list[AppliedMem
         spec = PREFERENCE_KEYS.get(item.key or "")
         label = spec.label if spec else "Memory"
         origin = _ORIGINS.get(item.origin, item.origin)
+        if item.kind == "fact":
+            # The fact's own words stay off the page: free text must never put a number in the Report.
+            lines.append(template_line(f"Free-text fact ({origin}): used to frame this Report; it changes no figure."))
+            continue
         if item.status == "overridden":
             lines.append(template_line(
                 f"{label}: your stored preference was not used for this run because your question gave its own "
