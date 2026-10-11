@@ -121,8 +121,8 @@ def test_the_latest_statement_wins_in_a_run_and_the_history_keeps_the_older_one(
     assert artifacts["findings"].materiality.relative_change_percent == 20.0
     assert _material(artifacts) == set()
     assert [item.memory_id for item in artifacts["applied_memories"]] == [newer.id]
-    assert [r.id for r in MemoryStore(store).history("priya")] == [older.id, newer.id]
-    assert MemoryStore(store).history("priya")[0].status == "superseded"
+    assert [r.id for r in MemoryStore(store).history("priya", "preference")] == [older.id, newer.id]
+    assert MemoryStore(store).history("priya", "preference")[0].status == "superseded"
 
 
 def test_a_forgotten_memory_stays_auditable_but_never_reaches_a_run(source, tmp_path, monkeypatch):
@@ -131,7 +131,7 @@ def test_a_forgotten_memory_stays_auditable_but_never_reaches_a_run(source, tmp_
     MemoryStore(store).forget("priya", record.id)
     artifacts, _ = _run(source, tmp_path, monkeypatch, store)
     assert artifacts["applied_memories"] == [] and "Applied Memories" not in _rendered(artifacts)
-    assert [(r.id, r.status) for r in MemoryStore(store).history("priya")] == [(record.id, "forgotten")]
+    assert [(r.id, r.status) for r in MemoryStore(store).history("priya", "preference")] == [(record.id, "forgotten")]
 
 
 def test_a_sentence_outside_the_vocabulary_is_a_free_text_fact_and_changes_no_parameter(source, tmp_path, monkeypatch):

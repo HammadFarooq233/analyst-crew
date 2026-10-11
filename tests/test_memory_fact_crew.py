@@ -138,7 +138,8 @@ class TestResume:
             source, tmp_path, monkeypatch, store, lambda: MemoryStore(store).forget("priya", record.id))
         assert planner.calls == 2 and FACT not in planner.prompts[1]
         assert reporter.calls == 1 and "framing_facts" not in reporter.contexts[0]
-        assert second["artifacts"]["report"].applied_memories == []
+        # The re-plan is given run 1's Past-run Summary, but no longer the forgotten fact.
+        assert [line.text.split(" given")[0] for line in second["artifacts"]["report"].applied_memories] == ["Past-run Summary"]
 
     def test_a_new_fact_replans_and_rewrites_the_report_with_it(self, source, tmp_path, monkeypatch):
         store = InMemoryStore()

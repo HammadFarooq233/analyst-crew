@@ -19,6 +19,8 @@ class MemoryRecord(BaseModel):
     # Typed Preferences only: a key from the closed vocabulary and its validated value.
     key: str | None = None
     value: float | None = None
+    # Past-run Summaries only: the source-data content hash the summary was computed from.
+    source_hash: str | None = None
     # Lifecycle: only "active" records are retrieved. Superseded and forgotten records stay as history.
     status: Literal["active", "superseded", "forgotten"] = "active"
     supersedes: str | None = None      # the memory this one replaced
