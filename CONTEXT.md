@@ -63,7 +63,7 @@ Runs arbitrary Python/pandas code in a sandbox and returns the result or error. 
 _Avoid_: Code runner, REPL
 
 **Postgres.query**:
-Executes a read-only SQL query against the self-hosted Postgres database. Used by the Fetcher and Critic.
+Executes a read-only SQL query against the self-hosted Postgres database. Used by the Fetcher.
 _Avoid_: DB connector, SQL runner
 
 **FRED.fetch**:
@@ -103,8 +103,36 @@ The final output returned to Priya. Contains a Summary (headline answer), Findin
 _Avoid_: Brief, output, response
 
 **Memory**:
-Facts, preferences, and session artifacts that persist across user sessions. Each Agent accesses it independently via a scoped `search_memory` tool, not through a central Planner-mediated fetch.
+Facts, preferences, and run summaries that persist across sessions and belong to one user. Retrieval is deterministic and scoped by user, memory kind and Agent role; Agents do not decide whether to look. Memory may change framing and the parameters Tools compute with, never which data is included. There are three kinds: typed preference, free-text fact, and past-run summary.
 _Avoid_: Context, history, long-term storage
+
+**Typed Preference**:
+A Memory with a meaning the Crew can act on, drawn from a closed vocabulary (for example the Material Change threshold). The Crew resolves it into the analysis parameters of a Handoff. A statement that does not fit the vocabulary is kept as a free-text fact and never becomes a parameter.
+_Avoid_: Setting, config, rule
+
+**Free-text Fact**:
+A Memory kept as the user's own wording. It may shape how a Report is framed but never changes a number.
+_Avoid_: Note, context
+
+**Past-run Summary**:
+A Memory describing what the Crew found in an earlier run, tied to the source data it described. It is stale once that source data changes.
+_Avoid_: History, log
+
+**Memory Update**:
+The Crew-level step that writes Memory, from an explicit user statement or from inference over the user's own words and the Crew's run records. It is not an Agent.
+_Avoid_: Memory Agent, learning
+
+**Applied Memories**:
+The Report section listing every Memory that influenced the run, with its origin (stated, inferred, or run record). Assembled by code, absent when none were applied.
+_Avoid_: Used context, personalisation
+
+**Marketing Spend**:
+An optional Data Source of weekly marketing spend, retrieved from Postgres. When absent or unavailable the Report is still produced and names the missing source in its Caveats.
+_Avoid_: Ad data, campaign data
+
+**Spend Relationship**:
+The Analyst's description of how weekly revenue and Marketing Spend move together across a fixed set of lags, with the paired-week count behind each figure and the number of lags tried. It is correlation only; a Report never states it as a cause.
+_Avoid_: Spend impact, attribution, effect
 
 **Data Source**:
 An explicitly supplied location from which the Fetcher may retrieve data. The Crew receives a catalog describing available Data Sources; Agents must not invent file paths, database tables, or external series.

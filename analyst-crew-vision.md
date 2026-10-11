@@ -83,6 +83,10 @@ risk of a surprise bill. "Free tier that upsells you at scale" is acceptable onl
 (stops working) rather than silently starts billing. See §11 for the specific stack this rules
 in and out.
 
+**Exception (ADR-0004):** Azure OpenAI is used for development and live acceptance runs, because free
+models proved unreliable for completing them. CI and evals must still run on free or local models, and
+a monthly spend ceiling is to be recorded in the ADR.
+
 ## 4. Target Users & Use Cases
 
 Even as a personal project, designing for a persona keeps scope honest.
@@ -195,7 +199,7 @@ for the first time. Each phase is still independently demoable and commit-worthy
   resolved in §11: FRED (economic data) + self-hosted Postgres.
 - ~~LangSmith free tier vs. self-hosted tracing/logging?~~ → resolved in §11: self-hosted
   Langfuse, chosen specifically because it has no usage cap or billing risk at all.
-- Chat UI vs. dashboard for the eventual interface layer — still open; deferred to Phase 9,
+- Chat UI vs. dashboard for the eventual interface layer — still open; deferred to Phase 8,
   not worth deciding before the agent itself exists.
 
 ## 10. Roadmap Status Log
@@ -208,7 +212,7 @@ progresses. Update this table, don't just the roadmap above.
 | 0 – Walking skeleton        | Complete*   | Implemented across commits; infrastructure is runnable    |
 | 1 – Real tool use           | Complete    | Live acceptance passed 2026-09-19 (see docs/phase-1-acceptance-status.md) |
 | 2 – Full orchestration      | Complete    | All six Agents run end to end: Visualizer (LLM selects, code supplies data, PNG Chart Artifacts), Reporter (cited Reports, chart references, one bounded revision) and Critic (no Tools, Critique, Reviewer Notes). Live acceptance passed 2026-10-11 (see docs/phase-2-acceptance-status.md; spec issue #14, ADR-0003). Not exercised live: FRED CPI path |
-| 3 – Memory, deepened        | Not started |                                                           |
+| 3 – Memory, deepened        | Not started | Spec: GitHub issue #23 (six slices); see ADR-0005. Use Case 2 (marketing spend vs. revenue) is a separate slice after it, spec #24 |
 | 4 – Observability, deepened | Not started |                                                           |
 | 5 – Evals                   | Not started |                                                           |
 | 6 – Safety/HITL             | Not started | `execute_python` moves to HITL-gated                      |
@@ -259,9 +263,12 @@ Evidence Catalog. Fetcher/Planner/Reporter get no execution access. The Critic h
 all (superseding the earlier "reuses Fetcher's read-only query tools" idea): citation validity
 is guaranteed by code, so it reviews judgment only.
 
-**Memory access.** Per-agent, via each agent's own scoped `search_memory` tool — not a single
-Planner-mediated fetch. Each agent queries memory at the point it needs it, scoped to its own
-role, rather than the Planner pre-guessing and injecting everything for everyone.
+**Memory access.** Superseded by ADR-0005. Retrieval is deterministic and application-side, scoped by
+user, memory kind and Agent role, rather than each Agent's LLM calling its own `search_memory` tool.
+Typed preferences are resolved by the Crew into the Handoff's analysis parameters, the Critic reads no
+memory, and writing is a Crew-level Memory Update step, not an Agent. Memory changes framing and
+parameters, never which data is included, and every applied memory is disclosed in the Report.
+(Original wording: per-agent scoped `search_memory`, queried at the point of need.)
 
 **Safety / permissions.** Defense-in-depth at two levels: **agent-level** (only give
 `execute_python` to the Analyst — other agents never have it in their tool list) and
