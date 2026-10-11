@@ -239,7 +239,8 @@ def _extract_question(state: CrewState) -> str:
     return ""
 
 
-def _reusable_prior_plan(state: CrewState, question: str, agent: "PlannerAgent") -> Plan | None:
+def _reusable_prior_plan(state: CrewState, question: str, agent: "PlannerAgent",
+                         memory_ids: list[str] | None = None) -> Plan | None:
     """Return the Plan already in the checkpointed state when it is still valid.
 
     Resuming a thread must not re-plan: a live Planner words step ids and
@@ -255,7 +256,18 @@ def _reusable_prior_plan(state: CrewState, question: str, agent: "PlannerAgent")
         return None
     if {source for step in prior.steps for source in step.source_ids} - agent.data_sources:
         return None
+    # A Plan written under different Memory (a fact added or forgotten) is not reused; an outage (None) never invalidates.
+    if memory_ids is not None and state.get("artifacts", {}).get("plan_memory_ids", []) != memory_ids:
+        return None
     return prior
+
+
+def _planner_memory_ids(user_id: str) -> list[str] | None:
+    """Ids of the Memories the Planner is given, or None when storage cannot be read."""
+    try:
+        return [record.id for record in MemoryStore(get_store()).read_for_role("Planner", user_id)]
+    except (RuntimeError, MemoryUnavailable):
+        return None
 
 
 def _planner_memory(user_id: str) -> tuple[str, str]:
@@ -288,7 +300,8 @@ def planner_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
             data_sources=configurable.get("data_sources", ()),
             llm=planner_model,
         )
-        plan = _reusable_prior_plan(state, question, agent)
+        memory_ids = _planner_memory_ids(configurable.get("user_id", "default"))
+        plan = _reusable_prior_plan(state, question, agent, memory_ids)
         if plan is None:
             plan = agent.generate_plan(question, config=config)
     except (RuntimeError, ValueError) as e:
@@ -299,7 +312,8 @@ def planner_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
 
     return {
         "current_step": "planner_node",
-        "artifacts": {"plan": plan, "memory_status": memory_status},
+        "artifacts": {"plan": plan, "memory_status": memory_status,
+                      "plan_memory_ids": memory_ids if memory_ids is not None else state.get("artifacts", {}).get("plan_memory_ids", [])},
     }
 
 
