@@ -23,6 +23,7 @@ from analyst_crew.agents.contracts import CREW_AGENTS, Crew, Handoff, Plan
 from analyst_crew.agents.reporter import production_reporter_model, revise_content
 from analyst_crew.agents.resume import _resume_decision, execution_key
 from analyst_crew.llm import make_chat_model
+from analyst_crew.memory.node import framing_facts
 from analyst_crew.reporting.catalog import EvidenceCatalog
 from analyst_crew.reporting.critique import Critique, report_items, report_targets, validate_critique
 from analyst_crew.reporting.report import Report, build_report, substitute
@@ -195,13 +196,17 @@ class CritiqueApplication:
 
 
 def _apply_critique(agent: "CriticAgent", handoff: Handoff, draft: Report, critique: Critique,
-                    catalog: EvidenceCatalog, configurable: dict, config: Any) -> CritiqueApplication:
+                    catalog: EvidenceCatalog, configurable: dict, config: Any,
+                    facts: list[str] | None = None) -> CritiqueApplication:
     """Turn a Critique of the draft into the final Report and outcome (ADR-0003).
 
     A clean Critique ships the draft. A non-empty one triggers exactly one Reporter revision, validated by the
     first draft's rules; the revised Report is reviewed once more, and whatever the Critic still flags becomes
     Reviewer Notes. A revision that fails keeps the draft with the original issues as Reviewer Notes. A Fallback
     Report is not revised (the Reporter model just failed to write it).
+
+    ``facts`` are the framing facts the Crew gives the Reporter's revision only, so it frames as the draft did
+    (ADR-0005); the Critic itself never sees them.
     """
     if not critique.issues:
         return CritiqueApplication(draft, "clean")
@@ -211,7 +216,7 @@ def _apply_critique(agent: "CriticAgent", handoff: Handoff, draft: Report, criti
                                    revision_failure="not attempted: the draft is a Fallback Report")
     try:
         model = configurable.get("reporter_model") or production_reporter_model()
-        content = revise_content(model, handoff, catalog, draft, critique, config=config)
+        content = revise_content(model, handoff, catalog, draft, critique, config=config, facts=facts)
         revised = build_report(content, catalog, draft.question, draft.charts, draft.chart_mode, draft.memory_unavailable)
         # The Applied Memories section is code-assembled and not the Reporter's to rewrite.
         revised = revised.model_copy(update={"applied_memories": draft.applied_memories})
@@ -296,7 +301,8 @@ def critic_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
             model = configurable.get("critic_model") or production_critic_model()
             agent = CriticAgent(model)
             critique = agent.run(handoff, draft, catalog, config=config)
-            applied = _apply_critique(agent, handoff, draft, critique, catalog, configurable, config)
+            applied = _apply_critique(agent, handoff, draft, critique, catalog, configurable, config,
+                                      facts=framing_facts(artifacts))
             final_report, critic_outcome = applied.report, applied.outcome
             revised_critique, revision_failure = applied.revised_critique, applied.revision_failure
             rereview_error = applied.rereview_error

@@ -2,7 +2,7 @@
 from typing import Any
 
 from analyst_crew.agents.contracts import CREW_AGENTS, Crew, Plan
-from analyst_crew.agents.resume import _resume_decision, _source_content_hash, execution_key
+from analyst_crew.agents.resume import _resume_decision, source_content_hash, execution_key
 from analyst_crew.state import CrewState
 from analyst_crew.tools.sales import FetcherAgent, production_fetcher_model
 
@@ -36,7 +36,7 @@ def fetcher_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
         source_hash = None
         if handoff.source_values:
             source_reference = next(iter(handoff.source_values.values())).reference
-            source_hash = _source_content_hash(source_reference)
+            source_hash = source_content_hash(source_reference)
         current_key = execution_key(
             fetch_step,
             analysis_parameters={},

@@ -19,9 +19,9 @@ from analyst_crew.tools.analysis import BaselineFindings
 
 def current_source_hashes(data_sources: Mapping[str, Any] | None) -> set[str]:
     """Content hashes of the CSV Data Sources this run would read (the same hash Findings record)."""
-    from analyst_crew.agents.resume import _source_content_hash
+    from analyst_crew.agents.resume import source_content_hash
 
-    hashes = (_source_content_hash(reference) for reference in (data_sources or {}).values())
+    hashes = (source_content_hash(reference) for reference in (data_sources or {}).values())
     return {value for value in hashes if value}
 
 

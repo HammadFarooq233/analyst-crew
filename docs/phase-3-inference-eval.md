@@ -17,3 +17,5 @@ caps respected, plainly stated facts and thresholds not missed.
 The prompt in `analyst_crew/memory/infer.py` is the one from runs 4-6. Model output is not deterministic, so a
 single green run is not a guarantee; the code-side grounding checks (quoted evidence must appear in the user's words,
 numbers must appear in the evidence, vocabulary and range validation, per-run caps) hold regardless of the model.
+
+Since those runs the code-side grounding was tightened: a fact is also rejected when its content adds content words (beyond function words and plural forms) that its quoted evidence does not contain. This eval has not been re-run against the live model since that change; a restated fact that was previously accepted may now be rejected, so re-run it before relying on the recall numbers above.

@@ -11,7 +11,7 @@ from typing import Any
 
 from analyst_crew.memory.models import AppliedMemory, MemoryRecord
 from analyst_crew.memory.vocabulary import PREFERENCE_KEYS, PreferenceError, validate_preference
-from analyst_crew.tools.analysis import _materiality_from_question
+from analyst_crew.tools.analysis import materiality_from_question
 
 RELATIVE_KEY = "materiality_relative_threshold_percent"
 ABSOLUTE_KEY = "materiality_absolute_threshold_percent"
@@ -33,7 +33,7 @@ def resolve_preferences(records: list[MemoryRecord], question: str) -> Resolutio
         except PreferenceError:
             continue  # a record that no longer validates never becomes a parameter
 
-    relative, absolute = _materiality_from_question(question)
+    relative, absolute = materiality_from_question(question)
     stated = {RELATIVE_KEY: relative, ABSOLUTE_KEY: absolute}
 
     resolution = Resolution()
