@@ -22,7 +22,9 @@ class MemoryRecord(BaseModel):
     # Past-run Summaries only: the source-data content hash the summary was computed from.
     source_hash: str | None = None
     # Lifecycle: only "active" records are retrieved. Superseded and forgotten records stay as history.
-    status: Literal["active", "superseded", "forgotten"] = "active"
+    # "pending" is an inferred Typed Preference awaiting the user's confirmation; it is never retrieved.
+    # "rejected" ones stay as history so the same inference is not proposed again.
+    status: Literal["active", "superseded", "forgotten", "pending", "rejected"] = "active"
     supersedes: str | None = None      # the memory this one replaced
     superseded_by: str | None = None   # the memory that replaced this one
     ended_at: str | None = None        # when it was superseded or forgotten
@@ -37,3 +39,27 @@ class AppliedMemory(BaseModel):
     key: str | None = None
     origin: MemoryOrigin = "stated"
     status: Literal["applied", "overridden"] = "applied"
+
+
+class InferredProposal(BaseModel):
+    """A candidate memory proposed by the inference model. ``evidence`` must quote the user's
+    own words (or, for a fact, the Crew's run records); code checks it before anything is stored."""
+
+    kind: Literal["fact", "preference"]
+    content: str
+    evidence: str
+    key: str | None = None
+    value: float | str | None = None
+
+
+class InferenceProposals(BaseModel):
+    proposals: list[InferredProposal] = []
+
+
+class InferenceResult(BaseModel):
+    """What the Memory Update step's inference did on one run (kept in run state)."""
+
+    status: Literal["skipped", "written", "unavailable", "failed"] = "skipped"
+    facts: list[str] = []      # ids of inferred Free-text Facts, applied at once
+    pending: list[str] = []    # ids of inferred Typed Preferences awaiting confirmation
+    rejected: list[str] = []   # why proposals were refused (never the proposed content)

@@ -187,6 +187,14 @@ def _run_metadata(result: CrewState) -> dict[str, Any]:
         metadata["applied_memory_ids"] = applied_ids
     if overridden_ids:
         metadata["overridden_memory_ids"] = overridden_ids
+    inference = artifacts.get("inference")
+    if inference is not None:
+        inferred = _field(inference, "facts")
+        pending = _field(inference, "pending")
+        if inferred:
+            metadata["inferred_memory_ids"] = list(inferred)
+        if pending:
+            metadata["pending_memory_ids"] = list(pending)
     step_outcomes = artifacts.get("step_outcomes")
     if step_outcomes:
         metadata["step_outcomes"] = {
