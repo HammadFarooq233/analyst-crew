@@ -70,6 +70,8 @@ class Report(BaseModel):
     methodology: list[ReportLine]
     # Critique issues that remain; the section is absent when empty (set only by the Critic Step).
     reviewer_notes: list[CritiqueIssue] = Field(default_factory=list)
+    # True when Memory storage was down and defaults were used; the Caveat above states it.
+    memory_unavailable: bool = False
 
     @model_validator(mode="after")
     def fallback_is_marked(self) -> "Report":
@@ -165,11 +167,18 @@ def _entry_placeholder(entry: EvidenceEntry) -> str:
     return "{" + entry.id + "}"
 
 
-def assemble_caveats(catalog: EvidenceCatalog) -> list[ReportLine]:
+MEMORY_UNAVAILABLE_CAVEAT = (
+    "Memory storage was unavailable for this run, so no saved memories were applied and defaults were used."
+)
+
+
+def assemble_caveats(catalog: EvidenceCatalog, memory_unavailable: bool = False) -> list[ReportLine]:
     """Every Findings limitation, every non-available optional source status,
     the CPI non-causality caveat when CPI is present, and the quarantine and
     duplicate disclosure. Mandatory: not selectable by the Reporter."""
     caveats: list[ReportLine] = []
+    if memory_unavailable:
+        caveats.append(template_line(MEMORY_UNAVAILABLE_CAVEAT))
     for entry in catalog.entries:
         if entry.source.startswith(("limitations.", "revenue_bridge.limitations.")):
             caveats.append(template_line("{" + entry.id + "}"))
@@ -241,18 +250,21 @@ def _chart_mode(charts: list[ChartReference] | None, chart_mode: str | None) -> 
 
 
 def build_report(content: ReporterContent, catalog: EvidenceCatalog, question: str,
-                 charts: list[ChartReference] | None = None, chart_mode: str | None = None) -> Report:
+                 charts: list[ChartReference] | None = None, chart_mode: str | None = None,
+                 memory_unavailable: bool = False) -> Report:
     """An ``llm``-mode Report: model-written Summary and Claims, code-assembled rest.
     ``charts`` are the Chart Artifact references for the code-assembled Charts section."""
     return Report(
         report_mode="llm", question=question, summary=content.summary, findings=content.claims,
         charts=charts or [], chart_mode=_chart_mode(charts, chart_mode),
-        caveats=assemble_caveats(catalog), methodology=assemble_methodology(catalog),
+        caveats=assemble_caveats(catalog, memory_unavailable), methodology=assemble_methodology(catalog),
+        memory_unavailable=memory_unavailable,
     )
 
 
 def build_fallback_report(catalog: EvidenceCatalog, question: str,
-                          charts: list[ChartReference] | None = None, chart_mode: str | None = None) -> Report:
+                          charts: list[ChartReference] | None = None, chart_mode: str | None = None,
+                          memory_unavailable: bool = False) -> Report:
     """Deterministic template Report: fixed Summary (window and net revenue
     change), Material Changes as templated Claims, plus the same code-assembled
     Caveats and Methodology. Visibly marked as generated without the Reporter."""
@@ -312,7 +324,8 @@ def build_fallback_report(catalog: EvidenceCatalog, question: str,
     return Report(
         report_mode="fallback", fallback_notice=FALLBACK_NOTICE, question=question, summary=summary,
         findings=claims, charts=charts or [], chart_mode=_chart_mode(charts, chart_mode),
-        caveats=assemble_caveats(catalog), methodology=assemble_methodology(catalog),
+        caveats=assemble_caveats(catalog, memory_unavailable), methodology=assemble_methodology(catalog),
+        memory_unavailable=memory_unavailable,
     )
 
 

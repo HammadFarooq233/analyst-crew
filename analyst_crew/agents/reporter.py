@@ -267,8 +267,11 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
         except ValueError as exc:
             # The Findings and catalog are fine, so this still degrades to a Fallback Report below.
             handoff_error = exc
+        memory_unavailable = artifacts.get("memory_status") == "unavailable"
+        # A changed storage state must not reuse a Report that was written under the other state.
+        key_parameters = {**analysis_parameters, **({"memory_unavailable": True} if memory_unavailable else {})}
         current_key = execution_key(
-            reporter_step, analysis_parameters=analysis_parameters,
+            reporter_step, analysis_parameters=key_parameters,
             input_artifact_hashes=[current_hash, *(chart.content_hash for chart in charts)],
         )
         resume_outcome, resume_reason = _resume_decision(state, reporter_step.step_id, current_key)
@@ -296,10 +299,10 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
                 model = configurable.get("reporter_model") or production_reporter_model()
                 agent = ReporterAgent(model)
                 content = agent.run(handoff, catalog, config=config)
-                report = build_report(content, catalog, plan.user_question, chart_refs, chart_mode)
+                report = build_report(content, catalog, plan.user_question, chart_refs, chart_mode, memory_unavailable)
             except Exception as exc:  # noqa: BLE001 — any Reporter failure degrades visibly, never silently
                 failure = exc
-                report = build_fallback_report(catalog, plan.user_question, chart_refs, chart_mode)
+                report = build_fallback_report(catalog, plan.user_question, chart_refs, chart_mode, memory_unavailable)
             retry_counts = {
                 "validation_retries": getattr(agent, "validation_retries", 0),
                 "tool_retries": getattr(agent, "tool_retries", 0),

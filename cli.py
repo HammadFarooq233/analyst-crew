@@ -280,16 +280,20 @@ def format_material_changes(findings: BaselineFindings) -> str:
     return "\n".join(lines)
 
 
-def seed_memory_before_invoke(fact: str):
+def seed_memory_before_invoke(fact: str, user_id: str = "default"):
+    """Store a free-text fact for ``user_id`` in the persistent Memory store (a dev aid until `remember`)."""
     from analyst_crew.tools.memory import seed_memory
 
     conn_string = os.getenv("POSTGRES_CONNECTION_STRING")
     if conn_string:
         from langgraph.store.postgres import PostgresStore
 
-        with PostgresStore.from_conn_string(conn_string) as store:
-            store.setup()
-            seed_memory(store, fact)
+        try:
+            with PostgresStore.from_conn_string(conn_string) as store:
+                store.setup()
+                seed_memory(store, fact, user_id=user_id)
+        except Exception as exc:  # noqa: BLE001 — a storage outage is stated, never a crash
+            print(f"Warning: Memory storage is unavailable; the fact was not stored ({exc}).", file=sys.stderr)
     else:
         print(
             "Warning: POSTGRES_CONNECTION_STRING not set. "
@@ -327,7 +331,7 @@ def main() -> None:
         sys.exit(1)
 
     if args.memory_seed is not None:
-        seed_memory_before_invoke(args.memory_seed)
+        seed_memory_before_invoke(args.memory_seed, args.user_id)
 
     invoke_config = {
         "configurable": {

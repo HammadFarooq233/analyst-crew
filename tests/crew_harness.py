@@ -68,12 +68,14 @@ class ScriptedPlannerModel:
     def __init__(self, plan):
         self.plan = plan
         self.calls = 0
+        self.prompts = []  # the system prompt of each call: what the Planner was given
 
     def with_structured_output(self, *_args, **_kwargs):
         return self
 
-    def invoke(self, _messages):
+    def invoke(self, messages):
         self.calls += 1
+        self.prompts.append(messages[0].content)
         return self.plan
 
 
@@ -169,7 +171,7 @@ USE_DEFAULT = object()
 def run_crew(source, tmp_path, monkeypatch, *, thread_id="thread-1", as_of_date="2025-06-30", checkpointer=None,
              plan=None, reporter_model=USE_DEFAULT, planner_model=None, fetcher_model=None, analyst_model=None,
              extra_sources=None, available_agents=("Fetcher", "Analyst", "Reporter"), visualizer_model=USE_DEFAULT,
-             critic_model=None, callbacks=None):
+             critic_model=None, callbacks=None, user_id=None, store=None):
     planner_model = planner_model or ScriptedPlannerModel(plan or crew_plan())
     fetcher_model = fetcher_model or ScriptedFetcherModel()
     analyst_model = analyst_model or ScriptedAnalystModel()
@@ -191,6 +193,8 @@ def run_crew(source, tmp_path, monkeypatch, *, thread_id="thread-1", as_of_date=
         "analyst_model": analyst_model,
         "analysis_parameters": {"as_of_date": as_of_date},
     }}
+    if user_id is not None:
+        runtime["configurable"]["user_id"] = user_id
     if callbacks:
         runtime["callbacks"] = list(callbacks)
     if reporter_model is not None:
@@ -199,7 +203,7 @@ def run_crew(source, tmp_path, monkeypatch, *, thread_id="thread-1", as_of_date=
         runtime["configurable"]["visualizer_model"] = visualizer_model
     if critic_model is not None:
         runtime["configurable"]["critic_model"] = critic_model
-    result = planner_module.invoke(QUESTION, runtime, checkpointer=checkpointer or MemorySaver())
+    result = planner_module.invoke(QUESTION, runtime, checkpointer=checkpointer or MemorySaver(), store=store)
     return result, reporter_model
 
 

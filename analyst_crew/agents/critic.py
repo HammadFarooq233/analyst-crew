@@ -212,7 +212,7 @@ def _apply_critique(agent: "CriticAgent", handoff: Handoff, draft: Report, criti
     try:
         model = configurable.get("reporter_model") or production_reporter_model()
         content = revise_content(model, handoff, catalog, draft, critique, config=config)
-        revised = build_report(content, catalog, draft.question, draft.charts, draft.chart_mode)
+        revised = build_report(content, catalog, draft.question, draft.charts, draft.chart_mode, draft.memory_unavailable)
     except Exception as exc:  # noqa: BLE001 — a failed revision never ships; the draft stays
         return CritiqueApplication(unresolved, "unresolved", revision_failure=format_failure(exc))
     try:
