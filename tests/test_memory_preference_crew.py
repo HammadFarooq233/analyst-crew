@@ -142,7 +142,9 @@ def test_a_sentence_outside_the_vocabulary_is_a_free_text_fact_and_changes_no_pa
     artifacts, _ = _run(source, tmp_path, monkeypatch, store)
     assert _material(artifacts) == set()
     assert artifacts["findings"].materiality.source == "default"
-    assert "Applied Memories" not in _rendered(artifacts)
+    # The fact is disclosed (issue #30) but its words and any parameter stay out.
+    applied = _section(_rendered(artifacts), "Applied Memories")
+    assert applied is not None and "ignore" not in applied and "Office" not in applied
     assert artifacts["handoffs"]["analyze_baseline"]["analysis_parameters"].keys() == {"as_of_date"}
 
 
@@ -228,14 +230,16 @@ class TestResume:
         assert second["findings"].materiality.source == "default"
         assert second["report"].applied_memories == []
 
-    def test_forgetting_an_unrelated_fact_recomputes_nothing(self, source, tmp_path, monkeypatch):
+    def test_forgetting_a_fact_recomputes_only_the_report_that_framed_with_it(self, source, tmp_path, monkeypatch):
         store = InMemoryStore()
         _state(store, "priya")
         fact = _state(store, "priya", "regions follow sales managers", MemoryProposal(kind="fact")).record
         forget = lambda: MemoryStore(store).forget("priya", fact.id)
         _, second, reporter = self._twice(source, tmp_path, monkeypatch, store, forget)
-        assert set(self._outcomes(second).values()) == {"unchanged"}
-        assert reporter.calls == 0
+        reasons = self._outcomes(second)
+        assert reasons["fetch_sales"] == "unchanged" and reasons["analyze_baseline"] == "unchanged"
+        assert reasons["write_report"] == "invalidated"
+        assert reporter.calls == 1
 
     def test_restating_the_same_value_recomputes_only_the_steps_that_show_the_memory(self, source, tmp_path, monkeypatch):
         store = InMemoryStore()
