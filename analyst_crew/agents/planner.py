@@ -14,6 +14,9 @@ from analyst_crew.state import CrewState
 from analyst_crew.tools.retry import invoke_with_optional_config
 
 
+# One initial call plus up to two repair retries with the validation error fed back.
+PLAN_ATTEMPTS = 3
+
 SYSTEM_PROMPT = """You are the Planner Agent for Analyst Crew, a multi-agent data analysis copilot.
 
 Your role is to decompose a user's analytical question into an ordered Plan of Steps.
@@ -153,10 +156,14 @@ class PlannerAgent:
                     agent for agent in PHASE2_AGENTS
                     if agent in allowed_agents and (agent != "Critic" or "Reporter" in allowed_agents)
                 ]
-                if [step.agent for step in plan.steps] != expected_agents:
+                produced_agents = [step.agent for step in plan.steps]
+                if produced_agents != expected_agents:
+                    missing = [agent for agent in expected_agents if agent not in produced_agents]
                     raise ValueError(
                         "Sales Plan must contain exactly " + ", ".join(expected_agents[:-1])
                         + f" then {expected_agents[-1]} Steps"
+                        + f" (one Step per Agent, in that order); you produced {', '.join(produced_agents) or 'no Steps'}"
+                        + (f", missing a {', '.join(missing)} Step" if missing else "")
                     )
                 fetch_step, analyst_step = plan.steps[0], plan.steps[1]
                 if fetch_step.source_ids != ["sales_csv"]:
@@ -192,15 +199,15 @@ class PlannerAgent:
 
         # Contract-invalid Plan output — malformed JSON or a structurally
         # valid Plan that still violates a Planner rule (unavailable Agent,
-        # unknown Data Source, wrong Phase 1 shape) — receives at most one
-        # repair retry, with the validation error fed back into the next
+        # unknown Data Source, wrong Phase 1 shape) — receives at most two
+        # repair retries, with the validation error fed back into the next
         # model call as feedback. Same policy already used for Fetcher/
         # Analyst Agent output (see FetcherAgent.run, AnalystAgent.run).
         # Free-tier models are more prone to this than larger ones, so this
         # matters more here even though the policy itself is pre-existing.
         result = None
         feedback = ""
-        for attempt in range(2):
+        for attempt in range(PLAN_ATTEMPTS):
             call_messages = messages if not feedback else messages + [
                 HumanMessage(
                     content=f"Your previous response was invalid: {feedback} "
@@ -236,7 +243,7 @@ class PlannerAgent:
                 except ValueError as exc:
                     self.last_validation_error = str(exc)
 
-            if attempt:
+            if attempt == PLAN_ATTEMPTS - 1:
                 raise RuntimeError(f"Planner LLM call failed: {self.last_validation_error}")
             self.validation_retries += 1
             feedback = self.last_validation_error
