@@ -304,7 +304,7 @@ def seed_memory_before_invoke(fact: str, user_id: str = "default"):
         )
 
 
-COMMANDS = ("run", "remember", "list", "forget")
+COMMANDS = ("run", "remember", "list", "forget", "confirm", "reject")
 
 
 @contextlib.contextmanager
@@ -361,10 +361,48 @@ def list_command(args) -> None:
         with memory_store_context() as store:
             memory = MemoryStore(store)
             records = memory.history(args.user_id) if args.history else memory.list(args.user_id)
+            pending = [] if args.history else memory.pending(args.user_id)
     except Exception as exc:  # noqa: BLE001
         print(f"Error: Memory storage is unavailable ({exc}).", file=sys.stderr)
         sys.exit(1)
     print(format_memories(records, history=args.history))
+    if pending:
+        print("\nPending (inferred, not applied until you confirm; `confirm <id>` or `reject <id>`):")
+        print(format_memories(pending))
+
+
+def format_pending_notice(result) -> str:
+    """Tells the user which inferred preferences this run left waiting for confirmation."""
+    inference = (result.get("artifacts") or {}).get("inference")
+    ids = list(getattr(inference, "pending", None) or (inference.get("pending") if isinstance(inference, dict) else []) or [])
+    if not ids:
+        return ""
+    lines = ["", "Inferred preferences waiting for your confirmation (they change no number until you confirm):"]
+    lines += [f"  {memory_id}: `confirm {memory_id}` to apply or `reject {memory_id}` to discard" for memory_id in ids]
+    return "\n".join(lines)
+
+
+def _resolve_pending(args, action: str, done: str) -> None:
+    from analyst_crew.memory import MemoryNotFound, MemoryStore
+
+    try:
+        with memory_store_context() as store:
+            record = getattr(MemoryStore(store), action)(args.user_id, args.memory_id)
+    except MemoryNotFound as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: Memory storage is unavailable; nothing changed ({exc}).", file=sys.stderr)
+        sys.exit(1)
+    print(done.format(id=record.id, content=record.content))
+
+
+def confirm_command(args) -> None:
+    _resolve_pending(args, "confirm", "Confirmed {id}: {content}. It applies from your next run.")
+
+
+def reject_command(args) -> None:
+    _resolve_pending(args, "reject", "Rejected {id}: {content}. It will never be applied and is kept in the history.")
 
 
 def forget_command(args) -> None:
@@ -394,6 +432,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--sales-csv", type=str, default=None)
     run.add_argument("--artifact-dir", type=str, default=".artifacts")
     run.add_argument("--as-of-date", type=str, required=True)
+    run.add_argument("--no-infer", action="store_true",
+                     help="do not infer memories from your question and the run records after the run")
     run.add_argument("--report-file", type=str, default=None,
                      help="also write the rendered Report to this Markdown file (nothing is written otherwise)")
 
@@ -408,6 +448,14 @@ def build_parser() -> argparse.ArgumentParser:
     forget = commands.add_parser("forget", help="forget one memory (it stays in the history)")
     forget.add_argument("memory_id", type=str)
     forget.add_argument("--user-id", type=str, default="default")
+
+    confirm = commands.add_parser("confirm", help="confirm a pending inferred preference so it applies")
+    confirm.add_argument("memory_id", type=str)
+    confirm.add_argument("--user-id", type=str, default="default")
+
+    reject = commands.add_parser("reject", help="reject a pending inferred preference")
+    reject.add_argument("memory_id", type=str)
+    reject.add_argument("--user-id", type=str, default="default")
     return parser
 
 
@@ -426,6 +474,12 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "forget":
         forget_command(args)
+        return
+    if args.command == "confirm":
+        confirm_command(args)
+        return
+    if args.command == "reject":
+        reject_command(args)
         return
 
     if not args.sales_csv:
@@ -451,6 +505,13 @@ def main(argv: list[str] | None = None) -> None:
             "user_id": args.user_id,
         }
     }
+    if not args.no_infer:
+        from analyst_crew.llm import credentials_available
+
+        if credentials_available():
+            from analyst_crew.memory.infer import production_inference_model
+
+            invoke_config["configurable"]["inference_model"] = production_inference_model()
     if args.sales_csv:
         from analyst_crew.tools.sales import sales_data_source
         from analyst_crew.tools.targets import sales_targets_data_source
@@ -472,6 +533,9 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
 
     print(format_result(result))
+    notice = format_pending_notice(result)
+    if notice:
+        print(notice)
 
     artifacts = result.get("artifacts", {})
     if args.report_file:

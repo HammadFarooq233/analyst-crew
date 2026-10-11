@@ -32,7 +32,7 @@ def test_full_run_checkpoints_load_without_unregistered_type_warnings(tmp_path, 
 
 def test_memory_state_models_are_allowlisted():
     names = {cls.__name__ for cls in crew_state_types()}
-    assert {"MemoryRecord", "AppliedMemory"} <= names
+    assert {"MemoryRecord", "AppliedMemory", "InferredProposal", "InferenceProposals", "InferenceResult"} <= names
 
 
 def test_chart_state_models_are_allowlisted():

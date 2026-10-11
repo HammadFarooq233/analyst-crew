@@ -124,6 +124,53 @@ class MemoryStore:
             raise MemoryUnavailable(str(exc)) from exc
         return forgotten
 
+    def pending(self, user_id: str) -> list[MemoryRecord]:
+        """Inferred Typed Preferences awaiting confirmation. They are never retrieved for a run."""
+        return [r for r in self.history(user_id, "preference") if r.status == "pending"]
+
+    def add_pending(self, user_id: str, content: str, *, key: str, value: float) -> MemoryRecord:
+        """Store an inferred Typed Preference as pending: it changes no number until confirmed."""
+        record = MemoryRecord(
+            id=f"mem-{uuid.uuid4().hex[:8]}", user_id=user_id, kind="preference", origin="inferred",
+            content=content, created_at=self._now(), key=key, value=value, status="pending")
+        try:
+            self._put(record)
+        except Exception as exc:  # noqa: BLE001
+            raise MemoryUnavailable(str(exc)) from exc
+        return record
+
+    def _pending(self, user_id: str, memory_id: str) -> MemoryRecord:
+        target = next((r for r in self.pending(user_id) if r.id == memory_id), None)
+        if target is None:
+            raise MemoryNotFound(f"No pending preference {memory_id!r} for user {user_id!r}.")
+        return target
+
+    def confirm(self, user_id: str, memory_id: str) -> MemoryRecord:
+        """Make a pending preference active now, superseding the active one on the same key."""
+        target = self._pending(user_id, memory_id)
+        now = self._now()
+        try:
+            older = [r for r in self._read(user_id, "preference") if r.status == "active" and r.key == target.key]
+            confirmed = target.model_copy(update={
+                "status": "active", "created_at": now, "supersedes": older[-1].id if older else None})
+            self._put(confirmed)
+            for previous in older:
+                self._put(previous.model_copy(update={
+                    "status": "superseded", "superseded_by": confirmed.id, "ended_at": now}))
+        except Exception as exc:  # noqa: BLE001
+            raise MemoryUnavailable(str(exc)) from exc
+        return confirmed
+
+    def reject(self, user_id: str, memory_id: str) -> MemoryRecord:
+        """Decline a pending preference. It stays in the history so it is not proposed again."""
+        target = self._pending(user_id, memory_id)
+        rejected = target.model_copy(update={"status": "rejected", "ended_at": self._now()})
+        try:
+            self._put(rejected)
+        except Exception as exc:  # noqa: BLE001
+            raise MemoryUnavailable(str(exc)) from exc
+        return rejected
+
     def read_for_role(self, role: str, user_id: str) -> list[MemoryRecord]:
         records: list[MemoryRecord] = []
         for kind in ROLE_KINDS.get(role, ()):

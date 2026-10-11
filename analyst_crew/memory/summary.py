@@ -12,7 +12,7 @@ from typing import Any
 
 from langgraph.config import get_store
 
-from analyst_crew.memory.models import AppliedMemory, MemoryRecord
+from analyst_crew.memory.models import AppliedMemory, InferenceResult, MemoryRecord
 from analyst_crew.memory.store import MemoryStore, MemoryUnavailable
 from analyst_crew.tools.analysis import BaselineFindings
 
@@ -69,26 +69,43 @@ def build_summary(artifacts: Mapping[str, Any]) -> tuple[str, str] | None:
     return " ".join(parts), str(source_hash)
 
 
+def _user_words(state: Mapping[str, Any]) -> str:
+    """The user's own question, taken from the first message, never from the Planner's Plan wording."""
+    messages = state.get("messages") or []
+    content = getattr(messages[0], "content", "") if messages else ""
+    return content if isinstance(content, str) else ""
+
+
 def memory_update_node(state: dict[str, Any], config: dict | None = None) -> dict[str, Any]:
-    """Crew-level Memory Update: store this run's Past-run Summary. Not an Agent; never fails the run."""
+    """Crew-level Memory Update: store this run's Past-run Summary, then infer from the user's words and
+    run records only. Not an Agent; never fails the run."""
     artifacts = state.get("artifacts", {})
-
-    def done(**status: Any) -> dict[str, Any]:
-        return {"current_step": "memory_update_node", "artifacts": {"memory_update": status}}
-
+    configurable = (config or {}).get("configurable") or {}
+    user_id = configurable.get("user_id", "default")
     built = build_summary(artifacts)
-    if built is None:
-        return done(status="skipped")
-    content, source_hash = built
-    user_id = ((config or {}).get("configurable") or {}).get("user_id", "default")
+    out: dict[str, Any] = {"memory_update": {"status": "skipped"}}
     try:
-        store = MemoryStore(get_store())
+        memory = MemoryStore(get_store())
     except RuntimeError:
-        return done(status="skipped")
-    try:
-        if any(r.content == content and r.source_hash == source_hash for r in store.list(user_id, "summary")):
-            return done(status="unchanged")  # a rerun with identical results adds nothing
-        record = store.add(user_id, "summary", content, origin="run_record", source_hash=source_hash)
-    except MemoryUnavailable:
-        return done(status="unavailable")
-    return done(status="written", memory_id=record.id)
+        return {"current_step": "memory_update_node", "artifacts": out}
+
+    if built is not None:
+        content, source_hash = built
+        try:
+            if any(r.content == content and r.source_hash == source_hash for r in memory.list(user_id, "summary")):
+                out["memory_update"] = {"status": "unchanged"}  # a rerun with identical results adds nothing
+            else:
+                record = memory.add(user_id, "summary", content, origin="run_record", source_hash=source_hash)
+                out["memory_update"] = {"status": "written", "memory_id": record.id}
+        except MemoryUnavailable:
+            out["memory_update"] = {"status": "unavailable"}
+
+    model = configurable.get("inference_model")
+    if model is not None:
+        from analyst_crew.memory.infer import infer
+
+        # Run records are the code-built digest of Findings, never the Report, Critic or Planner prose.
+        out["inference"] = infer(model, _user_words(state), built[0] if built else "", user_id, memory)
+    else:
+        out["inference"] = InferenceResult(status="skipped")
+    return {"current_step": "memory_update_node", "artifacts": out}
