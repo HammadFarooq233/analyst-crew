@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import os
 import shutil
 import sys
@@ -303,18 +304,76 @@ def seed_memory_before_invoke(fact: str, user_id: str = "default"):
         )
 
 
-def main() -> None:
+COMMANDS = ("run", "remember")
+
+
+@contextlib.contextmanager
+def memory_store_context():
+    """The persistent Memory store for CLI commands: Postgres, or a clear error. Memory that would
+    vanish when the process exits is never pretended to be stored."""
+    conn_string = os.getenv("POSTGRES_CONNECTION_STRING")
+    if not conn_string:
+        raise RuntimeError("POSTGRES_CONNECTION_STRING is not set, so there is no persistent Memory storage.")
+    from langgraph.store.postgres import PostgresStore
+
+    with PostgresStore.from_conn_string(conn_string) as store:
+        store.setup()
+        yield store
+
+
+def production_memory_model():
+    from analyst_crew.memory.update import production_memory_model as build
+
+    return build()
+
+
+def remember_command(args) -> None:
+    from analyst_crew.memory import MemoryStore
+    from analyst_crew.memory.update import remember
+
+    try:
+        model = production_memory_model()
+        with memory_store_context() as store:
+            outcome = remember(args.sentence, args.user_id, MemoryStore(store), model)
+    except Exception as exc:  # noqa: BLE001 — nothing is stored on any failure, and the user is told
+        print(f"Error: Nothing was stored: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(outcome.message)
+    if not outcome.stored:
+        sys.exit(1)
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Analyst Crew CLI")
-    parser.add_argument("--question", type=str, default=None)
-    parser.add_argument("--thread-id", type=str, default=None)
-    parser.add_argument("--user-id", type=str, default="default")
-    parser.add_argument("--memory-seed", type=str, default=None)
-    parser.add_argument("--sales-csv", type=str, default=None)
-    parser.add_argument("--artifact-dir", type=str, default=".artifacts")
-    parser.add_argument("--as-of-date", type=str, required=True)
-    parser.add_argument("--report-file", type=str, default=None,
-                        help="also write the rendered Report to this Markdown file (nothing is written otherwise)")
-    args = parser.parse_args()
+    commands = parser.add_subparsers(dest="command")
+
+    run = commands.add_parser("run", help="run the Crew on a question (the default when no command is given)")
+    run.add_argument("--question", type=str, default=None)
+    run.add_argument("--thread-id", type=str, default=None)
+    run.add_argument("--user-id", type=str, default="default")
+    run.add_argument("--memory-seed", type=str, default=None)
+    run.add_argument("--sales-csv", type=str, default=None)
+    run.add_argument("--artifact-dir", type=str, default=".artifacts")
+    run.add_argument("--as-of-date", type=str, required=True)
+    run.add_argument("--report-file", type=str, default=None,
+                     help="also write the rendered Report to this Markdown file (nothing is written otherwise)")
+
+    remember = commands.add_parser("remember", help="tell the Crew a preference or fact to remember")
+    remember.add_argument("sentence", type=str, help='e.g. "for me, unusual means a swing over 8%%"')
+    remember.add_argument("--user-id", type=str, default="default")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # The original flat invocation (`cli.py --question ...`) is the `run` command.
+    if not argv or (argv[0] not in COMMANDS and argv[0] not in ("-h", "--help")):
+        argv = ["run", *argv]
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "remember":
+        remember_command(args)
+        return
 
     if not args.sales_csv:
         parser.error("--sales-csv is required for Phase 1 execution")

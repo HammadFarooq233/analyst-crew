@@ -14,6 +14,7 @@ from typing import Any
 from langchain_core.runnables import RunnableLambda
 from pydantic import ValidationError
 
+from analyst_crew.memory.node import applied_memories, effective_parameters
 from analyst_crew.agents.agent_support import (
     catalog_prompt, format_failure, named_span, run_validated, summarize_schema_error,
 )
@@ -245,7 +246,8 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
         }
         analyst_step = next((step for step in plan.steps if step.agent == "Analyst"), None)
         findings_names = (analyst_step.declared_artifacts or [analyst_step.expected_output]) if analyst_step else []
-        analysis_parameters = dict(configurable.get("analysis_parameters", {}))
+        analysis_parameters = effective_parameters(artifacts, configurable)
+        applied = applied_memories(artifacts)
         # Charts come from the Visualizer Step (when the Plan has one); the Report only references them.
         visualizer_step = next((step for step in plan.steps if step.agent == "Visualizer"), None)
         charts = load_charts(artifacts.get("charts")) if visualizer_step is not None else []
@@ -269,7 +271,11 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
             handoff_error = exc
         memory_unavailable = artifacts.get("memory_status") == "unavailable"
         # A changed storage state must not reuse a Report that was written under the other state.
-        key_parameters = {**analysis_parameters, **({"memory_unavailable": True} if memory_unavailable else {})}
+        key_parameters = {
+            **analysis_parameters, **({"memory_unavailable": True} if memory_unavailable else {}),
+            # The Applied Memories section depends on which memories applied, not only on their values.
+            **({"applied_memories": sorted(f"{item.memory_id}:{item.status}" for item in applied)} if applied else {}),
+        }
         current_key = execution_key(
             reporter_step, analysis_parameters=key_parameters,
             input_artifact_hashes=[current_hash, *(chart.content_hash for chart in charts)],
@@ -299,10 +305,10 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
                 model = configurable.get("reporter_model") or production_reporter_model()
                 agent = ReporterAgent(model)
                 content = agent.run(handoff, catalog, config=config)
-                report = build_report(content, catalog, plan.user_question, chart_refs, chart_mode, memory_unavailable)
+                report = build_report(content, catalog, plan.user_question, chart_refs, chart_mode, memory_unavailable, applied)
             except Exception as exc:  # noqa: BLE001 — any Reporter failure degrades visibly, never silently
                 failure = exc
-                report = build_fallback_report(catalog, plan.user_question, chart_refs, chart_mode, memory_unavailable)
+                report = build_fallback_report(catalog, plan.user_question, chart_refs, chart_mode, memory_unavailable, applied)
             retry_counts = {
                 "validation_retries": getattr(agent, "validation_retries", 0),
                 "tool_retries": getattr(agent, "tool_retries", 0),

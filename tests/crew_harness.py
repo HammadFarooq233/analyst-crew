@@ -22,10 +22,10 @@ def write_sales(path, rows):
     return path
 
 
-def sales_row(order_id, order_date, quantity=1, unit_price=10):
+def sales_row(order_id, order_date, quantity=1, unit_price=10, region="North"):
     return {
         "order_id": order_id, "order_date": order_date, "product_id": "P001",
-        "product_name": "Desk Lamp", "category": "Office", "region": "North",
+        "product_name": "Desk Lamp", "category": "Office", "region": region,
         "sales_channel": "web", "customer_segment": "consumer",
         "quantity": quantity, "unit_price": unit_price,
         "discount_amount": 0, "returned_quantity": 0,
@@ -171,7 +171,7 @@ USE_DEFAULT = object()
 def run_crew(source, tmp_path, monkeypatch, *, thread_id="thread-1", as_of_date="2025-06-30", checkpointer=None,
              plan=None, reporter_model=USE_DEFAULT, planner_model=None, fetcher_model=None, analyst_model=None,
              extra_sources=None, available_agents=("Fetcher", "Analyst", "Reporter"), visualizer_model=USE_DEFAULT,
-             critic_model=None, callbacks=None, user_id=None, store=None):
+             critic_model=None, callbacks=None, user_id=None, store=None, question=None):
     planner_model = planner_model or ScriptedPlannerModel(plan or crew_plan())
     fetcher_model = fetcher_model or ScriptedFetcherModel()
     analyst_model = analyst_model or ScriptedAnalystModel()
@@ -203,7 +203,7 @@ def run_crew(source, tmp_path, monkeypatch, *, thread_id="thread-1", as_of_date=
         runtime["configurable"]["visualizer_model"] = visualizer_model
     if critic_model is not None:
         runtime["configurable"]["critic_model"] = critic_model
-    result = planner_module.invoke(QUESTION, runtime, checkpointer=checkpointer or MemorySaver(), store=store)
+    result = planner_module.invoke(question or QUESTION, runtime, checkpointer=checkpointer or MemorySaver(), store=store)
     return result, reporter_model
 
 

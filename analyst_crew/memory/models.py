@@ -1,4 +1,4 @@
-"""State model for one stored Memory. Allowlisted in the checkpoint serializer."""
+"""State models for stored and applied Memory. Allowlisted in the checkpoint serializer."""
 from typing import Literal
 
 from pydantic import BaseModel
@@ -16,3 +16,17 @@ class MemoryRecord(BaseModel):
     origin: MemoryOrigin = "stated"
     content: str
     created_at: str
+    # Typed Preferences only: a key from the closed vocabulary and its validated value.
+    key: str | None = None
+    value: float | None = None
+
+
+class AppliedMemory(BaseModel):
+    """One Memory that influenced a run, as resolved by the Crew. ``overridden`` means a
+    stored Typed Preference was not used because the question stated its own instruction."""
+
+    memory_id: str
+    kind: MemoryKind
+    key: str | None = None
+    origin: MemoryOrigin = "stated"
+    status: Literal["applied", "overridden"] = "applied"
