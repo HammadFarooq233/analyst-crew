@@ -108,9 +108,30 @@ def test_a_different_user_does_not_see_the_change(source, tmp_path, monkeypatch)
 def test_forgetting_the_memory_removes_the_change(source, tmp_path, monkeypatch):
     store = InMemoryStore()
     outcome = _state(store, "priya")
-    MemoryStore(store).delete("priya", "preference", outcome.record.id)
+    MemoryStore(store).forget("priya", outcome.record.id)
     artifacts, _ = _run(source, tmp_path, monkeypatch, store)
     assert _material(artifacts) == set()
+
+
+def test_the_latest_statement_wins_in_a_run_and_the_history_keeps_the_older_one(source, tmp_path, monkeypatch):
+    store = InMemoryStore()
+    older = _state(store, "priya").record
+    newer = _state(store, "priya", "actually 20%", MemoryProposal(kind="preference", key=REL, value=20)).record
+    artifacts, _ = _run(source, tmp_path, monkeypatch, store)
+    assert artifacts["findings"].materiality.relative_change_percent == 20.0
+    assert _material(artifacts) == set()
+    assert [item.memory_id for item in artifacts["applied_memories"]] == [newer.id]
+    assert [r.id for r in MemoryStore(store).history("priya")] == [older.id, newer.id]
+    assert MemoryStore(store).history("priya")[0].status == "superseded"
+
+
+def test_a_forgotten_memory_stays_auditable_but_never_reaches_a_run(source, tmp_path, monkeypatch):
+    store = InMemoryStore()
+    record = _state(store, "priya").record
+    MemoryStore(store).forget("priya", record.id)
+    artifacts, _ = _run(source, tmp_path, monkeypatch, store)
+    assert artifacts["applied_memories"] == [] and "Applied Memories" not in _rendered(artifacts)
+    assert [(r.id, r.status) for r in MemoryStore(store).history("priya")] == [(record.id, "forgotten")]
 
 
 def test_a_sentence_outside_the_vocabulary_is_a_free_text_fact_and_changes_no_parameter(source, tmp_path, monkeypatch):
@@ -200,9 +221,27 @@ class TestResume:
     def test_forgetting_a_memory_recomputes_dependent_steps(self, source, tmp_path, monkeypatch):
         store = InMemoryStore()
         outcome = _state(store, "priya")
-        forget = lambda: MemoryStore(store).delete("priya", "preference", outcome.record.id)
+        forget = lambda: MemoryStore(store).forget("priya", outcome.record.id)
         _, second, _ = self._twice(source, tmp_path, monkeypatch, store, forget)
         reasons = self._outcomes(second)
         assert reasons["analyze_baseline"] == "invalidated" and reasons["write_report"] == "invalidated"
         assert second["findings"].materiality.source == "default"
         assert second["report"].applied_memories == []
+
+    def test_forgetting_an_unrelated_fact_recomputes_nothing(self, source, tmp_path, monkeypatch):
+        store = InMemoryStore()
+        _state(store, "priya")
+        fact = _state(store, "priya", "regions follow sales managers", MemoryProposal(kind="fact")).record
+        forget = lambda: MemoryStore(store).forget("priya", fact.id)
+        _, second, reporter = self._twice(source, tmp_path, monkeypatch, store, forget)
+        assert set(self._outcomes(second).values()) == {"unchanged"}
+        assert reporter.calls == 0
+
+    def test_restating_the_same_value_recomputes_only_the_steps_that_show_the_memory(self, source, tmp_path, monkeypatch):
+        store = InMemoryStore()
+        _state(store, "priya")
+        again = lambda: _state(store, "priya", "I said 8% already", MemoryProposal(kind="preference", key=REL, value=8))
+        _, second, _ = self._twice(source, tmp_path, monkeypatch, store, again)
+        reasons = self._outcomes(second)
+        assert reasons["fetch_sales"] == "unchanged" and reasons["analyze_baseline"] == "unchanged"
+        assert reasons["write_report"] == "invalidated"

@@ -304,7 +304,7 @@ def seed_memory_before_invoke(fact: str, user_id: str = "default"):
         )
 
 
-COMMANDS = ("run", "remember")
+COMMANDS = ("run", "remember", "list", "forget")
 
 
 @contextlib.contextmanager
@@ -343,6 +343,45 @@ def remember_command(args) -> None:
         sys.exit(1)
 
 
+def format_memories(records, *, history: bool = False) -> str:
+    if not records:
+        return "No memories stored."
+    lines = []
+    for record in records:
+        stored = record.created_at[:19].replace("T", " ")
+        status = f"  [{record.status}]" if history else ""
+        lines.append(f"{record.id}  {record.kind:<10} {record.origin:<10} {stored}{status}  {record.content}")
+    return "\n".join(lines)
+
+
+def list_command(args) -> None:
+    from analyst_crew.memory import MemoryStore
+
+    try:
+        with memory_store_context() as store:
+            memory = MemoryStore(store)
+            records = memory.history(args.user_id) if args.history else memory.list(args.user_id)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: Memory storage is unavailable ({exc}).", file=sys.stderr)
+        sys.exit(1)
+    print(format_memories(records, history=args.history))
+
+
+def forget_command(args) -> None:
+    from analyst_crew.memory import MemoryNotFound, MemoryStore
+
+    try:
+        with memory_store_context() as store:
+            record = MemoryStore(store).forget(args.user_id, args.memory_id)
+    except MemoryNotFound as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: Memory storage is unavailable; nothing was forgotten ({exc}).", file=sys.stderr)
+        sys.exit(1)
+    print(f"Forgotten {record.id}: {record.content}. It no longer affects runs and stays in the history.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Analyst Crew CLI")
     commands = parser.add_subparsers(dest="command")
@@ -361,6 +400,14 @@ def build_parser() -> argparse.ArgumentParser:
     remember = commands.add_parser("remember", help="tell the Crew a preference or fact to remember")
     remember.add_argument("sentence", type=str, help='e.g. "for me, unusual means a swing over 8%%"')
     remember.add_argument("--user-id", type=str, default="default")
+
+    listing = commands.add_parser("list", help="list what the Crew remembers about a user")
+    listing.add_argument("--user-id", type=str, default="default")
+    listing.add_argument("--history", action="store_true", help="include superseded and forgotten memories")
+
+    forget = commands.add_parser("forget", help="forget one memory (it stays in the history)")
+    forget.add_argument("memory_id", type=str)
+    forget.add_argument("--user-id", type=str, default="default")
     return parser
 
 
@@ -373,6 +420,12 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.command == "remember":
         remember_command(args)
+        return
+    if args.command == "list":
+        list_command(args)
+        return
+    if args.command == "forget":
+        forget_command(args)
         return
 
     if not args.sales_csv:
