@@ -32,7 +32,7 @@ def test_full_run_checkpoints_load_without_unregistered_type_warnings(tmp_path, 
 
 def test_memory_state_models_are_allowlisted():
     names = {cls.__name__ for cls in crew_state_types()}
-    assert {"MemoryRecord"} <= names
+    assert {"MemoryRecord", "AppliedMemory"} <= names
 
 
 def test_chart_state_models_are_allowlisted():
@@ -60,4 +60,26 @@ def test_full_run_with_charts_checkpoints_round_trip_under_strict_msgpack(tmp_pa
     artifacts = result["artifacts"]
     assert artifacts["charts"] and all(isinstance(chart, ChartArtifact) for chart in artifacts["charts"])
     assert all(isinstance(ref, ChartReference) for ref in artifacts["report"].charts)
+    assert "unregistered type" not in caplog.text
+
+
+def test_applied_memories_checkpoint_round_trip_under_strict_msgpack(tmp_path, monkeypatch, caplog):
+    from langgraph.checkpoint.serde import _msgpack
+    from langgraph.store.memory import InMemoryStore
+
+    from analyst_crew.memory import MemoryStore
+    from analyst_crew.memory.models import AppliedMemory
+
+    monkeypatch.setattr(_msgpack, "STRICT_MSGPACK_ENABLED", True)
+    source = tmp_path / "sales.csv"
+    write_sales(source, base_rows())
+    store = InMemoryStore()
+    MemoryStore(store).add("priya", "preference", "x", key="materiality_relative_threshold_percent", value=8.0)
+    kwargs = {"thread_id": "serde-memory", "checkpointer": MemorySaver(serde=crew_serde()), "user_id": "priya",
+              "store": store}
+    with caplog.at_level(logging.WARNING):
+        run_crew(source, tmp_path, monkeypatch, **kwargs)
+        result, _ = run_crew(source, tmp_path, monkeypatch, **kwargs)
+    applied = result["artifacts"]["applied_memories"]
+    assert applied and all(isinstance(item, AppliedMemory) for item in applied)
     assert "unregistered type" not in caplog.text

@@ -18,6 +18,7 @@ from analyst_crew.agents.critic import critic_node
 from analyst_crew.agents.reporter import reporter_node
 from analyst_crew.agents.visualizer import visualizer_node
 from analyst_crew.agents.tracing import _finish_langfuse_trace, _run_metadata, get_langfuse_handler
+from analyst_crew.memory.node import memory_node
 from analyst_crew.memory import MemoryStore, MemoryUnavailable, UnavailableStore
 from analyst_crew.state import CrewState
 from analyst_crew.state.serde import crew_serde
@@ -40,11 +41,14 @@ def build_graph(checkpointer=None, store=None, runtime_config: dict | None = Non
     graph.add_node("planner_node", lambda state, config=None: planner_module.planner_node(state, merged_config(config)))
     graph.add_node("fetcher_node", lambda state, config=None: fetcher_node(state, merged_config(config)))
     graph.add_node("analyst_node", lambda state, config=None: analyst_node(state, merged_config(config)))
+    graph.add_node("memory_node", lambda state, config=None: memory_node(state, merged_config(config)))
     graph.add_edge(START, "planner_node")
     def next_node(state: CrewState) -> str:
         plan = state.get("artifacts", {}).get("plan")
-        return "fetcher_node" if isinstance(plan, Plan) and any(step.agent == "Fetcher" for step in plan.steps) else END
-    graph.add_conditional_edges("planner_node", next_node, {"fetcher_node": "fetcher_node", END: END})
+        return "memory_node" if isinstance(plan, Plan) and any(step.agent == "Fetcher" for step in plan.steps) else END
+    graph.add_conditional_edges("planner_node", next_node, {"memory_node": "memory_node", END: END})
+    # The Crew resolves stored Typed Preferences into analysis parameters before any Step that uses them.
+    graph.add_edge("memory_node", "fetcher_node")
     def after_fetcher(state: CrewState) -> str:
         if state.get("artifacts", {}).get("terminal_failure"):
             return END

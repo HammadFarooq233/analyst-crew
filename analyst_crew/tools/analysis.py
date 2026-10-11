@@ -49,7 +49,7 @@ class ComparisonWindow(BaseModel):
 class MaterialityThresholds(BaseModel):
     relative_change_percent: float = DEFAULT_MATERIALITY_RELATIVE_PERCENT
     absolute_change_percent_of_prior_total: float = DEFAULT_MATERIALITY_ABSOLUTE_PERCENT_OF_PRIOR_TOTAL
-    source: Literal["default", "analysis_parameters", "user_question"] = "default"
+    source: Literal["default", "analysis_parameters", "user_question", "memory"] = "default"
 
 
 class DimensionDriver(BaseModel):
@@ -399,9 +399,10 @@ def _resolve_materiality(
     parameters = analysis_parameters or {}
     relative = parameters.get("materiality_relative_threshold_percent")
     absolute = parameters.get("materiality_absolute_threshold_percent")
-    source: Literal["default", "analysis_parameters", "user_question"] = "default"
+    source: Literal["default", "analysis_parameters", "user_question", "memory"] = "default"
     if relative is not None or absolute is not None:
-        source = "analysis_parameters"
+        # The Crew labels parameters it resolved from stored Typed Preferences; nothing else may claim it.
+        source = "memory" if parameters.get("materiality_source") == "memory" else "analysis_parameters"
     else:
         relative, absolute = _materiality_from_question(user_question)
         if relative is not None or absolute is not None:

@@ -57,10 +57,11 @@ class MemoryStore:
             raise ValueError(f"Unknown memory kind: {kind!r}")
         return (ROOT, _label(user_id), kind)
 
-    def add(self, user_id: str, kind: str, content: str, origin: str = "stated") -> MemoryRecord:
+    def add(self, user_id: str, kind: str, content: str, origin: str = "stated", *,
+            key: str | None = None, value: float | None = None) -> MemoryRecord:
         record = MemoryRecord(
             id=f"mem-{uuid.uuid4().hex[:8]}", user_id=user_id, kind=kind, origin=origin, content=content,
-            created_at=datetime.now(timezone.utc).isoformat(),
+            created_at=datetime.now(timezone.utc).isoformat(), key=key, value=value,
         )
         try:
             self._store.put(self.namespace(user_id, kind), record.id, record.model_dump())
