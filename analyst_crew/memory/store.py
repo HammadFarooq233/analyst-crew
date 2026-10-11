@@ -68,16 +68,22 @@ class MemoryStore:
         self._store.put(self.namespace(record.user_id, record.kind), record.id, record.model_dump())
 
     def add(self, user_id: str, kind: str, content: str, origin: str = "stated", *,
-            key: str | None = None, value: float | None = None) -> MemoryRecord:
+            key: str | None = None, value: float | None = None,
+            source_hash: str | None = None) -> MemoryRecord:
         """Store a memory. A newer Typed Preference on the same key supersedes the active one(s):
         the older record stays in the history, marked superseded and linked to its replacement."""
         record = MemoryRecord(
             id=f"mem-{uuid.uuid4().hex[:8]}", user_id=user_id, kind=kind, origin=origin, content=content,
             created_at=self._now(), key=key, value=value,
+            source_hash=source_hash,
         )
         try:
-            older = ([r for r in self._read(user_id, kind) if r.status == "active" and r.key == key]
-                     if kind == "preference" and key else [])
+            if kind == "preference" and key:
+                older = [r for r in self._read(user_id, kind) if r.status == "active" and r.key == key]
+            elif kind == "summary":  # only the latest Past-run Summary stays active
+                older = [r for r in self._read(user_id, kind) if r.status == "active"]
+            else:
+                older = []
             if older:
                 record = record.model_copy(update={"supersedes": older[-1].id})
             self._put(record)  # the replacement lands first, so a failure never leaves a gap

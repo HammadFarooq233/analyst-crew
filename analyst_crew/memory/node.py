@@ -34,7 +34,9 @@ def memory_node(state: dict[str, Any], config: dict | None = None) -> dict[str, 
     plan = state.get("artifacts", {}).get("plan")
     messages = state.get("messages", [])
     question = getattr(plan, "user_question", None) or (messages[0].content if messages else "")
-    artifacts: dict[str, Any] = {"memory_parameters": {}, "applied_memories": []}
+    # What the Planner was given (Past-run Summaries) is listed first; the Planner runs before this step.
+    planner_applied = list(state.get("artifacts", {}).get("planner_applied_memories") or [])
+    artifacts: dict[str, Any] = {"memory_parameters": {}, "applied_memories": planner_applied}
     try:
         store = get_store()
     except RuntimeError:
@@ -46,5 +48,5 @@ def memory_node(state: dict[str, Any], config: dict | None = None) -> dict[str, 
         return {"current_step": "memory_node", "artifacts": artifacts}
     resolution = resolve_preferences(records, question)
     artifacts["memory_parameters"] = resolution.parameters
-    artifacts["applied_memories"] = resolution.applied
+    artifacts["applied_memories"] = [*planner_applied, *resolution.applied]
     return {"current_step": "memory_node", "artifacts": artifacts}

@@ -261,6 +261,9 @@ def assemble_applied_memories(catalog: EvidenceCatalog, applied: list[AppliedMem
     can never display a value other than the resolved parameter; memory ids and dates stay off the page."""
     lines: list[ReportLine] = []
     for item in applied or []:
+        if item.kind == "summary":
+            lines.append(template_line(f"Past-run Summary given to the Planner ({_ORIGINS.get(item.origin, item.origin)})."))
+            continue
         spec = PREFERENCE_KEYS.get(item.key or "")
         label = spec.label if spec else "Memory"
         origin = _ORIGINS.get(item.origin, item.origin)

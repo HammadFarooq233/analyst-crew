@@ -11,6 +11,8 @@ from analyst_crew.agents.contracts import (  # noqa: F401 — re-exported for ex
 from analyst_crew.agents.resume import _resume_decision, _source_content_hash, execution_key  # noqa: F401
 from analyst_crew.llm import make_chat_model
 from analyst_crew.memory import MemoryStore, MemoryUnavailable
+from analyst_crew.memory.models import AppliedMemory
+from analyst_crew.memory.summary import applied_summaries, current_source_hashes, fresh_summaries
 from analyst_crew.state import CrewState
 from analyst_crew.tools.retry import invoke_with_optional_config
 
@@ -258,20 +260,22 @@ def _reusable_prior_plan(state: CrewState, question: str, agent: "PlannerAgent")
     return prior
 
 
-def _planner_memory(user_id: str) -> tuple[str, str]:
-    """The user's Planner-scoped Memory as prompt text, and whether storage was reachable.
+def _planner_memory(user_id: str, source_hashes: set[str] = frozenset()) -> tuple[str, str, list[AppliedMemory]]:
+    """The user's Planner-scoped Memory as prompt text, whether storage was reachable, and the
+    Past-run Summaries applied.
 
     Retrieval is deterministic and application-side (ADR-0005). A storage outage
-    degrades to no memory with status "unavailable"; it never fails the run."""
+    degrades to no memory with status "unavailable"; it never fails the run. A Past-run
+    Summary whose source-data hash no longer matches the data is stale and is dropped."""
     try:
         store = get_store()
     except RuntimeError:
-        return "", "available"
+        return "", "available", []
     try:
-        records = MemoryStore(store).read_for_role("Planner", user_id)
+        records = fresh_summaries(MemoryStore(store).read_for_role("Planner", user_id), source_hashes)
     except MemoryUnavailable:
-        return "", "unavailable"
-    return "\n".join(f"- {record.content}" for record in records), "available"
+        return "", "unavailable", []
+    return "\n".join(f"- {record.content}" for record in records), "available", applied_summaries(records)
 
 
 def planner_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
@@ -281,7 +285,8 @@ def planner_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
     try:
         configurable = (config or {}).get("configurable", {})
         planner_model = configurable.get("planner_model")
-        memory_context, memory_status = _planner_memory(configurable.get("user_id", "default"))
+        memory_context, memory_status, applied = _planner_memory(
+            configurable.get("user_id", "default"), current_source_hashes(configurable.get("data_sources")))
         agent = PlannerAgent(
             memory_context=memory_context,
             available_agents=configurable.get("available_agents"),
@@ -291,6 +296,8 @@ def planner_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
         plan = _reusable_prior_plan(state, question, agent)
         if plan is None:
             plan = agent.generate_plan(question, config=config)
+        else:
+            applied = []  # a reused Plan was not given any Memory this run
     except (RuntimeError, ValueError) as e:
         return {
             "current_step": "planner_node",
@@ -299,7 +306,7 @@ def planner_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
 
     return {
         "current_step": "planner_node",
-        "artifacts": {"plan": plan, "memory_status": memory_status},
+        "artifacts": {"plan": plan, "memory_status": memory_status, "planner_applied_memories": applied},
     }
 
 
