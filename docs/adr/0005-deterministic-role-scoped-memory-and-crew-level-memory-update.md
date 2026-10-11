@@ -28,3 +28,14 @@ Vision §13 says each Agent reads Memory through its own scoped `search_memory` 
 - Memory use is testable through the Crew and always visible on the Report and the trace.
 - Applied memories become part of resume keys.
 - Extending the preference vocabulary is a deliberate code change.
+
+## As shipped (Phase 3 close-out, issue #33)
+
+Checked against the code and the live acceptance run (`docs/phase-3-acceptance-status.md`). The decision stands; these details are how it landed:
+
+- **The preference vocabulary has two keys**: the Material Change relative threshold and the absolute-impact threshold, each range-checked in code. The "grouping dimension emphasised" preference named in the Phase 3 spec was not built: no analysis parameter selects a grouping dimension (every dimension is always computed), so it would map onto nothing. Adding it is a deliberate vocabulary change together with an Analyst parameter.
+- **A question overrides a stored preference for that run.** The Applied Memories line then says the stored preference was not used; the Methodology states the threshold source (`default`, `analysis_parameters`, `user_question` or `memory`).
+- **Past-run Summaries** are written by the Memory Update step from run records only (Findings, Plan Steps, Step outcomes; never Report or Critic prose) with the source file's content hash. They go to the Planner and are skipped as stale when the hash no longer matches. They are listed under Applied Memories as "Past-run Summary given to the Planner".
+- **Inference** keeps the ADR rules and adds code-side grounding: quoted evidence must appear in the user's words (or, for facts, the run records), numbers must appear in the evidence, and a per-run cap applies. Pending preferences are listed by `list` and resolved with `confirm` / `reject`.
+- **Storage outage** degrades to defaults and states so in Caveats; the run does not fail. Applied Memories show the Memory's kind and origin, never its stored text, so free text cannot put a number in a Report.
+- **Superseded, forgotten and rejected Memories** are kept in the history (`list --history`) and are never retrieved.

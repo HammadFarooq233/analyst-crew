@@ -212,7 +212,7 @@ progresses. Update this table, don't just the roadmap above.
 | 0 – Walking skeleton        | Complete*   | Implemented across commits; infrastructure is runnable    |
 | 1 – Real tool use           | Complete    | Live acceptance passed 2026-09-19 (see docs/phase-1-acceptance-status.md) |
 | 2 – Full orchestration      | Complete    | All six Agents run end to end: Visualizer (LLM selects, code supplies data, PNG Chart Artifacts), Reporter (cited Reports, chart references, one bounded revision) and Critic (no Tools, Critique, Reviewer Notes). Live acceptance passed 2026-10-11 (see docs/phase-2-acceptance-status.md; spec issue #14, ADR-0003). Not exercised live: FRED CPI path |
-| 3 – Memory, deepened        | Not started | Spec: GitHub issue #23 (six slices); see ADR-0005. Use Case 2 (marketing spend vs. revenue) is a separate slice after it, spec #24 |
+| 3 – Memory, deepened        | Complete    | Persistent per-user Memory in Postgres (typed preferences, free-text facts, past-run summaries, inferred memories with confirmation), deterministic role-scoped retrieval, Applied Memories on the Report and applied memory ids on the Langfuse trace. Live two-session acceptance (stated 8% threshold, new thread, both controls) passed 2026-10-11 (see docs/phase-3-acceptance-status.md; spec #23, ADR-0005). Not built: the grouping-dimension preference. Use Case 2 (marketing spend vs. revenue) is a separate slice after it, spec #24 |
 | 4 – Observability, deepened | Not started |                                                           |
 | 5 – Evals                   | Not started |                                                           |
 | 6 – Safety/HITL             | Not started | `execute_python` moves to HITL-gated                      |
