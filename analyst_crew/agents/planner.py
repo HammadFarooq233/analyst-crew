@@ -14,6 +14,9 @@ from analyst_crew.state import CrewState
 from analyst_crew.tools.retry import invoke_with_optional_config
 
 
+# One initial call plus up to two repair retries with the validation error fed back.
+PLAN_ATTEMPTS = 3
+
 SYSTEM_PROMPT = """You are the Planner Agent for Analyst Crew, a multi-agent data analysis copilot.
 
 Your role is to decompose a user's analytical question into an ordered Plan of Steps.
@@ -22,8 +25,8 @@ Each Step names a target Agent, describes what it produces, and lists which prio
 Available Agents:
 - Fetcher: Retrieves data from sources (CSV, Postgres, FRED API). Returns raw data — no analysis, no interpretation.
 - Analyst: Performs computation on data — statistics, joins, comparisons, trend detection. Consumes data, produces findings.
-- Visualizer: Generates charts and tables from findings.
-- Critic: Reviews a draft report for uncited claims, missing caveats, and logical gaps.
+- Visualizer: Generates charts from findings. Code supplies every plotted value from the findings; it never computes.
+- Critic: Reviews the draft report for judgment errors (causal overreach, misread evidence, overstated drivers). Has no Tools; it flags issues and never adds claims.
 - Reporter: Writes the narrative report from findings and charts. Synthesizes results into prose, cites specific numbers.
 
 Any relevant facts, preferences, or conventions the user has established in prior sessions are supplied below under "Relevant memory," already retrieved for you — incorporate them into your Plan decisions. If none are supplied, there is no prior memory to draw on.
@@ -34,8 +37,8 @@ Rules:
 3. Each Step must name exactly one Agent from the list above.
 4. depends_on must reference only step_ids from earlier Steps in the plan (never itself, never a later Step).
 5. The Steps must form a valid dependency order — no cycles, no forward references.
-6. For the sales comparison, produce exactly a Fetcher Step followed by a dependent Analyst Step, and, when Reporter is among the validated capabilities for this run, a final Reporter Step that depends on the Analyst Step.
-7. The Fetcher must use a supplied Data Source and declare one Dataset Artifact output. The Analyst must depend on that Fetcher output and declare Findings. The Reporter, when present, must depend only on the Analyst Step, declare one Report output, and have empty source_ids.
+6. For the sales comparison, produce exactly a Fetcher Step followed by a dependent Analyst Step, then, when Visualizer is among the validated capabilities for this run, a Visualizer Step that depends on the Analyst Step, and, when Reporter is among the validated capabilities for this run, a Reporter Step, and, when Critic is also among the validated capabilities, a final Critic Step that depends only on the Reporter Step. Leave out any Step whose Agent is not among the validated capabilities. When Fetcher, Analyst, Visualizer, Reporter and Critic are all available, the Plan has exactly those five Steps in that order, and the last Step is always the Critic.
+7. The Fetcher must use a supplied Data Source and declare one Dataset Artifact output. The Analyst must depend on that Fetcher output and declare Findings. The Visualizer, when present, must depend only on the Analyst Step, declare one Chart Artifacts output, and have empty source_ids. The Reporter, when present, must declare one Report output, have empty source_ids, and depend on the Analyst and Visualizer Steps (only on the Analyst Step when there is no Visualizer Step). The Critic, when present, must declare one Critique output, have empty source_ids, and depend only on the Reporter Step.
 8. Include the exact user_question text in the Plan.
 9. Use these Step keys: `step_id`, `agent`, `objective`, `source_ids`, `expected_output`, `declared_artifacts`, and `depends_on`.
 10. Never invent a Data Source ID, filesystem location, executable SQL, or arithmetic result.
@@ -145,12 +148,22 @@ class PlannerAgent:
             unknown_sources = {source for step in plan.steps for source in step.source_ids} - catalog
             if unknown_sources:
                 raise ValueError(f"Plan references unknown Data Sources: {sorted(unknown_sources)}")
-            if allowed_agents in (set(PHASE1_AGENTS), set(PHASE2_AGENTS)) and "sales_csv" in catalog:
-                expected_agents = ["Fetcher", "Analyst", "Reporter"] if "Reporter" in allowed_agents else ["Fetcher", "Analyst"]
-                if [step.agent for step in plan.steps] != expected_agents:
+            sales_shaped = set(PHASE1_AGENTS) <= allowed_agents <= set(PHASE2_AGENTS)
+            if sales_shaped and "sales_csv" in catalog:
+                # Fetcher, Analyst, then each of Visualizer and Reporter that this Crew has, in that order.
+                # The Critic reviews a Report, so without a Reporter there is nothing for it to do.
+                expected_agents = [
+                    agent for agent in PHASE2_AGENTS
+                    if agent in allowed_agents and (agent != "Critic" or "Reporter" in allowed_agents)
+                ]
+                produced_agents = [step.agent for step in plan.steps]
+                if produced_agents != expected_agents:
+                    missing = [agent for agent in expected_agents if agent not in produced_agents]
                     raise ValueError(
                         "Sales Plan must contain exactly " + ", ".join(expected_agents[:-1])
                         + f" then {expected_agents[-1]} Steps"
+                        + f" (one Step per Agent, in that order); you produced {', '.join(produced_agents) or 'no Steps'}"
+                        + (f", missing a {', '.join(missing)} Step" if missing else "")
                     )
                 fetch_step, analyst_step = plan.steps[0], plan.steps[1]
                 if fetch_step.source_ids != ["sales_csv"]:
@@ -161,24 +174,40 @@ class PlannerAgent:
                     raise ValueError("Sales Plan Fetcher must declare a Dataset Artifact output")
                 if not (analyst_step.declared_artifacts or [analyst_step.expected_output]):
                     raise ValueError("Sales Plan Analyst must declare a Findings output")
-                if len(plan.steps) == 3:
-                    reporter_step = plan.steps[2]
-                    if reporter_step.depends_on != [analyst_step.step_id]:
-                        raise ValueError("Reporter must depend on the Analyst Step")
+                visualizer_step = next((step for step in plan.steps if step.agent == "Visualizer"), None)
+                reporter_step = next((step for step in plan.steps if step.agent == "Reporter"), None)
+                if visualizer_step is not None:
+                    if visualizer_step.depends_on != [analyst_step.step_id]:
+                        raise ValueError("Visualizer must depend on the Analyst Step")
+                    if visualizer_step.source_ids:
+                        raise ValueError("Visualizer Step must not name Data Sources; it consumes Findings")
+                if reporter_step is not None:
+                    required = [analyst_step.step_id] + ([visualizer_step.step_id] if visualizer_step else [])
+                    if set(reporter_step.depends_on) != set(required) or len(reporter_step.depends_on) != len(required):
+                        raise ValueError(
+                            "Reporter must depend on the Analyst and Visualizer Steps"
+                            if visualizer_step else "Reporter must depend on the Analyst Step"
+                        )
                     if reporter_step.source_ids:
                         raise ValueError("Reporter Step must not name Data Sources; it consumes Findings")
+                critic_step = next((step for step in plan.steps if step.agent == "Critic"), None)
+                if critic_step is not None:
+                    if reporter_step is None or critic_step.depends_on != [reporter_step.step_id]:
+                        raise ValueError("Critic must depend only on the Reporter Step")
+                    if critic_step.source_ids:
+                        raise ValueError("Critic Step must not name Data Sources; it consumes the draft Report")
 
         # Contract-invalid Plan output — malformed JSON or a structurally
         # valid Plan that still violates a Planner rule (unavailable Agent,
-        # unknown Data Source, wrong Phase 1 shape) — receives at most one
-        # repair retry, with the validation error fed back into the next
+        # unknown Data Source, wrong Phase 1 shape) — receives at most two
+        # repair retries, with the validation error fed back into the next
         # model call as feedback. Same policy already used for Fetcher/
         # Analyst Agent output (see FetcherAgent.run, AnalystAgent.run).
         # Free-tier models are more prone to this than larger ones, so this
         # matters more here even though the policy itself is pre-existing.
         result = None
         feedback = ""
-        for attempt in range(2):
+        for attempt in range(PLAN_ATTEMPTS):
             call_messages = messages if not feedback else messages + [
                 HumanMessage(
                     content=f"Your previous response was invalid: {feedback} "
@@ -214,7 +243,7 @@ class PlannerAgent:
                 except ValueError as exc:
                     self.last_validation_error = str(exc)
 
-            if attempt:
+            if attempt == PLAN_ATTEMPTS - 1:
                 raise RuntimeError(f"Planner LLM call failed: {self.last_validation_error}")
             self.validation_retries += 1
             feedback = self.last_validation_error

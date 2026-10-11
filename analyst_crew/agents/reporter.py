@@ -14,16 +14,20 @@ from typing import Any
 from langchain_core.runnables import RunnableLambda
 from pydantic import ValidationError
 
+from analyst_crew.agents.agent_support import (
+    catalog_prompt, format_failure, named_span, run_validated, summarize_schema_error,
+)
 from analyst_crew.agents.contracts import CREW_AGENTS, Crew, Handoff, Plan
 from analyst_crew.agents.resume import _resume_decision, execution_key
 from analyst_crew.llm import make_chat_model
 from analyst_crew.reporting.catalog import EvidenceCatalog, build_evidence_catalog
+from analyst_crew.reporting.charts import chart_set_reference, load_charts
+from analyst_crew.reporting.critique import Critique, report_items
 from analyst_crew.reporting.report import (
     Report, ReporterContent, build_fallback_report, build_report, validate_reporter_content,
 )
 from analyst_crew.state import CrewState
 from analyst_crew.tools.analysis import BaselineFindings
-from analyst_crew.tools.retry import invoke_with_optional_config, retry_with_backoff
 
 REPORTER_SYSTEM_PROMPT = """You are the Reporter Agent for Analyst Crew, a multi-agent data analysis copilot.
 
@@ -49,31 +53,13 @@ Rules:
    (the largest movers, the biggest misses against target) instead of one long list of numbers. Never place a
    number next to a name unless the two entries belong to the same driver or target row.
 6. State only what the entries support. Describe what changed; do not claim what caused it. CPI context is never causal.
-7. Methodology and Caveats are written by the system and always appear; do not restate them. You may add a Claim that
+7. When the Charts list below is not empty, a Claim may point the reader to a chart by writing {chart:<chart_id>}
+   with a chart_id from that list, for example "the revenue bridge is drawn in {chart:revenue_bridge}". Only use
+   listed chart ids, and never describe what a chart shows beyond the Evidence Entries the Claim cites. The Charts
+   section itself is assembled by the system. Methodology and Caveats are written by the system and always appear; do not restate them. You may add a Claim that
    comments on a caveat.
 8. Respond with a single JSON object and nothing else, in exactly this shape:
    {"summary": {"text": "...", "evidence_ids": ["E1"]}, "claims": [{"text": "...", "evidence_ids": ["E2", "E3"]}]}"""
-
-
-class TransientReporterError(Exception):
-    """Retryable Reporter provider failure."""
-
-
-def _is_transient_provider_error(exc: BaseException) -> bool:
-    if isinstance(exc, (TimeoutError, ConnectionError, TransientReporterError)):
-        return True
-    if any(cls.__name__ in {"APITimeoutError", "APIConnectionError"} for cls in type(exc).__mro__):
-        return True
-    status = getattr(exc, "status_code", None)
-    return isinstance(status, int) and (status in (408, 409, 429) or status >= 500)
-
-
-def _catalog_prompt(entries: list[Mapping[str, Any]]) -> str:
-    lines = []
-    for entry in entries:
-        flag = " [MATERIAL CHANGE]" if entry.get("material") else ""
-        lines.append(f"{entry['id']} | {entry['label']} | {entry['display']}{flag}")
-    return "\n".join(lines)
 
 
 def production_reporter_model() -> Any:
@@ -91,12 +77,32 @@ def production_reporter_model() -> Any:
     )
 
     def _invoke(context: dict[str, Any], config: Any = None) -> ReporterContent:
-        system = REPORTER_SYSTEM_PROMPT + "\n\nEvidence Catalog (id | label | display):\n" + _catalog_prompt(
-            context["evidence_catalog"]
+        charts = context.get("charts") or []
+        charts_text = "\n".join(f"{chart['chart_id']} | {chart['title']}" for chart in charts) or "none"
+        system = (
+            REPORTER_SYSTEM_PROMPT + "\n\nCharts (chart_id | title):\n" + charts_text
+            + "\n\nEvidence Catalog (id | label | display):\n" + catalog_prompt(context["evidence_catalog"])
         )
+        revision = context.get("revision")
+        revision_text = ""
+        if revision:
+            draft_lines = "\n".join(
+                f"{item['target']} | {item['text']} | cites: {', '.join(item['evidence_ids'])}" for item in revision["draft"]
+            )
+            issue_lines = "\n".join(
+                f"{found['target']} | {found['category']} | {found['rationale']}" for found in revision["issues"]
+            )
+            revision_text = (
+                "REVISION PASS. The Critic flagged issues in your draft. Rewrite the Summary and Findings so each "
+                "flagged item is corrected (soften or remove causal wording, fix misread evidence, drop overstatement). "
+                "All the rules above still apply: placeholders only, no digits, only catalog ids.\n"
+                f"Your draft (target | text | cited entries):\n{draft_lines}\n"
+                f"Issues (target | category | rationale):\n{issue_lines}\n"
+            )
         user = (
             f"User question: {context['user_question']}\n"
             f"Step objective: {context['step_objective']}\n"
+            f"{revision_text}"
             f"Validation feedback from a prior attempt (empty if this is the first): "
             f"{context.get('validation_feedback') or 'none'}\n"
             "Return the JSON object now."
@@ -109,10 +115,6 @@ def production_reporter_model() -> Any:
         return result
 
     return RunnableLambda(_invoke)
-
-
-def _summarize_schema_error(exc: ValidationError) -> str:
-    return "; ".join(f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}" for error in exc.errors())
 
 
 class ReporterAgent:
@@ -140,45 +142,68 @@ class ReporterAgent:
             "step_objective": handoff.step.objective,
             "user_question": handoff.user_question,
             "evidence_catalog": [entry.model_dump() for entry in catalog.entries],
+            "charts": _handoff_charts(handoff),
         }
-        feedback = ""
-        for attempt in range(2):
-            calls = 0
+        chart_ids = {chart["chart_id"] for chart in context["charts"]}
 
-            def call() -> Any:
-                nonlocal calls
-                calls += 1
-                return invoke_with_optional_config(self.model, {**context, "validation_feedback": feedback}, config)
-
+        def parse(raw: Any) -> ReporterContent:
             try:
-                # A ValueError out of the model call means the response itself was unusable
-                # (e.g. unparseable JSON), so it takes the validation-retry path; provider
-                # failures are other exception types and are retried (or not) below.
-                try:
-                    raw, _ = retry_with_backoff(
-                        call,
-                        is_transient=_is_transient_provider_error,
-                        max_attempts=self.max_provider_attempts,
-                        backoff_seconds=self.backoff_seconds,
-                    )
-                finally:
-                    # Counted even when the bounded retries are exhausted and the call raises.
-                    self.tool_retries += calls - 1
-                try:
-                    content = raw if isinstance(raw, ReporterContent) else ReporterContent.model_validate(raw)
-                except ValidationError as exc:
-                    raise ValueError(f"response does not match the required JSON shape: {_summarize_schema_error(exc)}") from exc
-                return validate_reporter_content(content, catalog)
-            except ValueError as exc:
-                self.last_validation_error = str(exc)
-                if attempt:
-                    raise
-                self.validation_retries += 1
-                feedback = (
-                    f"Your previous response was invalid: {exc}. Return the corrected JSON object only, "
-                    "with no digits outside {E<id>} placeholders and only ids from the catalog."
-                )
-        raise RuntimeError("Reporter request loop exhausted")
+                content = raw if isinstance(raw, ReporterContent) else ReporterContent.model_validate(raw)
+            except ValidationError as exc:
+                raise ValueError(f"response does not match the required JSON shape: {summarize_schema_error(exc)}") from exc
+            return validate_reporter_content(content, catalog, chart_ids)
+
+        return run_validated(
+            self, context, parse, label="Reporter", config=config,
+            retry_hint=(
+                "Return the corrected JSON object only, with no digits outside {E<id>} placeholders, "
+                "only ids from the catalog and only chart ids from the Charts list."
+            ),
+        )
+
+
+REVISION_RUN_NAME = "Reporter (revision)"
+
+
+def revise_content(model: Any, handoff: Handoff, catalog: EvidenceCatalog, draft: Report, critique: Critique,
+                   *, config: Any = None) -> ReporterContent:
+    """One Reporter revision of ``draft`` against ``critique`` (Crew-internal, not a Step).
+
+    A single model call with no retry: the result is validated by exactly the rules the first draft meets
+    (``validate_reporter_content`` with the draft's chart ids) and any failure raises, so the caller keeps the
+    draft. The call is its own run labelled ``Reporter (revision)`` so it shows as a second Reporter span.
+    """
+    chart_ids = {chart.chart_id for chart in draft.charts}
+    context = {
+        "step_objective": handoff.step.objective,
+        "user_question": handoff.user_question,
+        "evidence_catalog": [entry.model_dump() for entry in catalog.entries],
+        "charts": [{"chart_id": chart.chart_id, "title": chart.title} for chart in draft.charts],
+        "validation_feedback": "",
+        "revision": {
+            "issues": [issue.model_dump() for issue in critique.issues],
+            "draft": [
+                {"target": target, "text": claim.text, "evidence_ids": claim.evidence_ids}
+                for target, claim in report_items(draft)
+            ],
+        },
+    }
+    raw = named_span(model, REVISION_RUN_NAME, ["agent:Reporter", "revision"]).invoke(context, config)
+    try:
+        content = raw if isinstance(raw, ReporterContent) else ReporterContent.model_validate(raw)
+    except ValidationError as exc:
+        raise ValueError(f"revision does not match the required JSON shape: {summarize_schema_error(exc)}") from exc
+    return validate_reporter_content(content, catalog, chart_ids)
+
+
+def _handoff_charts(handoff: Handoff) -> list[dict[str, str]]:
+    """Chart ids and titles the Handoff carries from the Visualizer output."""
+    return [
+        {"chart_id": chart["chart_id"], "title": chart["title"]}
+        for reference in handoff.input_artifacts.values()
+        if isinstance(reference, Mapping) and reference.get("kind") == "Chart Artifacts"
+        for chart in reference.get("charts", [])
+    ]
 
 
 def findings_hash(findings: BaselineFindings) -> str:
@@ -221,6 +246,12 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
         analyst_step = next((step for step in plan.steps if step.agent == "Analyst"), None)
         findings_names = (analyst_step.declared_artifacts or [analyst_step.expected_output]) if analyst_step else []
         analysis_parameters = dict(configurable.get("analysis_parameters", {}))
+        # Charts come from the Visualizer Step (when the Plan has one); the Report only references them.
+        visualizer_step = next((step for step in plan.steps if step.agent == "Visualizer"), None)
+        charts = load_charts(artifacts.get("charts")) if visualizer_step is not None else []
+        chart_refs = [chart.reference() for chart in charts]
+        chart_mode = artifacts.get("chart_mode")  # build_report drops it when there are no charts
+        chart_names = (visualizer_step.declared_artifacts or [visualizer_step.expected_output]) if visualizer_step else []
         crew = Crew(
             available_agents=configurable.get("available_agents", CREW_AGENTS),
             data_sources=configurable.get("data_sources", {}),
@@ -229,14 +260,16 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
         try:
             handoff = crew.resolve_handoff(
                 reporter_step, plan,
-                {**artifacts.get("step_outputs", {}), **{name: findings_reference for name in findings_names}},
+                {**artifacts.get("step_outputs", {}), **{name: findings_reference for name in findings_names},
+                 **{name: chart_set_reference(charts) for name in chart_names}},
                 analysis_parameters,
             )
         except ValueError as exc:
             # The Findings and catalog are fine, so this still degrades to a Fallback Report below.
             handoff_error = exc
         current_key = execution_key(
-            reporter_step, analysis_parameters=analysis_parameters, input_artifact_hashes=[current_hash],
+            reporter_step, analysis_parameters=analysis_parameters,
+            input_artifact_hashes=[current_hash, *(chart.content_hash for chart in charts)],
         )
         resume_outcome, resume_reason = _resume_decision(state, reporter_step.step_id, current_key)
 
@@ -245,7 +278,8 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
         if handoff_error is not None and resume_outcome == "reused":
             resume_outcome, resume_reason = "recomputed", "invalidated"
         if resume_outcome == "reused":
-            stored = artifacts.get("report")
+            # The Critic may have stored a Report with Reviewer Notes under "report"; reuse the draft.
+            stored = artifacts.get("draft_report") or artifacts.get("report")
             if stored is None:
                 # Defensive: never trust a reuse we cannot actually produce output for.
                 resume_outcome, resume_reason = "recomputed", "invalidated"
@@ -262,25 +296,23 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
                 model = configurable.get("reporter_model") or production_reporter_model()
                 agent = ReporterAgent(model)
                 content = agent.run(handoff, catalog, config=config)
-                report = build_report(content, catalog, plan.user_question)
+                report = build_report(content, catalog, plan.user_question, chart_refs, chart_mode)
             except Exception as exc:  # noqa: BLE001 — any Reporter failure degrades visibly, never silently
                 failure = exc
-                report = build_fallback_report(catalog, plan.user_question)
+                report = build_fallback_report(catalog, plan.user_question, chart_refs, chart_mode)
             retry_counts = {
                 "validation_retries": getattr(agent, "validation_retries", 0),
                 "tool_retries": getattr(agent, "tool_retries", 0),
             }
 
         completed = failure is None
-        failure_message = (
-            str(failure) if isinstance(failure, (RuntimeError, ValueError)) or failure is None
-            else f"{type(failure).__name__}: {failure}"
-        )
+        failure_message = None if completed else format_failure(failure)
         return {
             "current_step": "reporter_node",
             "steps_completed": [reporter_step.step_id] if completed else [],
             "artifacts": {
                 "report": report,
+                "draft_report": report,
                 "report_mode": report.report_mode,
                 "evidence_catalog": catalog,
                 "terminal_failure": None if completed else {
@@ -300,7 +332,7 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
                     reporter_step.step_id: {
                         "status": "completed" if completed else "failed",
                         "artifact_ids": reporter_step.declared_artifacts or [reporter_step.expected_output],
-                        "input_artifact_ids": [findings_reference["artifact_id"]],
+                        "input_artifact_ids": [findings_reference["artifact_id"], *(chart.artifact_id for chart in charts)],
                         "retry_counts": retry_counts,
                         "execution_key": current_key,
                         "resume_outcome": resume_outcome,

@@ -118,6 +118,7 @@ def test_forced_reporter_failure_records_report_mode_and_failure_on_the_trace(tm
         "thread_id": f"forced-failure-{uuid.uuid4().hex[:8]}",
         "data_sources": sales_data_source(source),
         "artifact_dir": tmp_path / "artifacts",
+        "available_agents": ["Fetcher", "Analyst", "Reporter"],
         "planner_model": ScriptedPlannerModel(crew_plan()),
         "fetcher_model": ScriptedFetcherModel(),
         "analyst_model": ScriptedAnalystModel(),

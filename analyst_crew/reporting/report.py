@@ -8,11 +8,14 @@ Rendering is a pure function of the stored Report and the catalog.
 from __future__ import annotations
 
 import re
+from collections.abc import Collection, Mapping
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
 from analyst_crew.reporting.catalog import EvidenceCatalog, EvidenceEntry
+from analyst_crew.reporting.charts import ChartReference
+from analyst_crew.reporting.critique import CritiqueIssue, target_label
 
 PLACEHOLDER = re.compile(r"\{([^{}]*)\}")
 
@@ -20,7 +23,11 @@ FALLBACK_NOTICE = (
     "This Report was generated without the Reporter Agent. It is a deterministic template built directly "
     "from the computed Findings, not a written analysis."
 )
-CHARTS_NOTICE = "Reserved. Charts are not generated yet; no Visualizer Agent is part of the Crew."
+FALLBACK_CHARTS_NOTE = (
+    "Fallback chart set: chosen by code from the Evidence Catalog, with no Visualizer judgment. "
+    "Every plotted value is an Evidence Entry value."
+)
+CHARTS_NOTICE = "No charts were produced for this Report."
 
 
 class CitedText(BaseModel):
@@ -33,7 +40,10 @@ class CitedText(BaseModel):
 
 class Claim(CitedText):
     """One item of the Summary or the Findings section, written by the Reporter
-    (or, in a Fallback Report, by a fixed template)."""
+    (or, in a Fallback Report, by a fixed template). ``chart_ids`` lists the charts its
+    text mentions by ``{chart:<id>}`` placeholder; they are references, never evidence."""
+
+    chart_ids: list[str] = Field(default_factory=list)
 
 
 class ReportLine(CitedText):
@@ -54,9 +64,12 @@ class Report(BaseModel):
     question: str
     summary: Claim
     findings: list[Claim]
-    charts: list[str] = Field(default_factory=list)
+    charts: list[ChartReference] = Field(default_factory=list)
+    chart_mode: Literal["llm", "fallback"] | None = None
     caveats: list[ReportLine]
     methodology: list[ReportLine]
+    # Critique issues that remain; the section is absent when empty (set only by the Critic Step).
+    reviewer_notes: list[CritiqueIssue] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def fallback_is_marked(self) -> "Report":
@@ -92,13 +105,19 @@ def template_line(text: str) -> ReportLine:
     return ReportLine(text=text, evidence_ids=_cited_ids(text))
 
 
-def validate_reporter_content(content: ReporterContent, catalog: EvidenceCatalog) -> ReporterContent:
+CHART_PREFIX = "chart:"
+
+
+def validate_reporter_content(content: ReporterContent, catalog: EvidenceCatalog,
+                              chart_ids: Collection[str] = ()) -> ReporterContent:
     """Enforce the ADR-0002 rules and return the content with each Claim's
     ``evidence_ids`` completed with every id its text places.
 
     Rules: every cited id and every placeholder exists in the catalog; no digit
     remains once placeholders are removed (no number parsing, no tolerance); no
-    stray braces; every Claim cites evidence; there is at least one Claim.
+    stray braces; every Claim cites evidence; there is at least one Claim. A
+    ``{chart:<id>}`` placeholder must name one of ``chart_ids`` (the charts the
+    Handoff carries); it is a reference, so it is neither evidence nor a number.
     """
     known = catalog.ids
     errors: list[str] = []
@@ -106,7 +125,13 @@ def validate_reporter_content(content: ReporterContent, catalog: EvidenceCatalog
     def check(name: str, claim: Claim) -> Claim:
         if not claim.text.strip():
             errors.append(f"{name} has no text")
-        placed = placeholders_in(claim.text)
+        all_placed = placeholders_in(claim.text)
+        placed_charts = [p[len(CHART_PREFIX):] for p in all_placed if p.startswith(CHART_PREFIX)]
+        placed = [p for p in all_placed if not p.startswith(CHART_PREFIX)]
+        for chart_id in placed_charts:
+            if chart_id not in chart_ids:
+                errors.append(f"{name} references chart '{chart_id}', which is not a chart of this Report "
+                              f"(available chart ids: {', '.join(sorted(chart_ids)) or 'none'})")
         for entry_id in placed:
             if entry_id not in known:
                 errors.append(f"{name} uses placeholder '{{{entry_id}}}', which is not an Evidence Entry id")
@@ -124,7 +149,8 @@ def validate_reporter_content(content: ReporterContent, catalog: EvidenceCatalog
                 errors.append(f"{name} cites unknown Evidence Entry id '{entry_id}'")
         if not claim.evidence_ids and not placed:
             errors.append(f"{name} cites no Evidence Entry")
-        return Claim(text=claim.text, evidence_ids=list(dict.fromkeys([*claim.evidence_ids, *placed])))
+        return Claim(text=claim.text, evidence_ids=list(dict.fromkeys([*claim.evidence_ids, *placed])),
+                     chart_ids=list(dict.fromkeys(placed_charts)))
 
     summary = check("Summary", content.summary)
     claims = [check(f"Claim {index}", claim) for index, claim in enumerate(content.claims, start=1)]
@@ -209,15 +235,24 @@ def assemble_methodology(catalog: EvidenceCatalog) -> list[ReportLine]:
     return [template_line(line) for line in lines]
 
 
-def build_report(content: ReporterContent, catalog: EvidenceCatalog, question: str) -> Report:
-    """An ``llm``-mode Report: model-written Summary and Claims, code-assembled rest."""
+def _chart_mode(charts: list[ChartReference] | None, chart_mode: str | None) -> str | None:
+    """``chart_mode`` describes the charts, so a Report without charts carries none."""
+    return chart_mode if charts else None
+
+
+def build_report(content: ReporterContent, catalog: EvidenceCatalog, question: str,
+                 charts: list[ChartReference] | None = None, chart_mode: str | None = None) -> Report:
+    """An ``llm``-mode Report: model-written Summary and Claims, code-assembled rest.
+    ``charts`` are the Chart Artifact references for the code-assembled Charts section."""
     return Report(
         report_mode="llm", question=question, summary=content.summary, findings=content.claims,
+        charts=charts or [], chart_mode=_chart_mode(charts, chart_mode),
         caveats=assemble_caveats(catalog), methodology=assemble_methodology(catalog),
     )
 
 
-def build_fallback_report(catalog: EvidenceCatalog, question: str) -> Report:
+def build_fallback_report(catalog: EvidenceCatalog, question: str,
+                          charts: list[ChartReference] | None = None, chart_mode: str | None = None) -> Report:
     """Deterministic template Report: fixed Summary (window and net revenue
     change), Material Changes as templated Claims, plus the same code-assembled
     Caveats and Methodology. Visibly marked as generated without the Reporter."""
@@ -276,22 +311,27 @@ def build_fallback_report(catalog: EvidenceCatalog, question: str) -> Report:
 
     return Report(
         report_mode="fallback", fallback_notice=FALLBACK_NOTICE, question=question, summary=summary,
-        findings=claims, caveats=assemble_caveats(catalog), methodology=assemble_methodology(catalog),
+        findings=claims, charts=charts or [], chart_mode=_chart_mode(charts, chart_mode),
+        caveats=assemble_caveats(catalog), methodology=assemble_methodology(catalog),
     )
 
 
-def _substitute(text: str, catalog: EvidenceCatalog) -> str:
+def substitute(text: str, catalog: EvidenceCatalog, charts: Mapping[str, str] | None = None) -> str:
     def replace(match: re.Match[str]) -> str:
-        entry = catalog.get(match.group(1))
+        token = match.group(1)
+        if token.startswith(CHART_PREFIX):
+            title = (charts or {}).get(token[len(CHART_PREFIX):])
+            return match.group(0) if title is None else f"\u201c{title}\u201d"
+        entry = catalog.get(token)
         return match.group(0) if entry is None else entry.display
 
     return PLACEHOLDER.sub(replace, text)
 
 
-def _sentence(text: str, catalog: EvidenceCatalog) -> str:
+def _sentence(text: str, catalog: EvidenceCatalog, charts: Mapping[str, str] | None = None) -> str:
     """Substituted text with its first letter capitalised, because a placeholder
     (a lower-cased dimension value, say) may open the sentence."""
-    text = _substitute(text, catalog)
+    text = substitute(text, catalog, charts)
     return text[:1].upper() + text[1:]
 
 
@@ -306,17 +346,32 @@ def _citation(claim: Claim) -> str:
 def render_report(report: Report, catalog: EvidenceCatalog) -> str:
     """Markdown for a stored Report. A pure function of the Report and the
     catalog; no model is ever involved."""
+    titles = {chart.chart_id: chart.title for chart in report.charts}
     lines: list[str] = ["# Analyst Crew Report", ""]
     if report.fallback_notice:
         lines += [f"> **Fallback Report.** {report.fallback_notice}", ""]
     lines += [f"**Question:** {report.question}", "", "## Summary", "",
-              _sentence(report.summary.text, catalog) + _citation(report.summary), "", "## Findings", ""]
-    lines += [f"{number}. {_sentence(claim.text, catalog)}{_citation(claim)}"
+              _sentence(report.summary.text, catalog, titles) + _citation(report.summary), "", "## Findings", ""]
+    lines += [f"{number}. {_sentence(claim.text, catalog, titles)}{_citation(claim)}"
               for number, claim in enumerate(report.findings, start=1)]
     lines += ["", "## Charts", ""]
-    lines += [f"- {chart}" for chart in report.charts] or [f"_{CHARTS_NOTICE}_"]
-    lines += ["", "## Caveats", ""] + [f"- {_substitute(claim.text, catalog)}" for claim in report.caveats]
-    lines += ["", "## Methodology", ""] + [f"- {_substitute(claim.text, catalog)}" for claim in report.methodology]
+    if report.charts:
+        if report.chart_mode == "fallback":
+            lines += [f"_{FALLBACK_CHARTS_NOTE}_", ""]
+        for chart in report.charts:
+            lines += [f"![{chart.title}]({chart.filename})", ""]
+        lines.pop()
+    else:
+        lines.append(f"_{CHARTS_NOTICE}_")
+    lines += ["", "## Caveats", ""] + [f"- {substitute(claim.text, catalog)}" for claim in report.caveats]
+    lines += ["", "## Methodology", ""] + [f"- {substitute(claim.text, catalog)}" for claim in report.methodology]
+
+    if report.reviewer_notes:
+        lines += ["", "## Reviewer Notes", ""]
+        lines += [
+            f"- **{target_label(note.target)}** ({note.category.replace('_', ' ')}): {_sentence(note.rationale, catalog)}"
+            for note in report.reviewer_notes
+        ]
 
     cited = {entry_id for claim in [report.summary, *report.findings] for entry_id in claim.evidence_ids}
     evidence = [entry for entry in catalog.entries if entry.id in cited]

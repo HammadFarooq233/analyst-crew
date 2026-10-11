@@ -86,8 +86,14 @@ A durable, content-addressed rendered image of one Chart Spec. The Report's Char
 _Avoid_: Chart image, figure
 
 **Critique**:
-The Critic's structured verdict on a draft Report: a list of issues, each pointing at a Claim. Triggers at most one Reporter revision pass; issues that remain afterwards are shown in the Report as unresolved Reviewer Notes.
+The Critic's structured verdict on a draft Report: a list of issues, each pointing at a Claim. Triggers at most one Reporter revision pass. The Critic then reviews the revised Report once more (the re-review); issues it still flags are shown in the Report as unresolved Reviewer Notes. A rationale is a note, not Report body text: it may contain digits and is truncated if over-long.
 _Avoid_: Review, feedback
+
+**critic_outcome**:
+How the Critic pass ended, recorded in run metadata. `clean`: the first Critique had no issues and the draft shipped. `revised`: the Critique had issues, one Reporter revision was made and the re-review found none. `unresolved`: issues remain after the re-review, the revision or re-review failed, or the draft was a Fallback Report (which is never revised); the remaining issues are Reviewer Notes. `failed`: the Critic itself failed, the un-reviewed Report shipped and the failure is recorded (`critic_failure`).
+
+**chart_mode**:
+How the Report's charts were chosen, recorded on the Report and in run metadata. `llm`: the Visualizer selected them. `fallback`: the Visualizer failed and code built the deterministic fallback chart set. Absent when the Report has no charts.
 
 **Reviewer Notes**:
 The Report section listing Critique issues the revision pass did not resolve. Absent when the Critique is clean.

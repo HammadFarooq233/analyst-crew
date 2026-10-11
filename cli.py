@@ -1,5 +1,6 @@
 import argparse
 import os
+import shutil
 import sys
 import uuid
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 import config  # noqa: F401 — triggers load_dotenv()
 from analyst_crew.agents import invoke
 from analyst_crew.reporting.catalog import EvidenceCatalog, build_evidence_catalog
+from analyst_crew.reporting.charts import ChartArtifact, load_charts
 from analyst_crew.reporting.report import Report, render_report
 from analyst_crew.tools.analysis import BaselineFindings
 
@@ -72,6 +74,37 @@ def rendered_report(result) -> str | None:
     return render_report(report, catalog)
 
 
+def stored_charts(result) -> list[ChartArtifact]:
+    """The Chart Artifacts referenced by the Report in this result (none for a Crew without a Visualizer)."""
+    artifacts = result.get("artifacts", {})
+    report = artifacts.get("report")
+    if report is None:
+        return []
+    referenced = {ref.artifact_id for ref in (report if isinstance(report, Report) else Report.model_validate(report)).charts}
+    return [chart for chart in load_charts(artifacts.get("charts")) if chart.artifact_id in referenced]
+
+
+def format_charts(result) -> str:
+    """Chart titles and the paths of the stored PNGs, listed under the rendered Report."""
+    charts = stored_charts(result)
+    if not charts:
+        return ""
+    mode = (result.get("artifacts") or {}).get("chart_mode")
+    prefix = f"\nchart_mode: {mode}" if mode else ""
+    return prefix + "\nCharts generated:\n" + "\n".join(f"  - {chart.spec.title}: {chart.location}" for chart in charts)
+
+
+def save_charts(result, directory: Path) -> list[Path]:
+    """Copy the Report's chart PNGs beside the saved Markdown so its relative image links resolve."""
+    saved = []
+    for chart in stored_charts(result):
+        target = directory / chart.filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(chart.location, target)
+        saved.append(target)
+    return saved
+
+
 def format_reporter_failure(failure) -> str:
     retry_counts = failure.get("retry_counts") or {}
     validation, provider = retry_counts.get("validation_retries", 0), retry_counts.get("tool_retries", 0)
@@ -81,6 +114,17 @@ def format_reporter_failure(failure) -> str:
         f"{failure.get('error', 'unknown error')}. The Fallback Report above was generated without the "
         "Reporter Agent; the failure is recorded in the returned state and on the trace."
     )
+
+
+def format_critic_failure(result) -> str:
+    """A visible note that the Critic failed and the Report above was not reviewed (the run itself succeeded)."""
+    artifacts = result.get("artifacts", {})
+    if artifacts.get("critic_outcome") != "failed":
+        return ""
+    error = next((o.get("error") for o in artifacts.get("step_outcomes", {}).values()
+                  if o.get("critic_outcome") == "failed"), None)
+    return (f"\nThe Critic Agent failed ({error or 'unknown error'}), so the Report above was not reviewed. "
+            "The failure is recorded in the returned state and on the trace.\n")
 
 
 def _findings(artifacts) -> BaselineFindings:
@@ -98,6 +142,8 @@ def format_result(result) -> str:
 
     report = rendered_report(result)
     if report is not None:
+        report += format_charts(result)
+        report += format_critic_failure(result)
         if terminal_failure is not None:
             return f"{report}\n{format_reporter_failure(terminal_failure)}"
         return report
@@ -321,6 +367,8 @@ def main() -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(report, encoding="utf-8")
             print(f"Report saved to {path}", file=sys.stderr)
+            for chart_path in save_charts(result, path.parent):
+                print(f"Chart saved to {chart_path}", file=sys.stderr)
 
     terminal_failure = artifacts.get("terminal_failure")
     required_failure = terminal_failure is not None and terminal_failure.get("required", True)

@@ -7,7 +7,7 @@ from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 AGENTS = ("Fetcher", "Analyst", "Visualizer", "Critic", "Reporter")
 PHASE1_AGENTS = ("Fetcher", "Analyst")
-PHASE2_AGENTS = ("Fetcher", "Analyst", "Reporter")
+PHASE2_AGENTS = ("Fetcher", "Analyst", "Visualizer", "Reporter", "Critic")
 # The Agents the Crew can currently execute; the Planner may only assign Steps to these.
 CREW_AGENTS = PHASE2_AGENTS
 

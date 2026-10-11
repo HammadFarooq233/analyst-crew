@@ -13,7 +13,7 @@ from analyst_crew.agents import Plan
 from analyst_crew.agents.planner import PlannerAgent
 from analyst_crew.agents.tracing import _run_metadata
 from analyst_crew.reporting.catalog import EvidenceCatalog
-from analyst_crew.reporting.report import Report, render_report
+from analyst_crew.reporting.report import CHARTS_NOTICE, Report, render_report
 from analyst_crew.tools.fred import fred_cpi_data_source
 from analyst_crew.tools.sales import sales_data_source
 from analyst_crew.tools.targets import sales_targets_data_source
@@ -83,18 +83,18 @@ class TestValidReporter:
         assert handoff["user_question"] == QUESTION
         assert "sales.csv" not in str(handoff)
 
-    def test_charts_section_is_explicitly_reserved_and_empty(self, source, tmp_path, monkeypatch):
+    def test_charts_section_says_no_charts_were_produced(self, source, tmp_path, monkeypatch):
         result, _ = run_crew(source, tmp_path, monkeypatch)
 
         report, _, rendered = _report_and_catalog(result)
         assert report.charts == []
-        assert "## Charts" in rendered and "Reserved" in rendered
+        assert "## Charts" in rendered and CHARTS_NOTICE in rendered
 
     def test_the_model_sees_only_the_catalog_the_question_and_the_objective(self, source, tmp_path, monkeypatch):
         _, reporter = run_crew(source, tmp_path, monkeypatch)
 
         context = reporter.contexts[0]
-        assert set(context) == {"step_objective", "user_question", "evidence_catalog", "validation_feedback"}
+        assert set(context) == {"step_objective", "user_question", "evidence_catalog", "charts", "validation_feedback"}
         assert context["user_question"] == QUESTION
         assert all({"id", "label", "display", "source"} <= set(entry) for entry in context["evidence_catalog"])
         assert "sales.csv" not in str(context)

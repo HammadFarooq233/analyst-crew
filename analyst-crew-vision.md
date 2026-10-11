@@ -207,7 +207,7 @@ progresses. Update this table, don't just the roadmap above.
 | --------------------------- | ----------- | --------------------------------------------------------- |
 | 0 – Walking skeleton        | Complete*   | Implemented across commits; infrastructure is runnable    |
 | 1 – Real tool use           | Complete    | Live acceptance passed 2026-09-19 (see docs/phase-1-acceptance-status.md) |
-| 2 – Full orchestration      | In progress | Slice 1 (Reporter, issue #13) done: cited Reports over an Evidence Catalog, live-accepted 2026-09-20 (see docs/phase-2-reporter-acceptance-status.md). Visualizer and Critic still to join (spec: GitHub issue #14; see ADR-0003) |
+| 2 – Full orchestration      | Complete    | All six Agents run end to end: Visualizer (LLM selects, code supplies data, PNG Chart Artifacts), Reporter (cited Reports, chart references, one bounded revision) and Critic (no Tools, Critique, Reviewer Notes). Live acceptance passed 2026-10-11 (see docs/phase-2-acceptance-status.md; spec issue #14, ADR-0003). Not exercised live: FRED CPI path |
 | 3 – Memory, deepened        | Not started |                                                           |
 | 4 – Observability, deepened | Not started |                                                           |
 | 5 – Evals                   | Not started |                                                           |

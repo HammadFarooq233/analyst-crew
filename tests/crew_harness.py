@@ -40,17 +40,26 @@ def base_rows():
     ]
 
 
-def crew_plan(*, reporter=True):
+FULL_AGENTS = ("Fetcher", "Analyst", "Visualizer", "Reporter")
+
+
+def crew_plan(*, reporter=True, visualizer=False):
     steps = [
         Step(step_id="fetch_sales", agent="Fetcher", objective="Fetch normalized sales",
              source_ids=["sales_csv"], expected_output="sales_dataset", declared_artifacts=["sales_dataset"]),
         Step(step_id="analyze_baseline", agent="Analyst", objective="Compare baseline sales periods",
              expected_output="baseline_findings", declared_artifacts=["baseline_findings"], depends_on=["fetch_sales"]),
     ]
+    if visualizer:
+        steps.append(Step(
+            step_id="visualize_findings", agent="Visualizer", objective="Chart the revenue change from the Findings",
+            expected_output="sales_charts", declared_artifacts=["sales_charts"], depends_on=["analyze_baseline"],
+        ))
     if reporter:
         steps.append(Step(
             step_id="write_report", agent="Reporter", objective="Write the cited Report",
-            expected_output="sales_report", declared_artifacts=["sales_report"], depends_on=["analyze_baseline"],
+            expected_output="sales_report", declared_artifacts=["sales_report"],
+            depends_on=["analyze_baseline", "visualize_findings"] if visualizer else ["analyze_baseline"],
         ))
     return Plan(steps=steps, user_question=QUESTION)
 
@@ -159,12 +168,16 @@ USE_DEFAULT = object()
 
 def run_crew(source, tmp_path, monkeypatch, *, thread_id="thread-1", as_of_date="2025-06-30", checkpointer=None,
              plan=None, reporter_model=USE_DEFAULT, planner_model=None, fetcher_model=None, analyst_model=None,
-             extra_sources=None, available_agents=("Fetcher", "Analyst", "Reporter")):
+             extra_sources=None, available_agents=("Fetcher", "Analyst", "Reporter"), visualizer_model=USE_DEFAULT,
+             critic_model=None, callbacks=None):
     planner_model = planner_model or ScriptedPlannerModel(plan or crew_plan())
     fetcher_model = fetcher_model or ScriptedFetcherModel()
     analyst_model = analyst_model or ScriptedAnalystModel()
     if reporter_model is USE_DEFAULT:
         reporter_model = ScriptedReporterModel()
+    if visualizer_model is USE_DEFAULT:
+        # Offline default: the Visualizer model is unavailable, so a Visualizer Step uses the fallback chart set.
+        visualizer_model = ScriptedVisualizerModel()
     monkeypatch.setenv("POSTGRES_CONNECTION_STRING", "")
     monkeypatch.setenv("LANGFUSE_HOST", "")
     monkeypatch.delenv("FRED_API_KEY", raising=False)
@@ -178,8 +191,14 @@ def run_crew(source, tmp_path, monkeypatch, *, thread_id="thread-1", as_of_date=
         "analyst_model": analyst_model,
         "analysis_parameters": {"as_of_date": as_of_date},
     }}
+    if callbacks:
+        runtime["callbacks"] = list(callbacks)
     if reporter_model is not None:
         runtime["configurable"]["reporter_model"] = reporter_model
+    if visualizer_model is not None:
+        runtime["configurable"]["visualizer_model"] = visualizer_model
+    if critic_model is not None:
+        runtime["configurable"]["critic_model"] = critic_model
     result = planner_module.invoke(QUESTION, runtime, checkpointer=checkpointer or MemorySaver())
     return result, reporter_model
 
@@ -193,4 +212,28 @@ def body_numbers(rendered):
     appendix and the `[E3]` citation markers."""
     body = rendered.split("## Evidence")[0]
     body = re.sub(r"`\[[^\]]*\]`", "", body)
+    # Chart image links carry content-hash filenames; the title shown to the reader stays in the check.
+    body = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", body)
     return re.findall(r"\d+(?:,\d{3})*(?:\.\d+)?", body)
+
+
+class ScriptedVisualizerModel:
+    """Plays back one response per call (the last repeats), like ``ScriptedReporterModel``. A response may be a
+    ``VisualizerContent``, a dict, an Exception to raise, or a callable taking the Visualizer's context."""
+
+    def __init__(self, *responses):
+        self.responses = list(responses) or [ConnectionError("no Visualizer model scripted")]
+        self.contexts = []
+
+    @property
+    def calls(self):
+        return len(self.contexts)
+
+    def invoke(self, context):
+        self.contexts.append(context)
+        response = self.responses[min(len(self.contexts), len(self.responses)) - 1]
+        if callable(response):
+            response = response(context)
+        if isinstance(response, BaseException):
+            raise response
+        return response

@@ -80,6 +80,11 @@ class EvidenceEntry(BaseModel):
     group: str | None = None
     material: bool = False
 
+    @property
+    def is_numeric(self) -> bool:
+        """True when ``value`` is a plottable number (a bool is not)."""
+        return isinstance(self.value, (int, float)) and not isinstance(self.value, bool)
+
 
 class EvidenceCatalog(BaseModel):
     entries: list[EvidenceEntry]

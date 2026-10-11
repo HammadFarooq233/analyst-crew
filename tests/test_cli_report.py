@@ -2,14 +2,17 @@
 file only when asked, and shows a Fallback Report with a concise failure line
 when the Reporter fails. Driven through ``cli.main()`` against the real graph
 with scripted models injected into the config ``cli`` builds."""
+import re
+
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 
 import analyst_crew.agents as agents
 import cli
+from analyst_crew.reporting.report import CHARTS_NOTICE
 from tests.crew_harness import (
-    QUESTION, ScriptedAnalystModel, ScriptedFetcherModel, ScriptedPlannerModel, ScriptedReporterModel, base_rows,
-    crew_plan, write_sales,
+    FULL_AGENTS, QUESTION, ScriptedAnalystModel, ScriptedFetcherModel, ScriptedPlannerModel, ScriptedReporterModel,
+    ScriptedVisualizerModel, base_rows, crew_plan, write_sales,
 )
 
 
@@ -30,9 +33,10 @@ def _run_cli(monkeypatch, tmp_path, capsys, *extra_args, reporter=None, plan=Non
         config["configurable"].update(
             planner_model=ScriptedPlannerModel(plan or crew_plan()), fetcher_model=ScriptedFetcherModel(),
             analyst_model=ScriptedAnalystModel(), reporter_model=reporter,
+            visualizer_model=ScriptedVisualizerModel(),  # offline: no model, so the fallback chart set
         )
-        if available_agents:
-            config["configurable"]["available_agents"] = available_agents
+        # A Crew without the Visualizer unless a test asks for one: the default Plan has no Visualizer Step.
+        config["configurable"]["available_agents"] = available_agents or ["Fetcher", "Analyst", "Reporter"]
         return agents.invoke(question, config, checkpointer=MemorySaver())
 
     monkeypatch.setattr(cli, "invoke", scripted_invoke)
@@ -98,7 +102,8 @@ def test_required_source_failures_still_print_only_the_terminal_failure_and_exit
     monkeypatch.setenv("POSTGRES_CONNECTION_STRING", "")
     monkeypatch.setenv("LANGFUSE_HOST", "")
     monkeypatch.setattr(cli, "invoke", lambda question, config: agents.invoke(question, {"configurable": {
-        **config["configurable"], "planner_model": ScriptedPlannerModel(crew_plan()), "fetcher_model": BrokenFetcher(),
+        **config["configurable"], "available_agents": ["Fetcher", "Analyst", "Reporter"],
+        "planner_model": ScriptedPlannerModel(crew_plan()), "fetcher_model": BrokenFetcher(),
         "analyst_model": ScriptedAnalystModel(), "reporter_model": ScriptedReporterModel(),
     }}, checkpointer=MemorySaver()))
     monkeypatch.setattr("sys.argv", ["cli", "--question", QUESTION, "--sales-csv", str(source),
@@ -126,3 +131,41 @@ def test_without_a_reporter_step_the_findings_summary_is_still_printed(monkeypat
 
     assert exit_code == 0
     assert "Baseline sales Findings" in out and "## Summary" not in out
+
+
+def _full_cli(monkeypatch, tmp_path, capsys, *extra_args):
+    return _run_cli(monkeypatch, tmp_path, capsys, *extra_args, plan=crew_plan(visualizer=True),
+                    available_agents=list(FULL_AGENTS))
+
+
+def test_default_output_lists_chart_titles_and_paths(monkeypatch, tmp_path, capsys):
+    out, _, exit_code = _full_cli(monkeypatch, tmp_path, capsys)
+
+    assert exit_code == 0
+    assert "## Charts" in out and CHARTS_NOTICE not in out
+    listing = out.split("Charts generated:")[1].strip().splitlines()
+    assert len(listing) == 2
+    assert "Net revenue bridge: prior to current period" in listing[0]
+    assert "Top drivers of the net revenue change" in listing[1]
+    for line in listing:
+        path = line.rsplit(": ", 1)[1]
+        assert path.endswith(".png") and (tmp_path / "artifacts" / "charts" / path.rsplit("/", 1)[1]).is_file()
+
+
+def test_saving_the_report_writes_the_pngs_beside_the_markdown_so_image_links_resolve(monkeypatch, tmp_path, capsys):
+    target = tmp_path / "out" / "report.md"
+
+    _full_cli(monkeypatch, tmp_path, capsys, "--report-file", str(target))
+
+    links = re.findall(r"!\[[^\]]*\]\(([^)]+\.png)\)", target.read_text(encoding="utf-8"))
+    assert len(links) == 2
+    for link in links:
+        assert (target.parent / link).read_bytes().startswith(b"\x89PNG")
+
+
+def test_a_report_without_charts_saves_no_pngs(monkeypatch, tmp_path, capsys):
+    target = tmp_path / "out" / "report.md"
+
+    out, _, _ = _run_cli(monkeypatch, tmp_path, capsys, "--report-file", str(target))
+
+    assert not list(target.parent.glob("*.png")) and "Charts generated:" not in out
