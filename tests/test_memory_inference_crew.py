@@ -143,3 +143,17 @@ def test_the_run_metadata_marks_inferred_writes(source, tmp_path, monkeypatch):
     metadata = _run_metadata({"artifacts": artifacts})
     assert metadata["inferred_memory_ids"] == artifacts["inference"].facts
     assert metadata["pending_memory_ids"] == artifacts["inference"].pending
+
+
+def test_the_run_metadata_records_the_memory_update_outcome_and_written_id(source, tmp_path, monkeypatch):
+    store = InMemoryStore()
+    artifacts, _ = _run(source, tmp_path, monkeypatch, store, ScriptedInferenceModel())
+    metadata = _run_metadata({"artifacts": artifacts})
+    written = [r.id for r in MemoryStore(store).list("priya", "summary")]
+    assert metadata["memory_update"] == "written"
+    assert metadata["memory_update_ids"] == written and len(written) == 1
+
+
+def test_the_run_metadata_records_a_memory_update_that_wrote_nothing():
+    metadata = _run_metadata({"artifacts": {"memory_update": {"status": "unavailable"}}})
+    assert metadata["memory_update"] == "unavailable" and "memory_update_ids" not in metadata

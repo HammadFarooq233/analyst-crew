@@ -8,7 +8,7 @@ import config
 from analyst_crew.agents.contracts import (  # noqa: F401 — re-exported for existing importers
     AGENTS, CREW_AGENTS, PHASE1_AGENTS, PHASE2_AGENTS, ArtifactBinding, Crew, Handoff, Plan, SourceReference, Step, resolve_handoff,
 )
-from analyst_crew.agents.resume import _resume_decision, _source_content_hash, execution_key  # noqa: F401
+from analyst_crew.agents.resume import _resume_decision, source_content_hash, execution_key  # noqa: F401
 from analyst_crew.llm import make_chat_model
 from analyst_crew.memory import MemoryStore, MemoryUnavailable
 from analyst_crew.memory.models import AppliedMemory

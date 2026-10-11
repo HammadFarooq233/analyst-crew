@@ -195,6 +195,11 @@ def _run_metadata(result: CrewState) -> dict[str, Any]:
             metadata["inferred_memory_ids"] = list(inferred)
         if pending:
             metadata["pending_memory_ids"] = list(pending)
+    memory_update = artifacts.get("memory_update")
+    if memory_update:
+        metadata["memory_update"] = memory_update.get("status")
+        if memory_update.get("memory_id"):
+            metadata["memory_update_ids"] = [memory_update["memory_id"]]
     step_outcomes = artifacts.get("step_outcomes")
     if step_outcomes:
         metadata["step_outcomes"] = {

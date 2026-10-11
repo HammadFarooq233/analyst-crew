@@ -19,7 +19,7 @@ from typing import Any
 
 from analyst_crew.memory.models import InferenceProposals, InferenceResult, InferredProposal
 from analyst_crew.memory.store import MemoryStore, MemoryUnavailable
-from analyst_crew.memory.update import _number_in
+from analyst_crew.memory.update import number_in
 from analyst_crew.memory.vocabulary import PREFERENCE_KEYS, PreferenceError, validate_preference
 
 MAX_FACTS_PER_RUN = 3
@@ -43,6 +43,19 @@ def _norm(text: str) -> str:
 
 def _numbers(text: str) -> set[str]:
     return {n.rstrip("0").rstrip(".") if "." in n else n for n in re.findall(r"\d+(?:\.\d+)?", text or "")}
+
+
+_FUNCTION_WORDS = frozenset(
+    "the and for with that this these those our your their its are was were been being has have had not but "
+    "from into than then also who whom whose which when where while will would can could should may might "
+    "all any each every some such per via".split())
+
+
+def _content_words(text: str) -> set[str]:
+    """Lower-cased words of three or more letters, minus function words, with a trailing plural 's' dropped."""
+    words = re.findall(r"[a-z][a-z'-]*", (text or "").lower())
+    return {w[:-1] if len(w) > 3 and w.endswith("s") else w
+            for w in words if len(w) >= 3 and w not in _FUNCTION_WORDS}
 
 
 def production_inference_model() -> Any:
@@ -101,6 +114,8 @@ def infer(model: Any, user_words: str, run_records: str, user_id: str, memory: M
                     problem = "the fact is empty or too long"
                 elif not _numbers(content) <= _numbers(proposal.evidence):
                     problem = "the fact states a number its evidence does not contain"
+                elif not _content_words(content) <= _content_words(proposal.evidence):
+                    problem = "the fact adds words its evidence does not contain"
                 elif _norm(content) in known_facts:
                     continue  # already known (or deliberately forgotten): not stored again
                 elif len(result.facts) >= MAX_FACTS_PER_RUN:
@@ -113,7 +128,7 @@ def infer(model: Any, user_words: str, run_records: str, user_id: str, memory: M
             elif problem is None:
                 try:
                     value = validate_preference(proposal.key or "", proposal.value)
-                    if not _number_in(proposal.evidence, value):
+                    if not number_in(proposal.evidence, value):
                         raise PreferenceError(f"{value:g} does not appear in the quoted evidence")
                 except PreferenceError as exc:
                     problem = str(exc)

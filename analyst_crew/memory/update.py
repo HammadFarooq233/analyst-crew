@@ -37,7 +37,7 @@ class RememberOutcome:
     record: MemoryRecord | None = None
 
 
-def _number_in(sentence: str, value: float) -> bool:
+def number_in(sentence: str, value: float) -> bool:
     shown = {f"{value:g}", f"{value:.1f}", f"{value:.2f}"}
     return any(re.search(rf"(?<![\d.]){re.escape(text)}(?![\d.]*\d)", sentence) for text in shown)
 
@@ -78,7 +78,7 @@ def remember(sentence: str, user_id: str, memory: MemoryStore, model: Any) -> Re
     if proposal.kind == "preference":
         try:
             value = validate_preference(proposal.key or "", proposal.value)
-            if not _number_in(sentence, value):
+            if not number_in(sentence, value):
                 raise PreferenceError(f"{value:g} does not appear in what you said")
         except PreferenceError as exc:
             reason = str(exc)

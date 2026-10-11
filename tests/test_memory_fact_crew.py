@@ -12,7 +12,8 @@ from tests.crew_harness import (
     ScriptedAnalystModel, ScriptedFetcherModel, ScriptedPlannerModel, ScriptedReporterModel,
     ScriptedVisualizerModel, crew_plan, run_crew, sales_row, write_sales,
 )
-from tests.test_critic import ALL_AGENTS, ScriptedCriticModel, critic_plan
+from tests.test_critic import ALL_AGENTS, ScriptedCriticModel, critic_plan, issue
+from analyst_crew.reporting.critique import Critique
 from tests.test_memory_preferences import ScriptedMemoryModel
 
 FACT = "regions follow our sales managers"
@@ -85,6 +86,20 @@ def test_a_fact_never_changes_a_displayed_value(source, tmp_path, monkeypatch):
     assert with_fact["artifacts"]["findings"] == without["artifacts"]["findings"]
     assert with_fact["artifacts"]["evidence_catalog"] == without["artifacts"]["evidence_catalog"]
     assert with_fact["artifacts"]["memory_parameters"] == {}
+
+
+def test_the_reporter_revision_gets_the_fact_but_the_critic_still_reads_no_memory(source, tmp_path, monkeypatch):
+    store = InMemoryStore()
+    _say(store)
+    reporter = ScriptedReporterModel()
+    critic = ScriptedCriticModel(Critique(issues=[issue("claim_1")]), Critique(issues=[]))
+    result, _ = _run(source, tmp_path, monkeypatch, store, planner_model=ScriptedPlannerModel(critic_plan()),
+                     reporter_model=reporter, critic_model=critic, available_agents=ALL_AGENTS)
+
+    assert reporter.calls == 2, "a draft and one revision"
+    assert FACT in str(reporter.contexts[1]), "the revision keeps the framing facts the draft had"
+    assert FACT not in str(critic.contexts), "the Critic reads no memory (ADR-0005)"
+    assert [m.status for m in result["artifacts"]["applied_memories"]] == ["applied"]
 
 
 def test_the_fact_is_listed_under_applied_memories_with_its_origin(source, tmp_path, monkeypatch):

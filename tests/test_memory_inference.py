@@ -66,6 +66,8 @@ def test_a_grounded_preference_is_pending_and_resolves_to_no_parameter():
     fact(evidence="the invented quarter was glorious"),
     fact(content="north grew 12% every year", evidence="regions follow the sales managers"),
     fact(content="  ", evidence="regions follow"),
+    fact(content="regions follow the sales managers and always overperform"),
+    fact(content="regions follow the sales managers, Dana included"),
     pref(evidence="unusual means a swing over 9%", value=9),
     pref(value=12, evidence="unusual means a swing over 8%"),
     pref(key="exclude_category", value=8),
@@ -79,9 +81,14 @@ def test_ungrounded_or_invalid_proposals_store_nothing_and_say_why(proposal):
 
 def test_a_fact_may_be_grounded_in_the_run_records_but_a_preference_may_not():
     records = "Previous successful run compared May with June. Rows: 4 included."
-    result, store, _ = _infer([fact("the last run covered May and June", "compared May with June"),
+    result, store, _ = _infer([fact("compared May with June", "compared May with June"),
                                pref(4, "Rows: 4 included")], words="How did sales change?", records=records)
     assert len(result.facts) == 1 and result.pending == [] and len(result.rejected) == 1
+
+
+def test_a_fact_may_reword_with_function_words_and_plurals_but_not_add_content_words():
+    result, _, _ = _infer([fact("The regions follow our sales manager", "regions follow the sales managers")])
+    assert len(result.facts) == 1 and result.rejected == []
 
 
 def test_the_proposer_sees_only_the_users_words_and_the_run_records():

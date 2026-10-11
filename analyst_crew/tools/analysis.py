@@ -363,7 +363,7 @@ GROUP BY product_id
 """
 
 
-def _materiality_from_question(question: str) -> tuple[float | None, float | None]:
+def materiality_from_question(question: str) -> tuple[float | None, float | None]:
     """Deterministically parse explicit override percentages from prose.
 
     Only simple, unambiguous "<number>% relative/change" and
@@ -404,7 +404,7 @@ def _resolve_materiality(
         # The Crew labels parameters it resolved from stored Typed Preferences; nothing else may claim it.
         source = "memory" if parameters.get("materiality_source") == "memory" else "analysis_parameters"
     else:
-        relative, absolute = _materiality_from_question(user_question)
+        relative, absolute = materiality_from_question(user_question)
         if relative is not None or absolute is not None:
             source = "user_question"
     return MaterialityThresholds(

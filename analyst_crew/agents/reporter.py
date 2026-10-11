@@ -175,7 +175,7 @@ REVISION_RUN_NAME = "Reporter (revision)"
 
 
 def revise_content(model: Any, handoff: Handoff, catalog: EvidenceCatalog, draft: Report, critique: Critique,
-                   *, config: Any = None) -> ReporterContent:
+                   *, config: Any = None, facts: list[str] | None = None) -> ReporterContent:
     """One Reporter revision of ``draft`` against ``critique`` (Crew-internal, not a Step).
 
     A single model call with no retry: the result is validated by exactly the rules the first draft meets
@@ -189,6 +189,7 @@ def revise_content(model: Any, handoff: Handoff, catalog: EvidenceCatalog, draft
         "evidence_catalog": [entry.model_dump() for entry in catalog.entries],
         "charts": [{"chart_id": chart.chart_id, "title": chart.title} for chart in draft.charts],
         "validation_feedback": "",
+        **({"framing_facts": list(facts)} if facts else {}),
         "revision": {
             "issues": [issue.model_dump() for issue in critique.issues],
             "draft": [
