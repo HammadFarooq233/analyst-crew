@@ -6,7 +6,7 @@ import pytest
 from langgraph.store.base import BaseStore
 from langgraph.store.memory import InMemoryStore
 
-from analyst_crew.memory import MemoryRecord, MemoryStore, MemoryUnavailable, UnavailableStore
+from analyst_crew.memory import MemoryNotFound, MemoryRecord, MemoryStore, MemoryUnavailable, UnavailableStore
 
 
 def _postgres_conn():
@@ -109,3 +109,48 @@ def test_an_unreachable_store_raises_memory_unavailable():
 
 def test_unavailable_store_is_a_store():
     assert isinstance(UnavailableStore(), BaseStore)
+
+
+def test_forgetting_removes_a_memory_from_retrieval_but_keeps_it_in_the_history(memory):
+    keep = memory.add("priya", "fact", "keep")
+    drop = memory.add("priya", "fact", "drop")
+    forgotten = memory.forget("priya", drop.id)
+    assert forgotten.status == "forgotten" and forgotten.ended_at
+    assert memory.list("priya") == [keep]
+    assert memory.read_for_role("Reporter", "priya") == [keep]
+    history = {r.id: r for r in memory.history("priya")}
+    assert set(history) == {keep.id, drop.id}
+    assert history[drop.id].status == "forgotten" and history[drop.id].content == "drop"
+    assert history[keep.id].status == "active"
+
+
+def test_forgetting_an_unknown_or_already_inactive_memory_is_an_error_and_changes_nothing(memory):
+    mine = memory.add("priya", "fact", "mine")
+    with pytest.raises(MemoryNotFound):
+        memory.forget("priya", "mem-nope")
+    with pytest.raises(MemoryNotFound):
+        memory.forget("sam", mine.id)  # another user's memory is invisible
+    memory.forget("priya", mine.id)
+    with pytest.raises(MemoryNotFound):
+        memory.forget("priya", mine.id)
+    assert [r.status for r in memory.history("priya")] == ["forgotten"]
+
+
+def test_a_newer_statement_on_the_same_preference_supersedes_the_older_and_keeps_it_in_the_history(memory):
+    key = "materiality_relative_threshold_percent"
+    older = memory.add("priya", "preference", "10%", key=key, value=10.0)
+    other = memory.add("priya", "preference", "abs 3%", key="materiality_absolute_threshold_percent", value=3.0)
+    sam = memory.add("sam", "preference", "sam 5%", key=key, value=5.0)
+    newer = memory.add("priya", "preference", "20%", key=key, value=20.0)
+    assert newer.supersedes == older.id
+    assert {r.id for r in memory.list("priya", "preference")} == {newer.id, other.id}
+    assert [r.id for r in memory.list("sam", "preference")] == [sam.id]
+    history = {r.id: r for r in memory.history("priya")}
+    assert history[older.id].status == "superseded" and history[older.id].superseded_by == newer.id
+    assert history[older.id].ended_at and history[newer.id].status == "active"
+
+
+def test_facts_are_never_superseded_by_each_other(memory):
+    memory.add("priya", "fact", "one")
+    memory.add("priya", "fact", "two")
+    assert [r.content for r in memory.list("priya", "fact")] == ["one", "two"]

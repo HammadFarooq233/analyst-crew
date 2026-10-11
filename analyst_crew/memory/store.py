@@ -30,6 +30,10 @@ class MemoryUnavailable(Exception):
     """The Memory store could not be read or written."""
 
 
+class MemoryNotFound(Exception):
+    """No active memory with that id exists for the user."""
+
+
 class UnavailableStore(BaseStore):
     """A store standing in for one that cannot be reached: every operation fails."""
 
@@ -57,28 +61,62 @@ class MemoryStore:
             raise ValueError(f"Unknown memory kind: {kind!r}")
         return (ROOT, _label(user_id), kind)
 
+    def _now(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _put(self, record: MemoryRecord) -> None:
+        self._store.put(self.namespace(record.user_id, record.kind), record.id, record.model_dump())
+
     def add(self, user_id: str, kind: str, content: str, origin: str = "stated", *,
             key: str | None = None, value: float | None = None) -> MemoryRecord:
+        """Store a memory. A newer Typed Preference on the same key supersedes the active one(s):
+        the older record stays in the history, marked superseded and linked to its replacement."""
         record = MemoryRecord(
             id=f"mem-{uuid.uuid4().hex[:8]}", user_id=user_id, kind=kind, origin=origin, content=content,
-            created_at=datetime.now(timezone.utc).isoformat(), key=key, value=value,
+            created_at=self._now(), key=key, value=value,
         )
         try:
-            self._store.put(self.namespace(user_id, kind), record.id, record.model_dump())
+            older = ([r for r in self._read(user_id, kind) if r.status == "active" and r.key == key]
+                     if kind == "preference" and key else [])
+            if older:
+                record = record.model_copy(update={"supersedes": older[-1].id})
+            self._put(record)  # the replacement lands first, so a failure never leaves a gap
+            for previous in older:
+                self._put(previous.model_copy(update={
+                    "status": "superseded", "superseded_by": record.id, "ended_at": record.created_at}))
         except Exception as exc:  # noqa: BLE001 — any backend failure is an outage
             raise MemoryUnavailable(str(exc)) from exc
         return record
 
-    def list(self, user_id: str, kind: str | None = None) -> list[MemoryRecord]:
+    def _read(self, user_id: str, kind: str) -> list[MemoryRecord]:
+        items = self._store.search(self.namespace(user_id, kind), limit=1000)
+        return sorted((MemoryRecord.model_validate(item.value) for item in items),
+                      key=lambda record: (record.created_at, record.id))
+
+    def history(self, user_id: str, kind: str | None = None) -> list[MemoryRecord]:
+        """Every memory ever stored for the user, including superseded and forgotten ones."""
         kinds = MEMORY_KINDS if kind is None else (kind,)
-        records: list[MemoryRecord] = []
         try:
-            for each in kinds:
-                for item in self._store.search(self.namespace(user_id, each), limit=1000):
-                    records.append(MemoryRecord.model_validate(item.value))
+            records = [record for each in kinds for record in self._read(user_id, each)]
         except Exception as exc:  # noqa: BLE001
             raise MemoryUnavailable(str(exc)) from exc
         return sorted(records, key=lambda record: (record.created_at, record.id))
+
+    def list(self, user_id: str, kind: str | None = None) -> list[MemoryRecord]:
+        """The active memories: what retrieval can see."""
+        return [record for record in self.history(user_id, kind) if record.status == "active"]
+
+    def forget(self, user_id: str, memory_id: str) -> MemoryRecord:
+        """Remove an active memory from retrieval. It stays in the history, marked forgotten."""
+        target = next((record for record in self.list(user_id) if record.id == memory_id), None)
+        if target is None:
+            raise MemoryNotFound(f"No active memory {memory_id!r} for user {user_id!r}.")
+        forgotten = target.model_copy(update={"status": "forgotten", "ended_at": self._now()})
+        try:
+            self._put(forgotten)
+        except Exception as exc:  # noqa: BLE001
+            raise MemoryUnavailable(str(exc)) from exc
+        return forgotten
 
     def read_for_role(self, role: str, user_id: str) -> list[MemoryRecord]:
         records: list[MemoryRecord] = []
@@ -87,10 +125,11 @@ class MemoryStore:
         return sorted(records, key=lambda record: (record.created_at, record.id))
 
     def delete(self, user_id: str, kind: str, memory_id: str) -> None:
+        """Forget a memory (kept in the history). Kept for callers that know the kind."""
         try:
-            self._store.delete(self.namespace(user_id, kind), memory_id)
-        except Exception as exc:  # noqa: BLE001
-            raise MemoryUnavailable(str(exc)) from exc
+            self.forget(user_id, memory_id)
+        except MemoryNotFound:
+            pass
 
     def clear(self, user_id: str | None = None) -> None:
         """Delete every memory (one user's when ``user_id`` is given)."""

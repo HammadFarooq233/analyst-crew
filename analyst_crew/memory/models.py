@@ -19,6 +19,11 @@ class MemoryRecord(BaseModel):
     # Typed Preferences only: a key from the closed vocabulary and its validated value.
     key: str | None = None
     value: float | None = None
+    # Lifecycle: only "active" records are retrieved. Superseded and forgotten records stay as history.
+    status: Literal["active", "superseded", "forgotten"] = "active"
+    supersedes: str | None = None      # the memory this one replaced
+    superseded_by: str | None = None   # the memory that replaced this one
+    ended_at: str | None = None        # when it was superseded or forgotten
 
 
 class AppliedMemory(BaseModel):
