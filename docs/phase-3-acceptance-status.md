@@ -35,7 +35,7 @@ All opt-in runs used a scratch Postgres database (`analyst_tier_runs`, with `sal
 
 | Tier | Result |
 | --- | --- |
-| Offline (`-m "not llm and not integration and not eval"`) | 443 passed, 40 deselected (on this branch, before the merge of the tip of `phase-3-memory`; final count in the closing note below) |
+| Offline (`-m "not llm and not integration and not eval"`) | 443 passed, 40 deselected (re-run after merging the tip of `phase-3-memory`, which was already included) |
 | Opt-in, `-m "llm or integration or eval"` | 40 selected. The first invocation was stopped by me while `tests/test_critic_live.py` was running (I mistook a slow live test for a hang), so it contributed only the Critic eval results above (seeded-flaw eval, its control and the clean-Report eval, all passed). The second invocation (Critic eval file deselected, 37 selected): 35 passed, 1 skipped, 1 failed, in 288 s |
 
 - **The one failure was a stale test, fixed here.** `tests/test_eval.py::test_golden_plan_structure` still called `PlannerAgent(store=...)`, which Phase 3 removed (the Planner is handed role-scoped Memory text). It now passes `memory_context`, and passed live afterwards on its own (1 passed). It had been broken since the Planner slice of Phase 3 because the default suite deselects it.
