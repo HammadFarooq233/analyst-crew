@@ -1,6 +1,7 @@
 """Crew graph wiring and the ``invoke()`` entry point."""
 import os
 import uuid
+from contextlib import ExitStack
 from typing import Any
 
 from langchain_core.messages import HumanMessage
@@ -17,6 +18,7 @@ from analyst_crew.agents.critic import critic_node
 from analyst_crew.agents.reporter import reporter_node
 from analyst_crew.agents.visualizer import visualizer_node
 from analyst_crew.agents.tracing import _finish_langfuse_trace, _run_metadata, get_langfuse_handler
+from analyst_crew.memory import MemoryStore, MemoryUnavailable, UnavailableStore
 from analyst_crew.state import CrewState
 from analyst_crew.state.serde import crew_serde
 
@@ -83,6 +85,15 @@ def build_graph(checkpointer=None, store=None, runtime_config: dict | None = Non
     return graph.compile(checkpointer=checkpointer, store=store)
 
 
+def _retired(store):
+    """Drop the retired Planner-only namespace the first time a store is used; never fails the run."""
+    try:
+        MemoryStore(store).retire_legacy_namespace()
+    except MemoryUnavailable:
+        pass
+    return store
+
+
 def invoke(
     user_question: str,
     config: dict | None = None,
@@ -129,17 +140,20 @@ def invoke(
 
     def _run():
         if checkpointer is not None:
-            return _do_invoke(state, config, checkpointer, store if store is not None else InMemoryStore())
+            return _do_invoke(state, config, checkpointer, _retired(store if store is not None else InMemoryStore()))
         if conn_string:
-            with (
-                PostgresSaver.from_conn_string(conn_string) as pg_checkpointer,
-                PostgresStore.from_conn_string(conn_string) as pg_store,
-            ):
+            with PostgresSaver.from_conn_string(conn_string) as pg_checkpointer, ExitStack() as stack:
                 pg_checkpointer.serde = crew_serde()
                 pg_checkpointer.setup()
-                pg_store.setup()
-                return _do_invoke(state, config, pg_checkpointer, pg_store)
-        return _do_invoke(state, config, None, store if store is not None else InMemoryStore())
+                # Memory persists across runs in Postgres. If only the Memory store is down the run
+                # continues with defaults and states that in the Report; it never fails the run.
+                try:
+                    pg_store = stack.enter_context(PostgresStore.from_conn_string(conn_string))
+                    pg_store.setup()
+                except Exception:  # noqa: BLE001
+                    pg_store = UnavailableStore()
+                return _do_invoke(state, config, pg_checkpointer, _retired(pg_store))
+        return _do_invoke(state, config, None, _retired(store if store is not None else InMemoryStore()))
 
     result = _run()
     _finish_langfuse_trace(langfuse_client, langfuse_trace, metadata=_run_metadata(result))

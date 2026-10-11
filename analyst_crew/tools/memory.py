@@ -1,22 +1,14 @@
-import uuid
-
+"""Test helpers over the per-user Memory store. The old Planner-only
+``("planner",)`` namespace and its model-callable search Tool are retired
+(ADR-0005); retrieval is deterministic and lives in ``analyst_crew.memory``."""
 from langgraph.store.base import BaseStore
-from langmem import create_search_memory_tool
+
+from analyst_crew.memory import MemoryStore
 
 
-def create_memory_tool(store: BaseStore | None = None):
-    return create_search_memory_tool(
-        namespace=("planner",),
-        store=store,
-    )
+def seed_memory(store: BaseStore, fact: str, user_id: str = "default", kind: str = "fact") -> str:
+    return MemoryStore(store).add(user_id, kind, fact).id
 
 
-def seed_memory(store: BaseStore, fact: str):
-    key = f"mem-{uuid.uuid4().hex[:8]}"
-    store.put(("planner",), key, {"content": fact})
-    return key
-
-
-def clear_namespace(store: BaseStore):
-    for item in store.search(("planner",), limit=1000):
-        store.delete(("planner",), item.key)
+def clear_namespace(store: BaseStore, user_id: str | None = None) -> None:
+    MemoryStore(store).clear(user_id)

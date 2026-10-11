@@ -6,7 +6,7 @@ from analyst_crew.tools.analysis import (
     MetricComparison,
     run_sales_baseline,
 )
-from analyst_crew.tools.memory import clear_namespace, create_memory_tool, seed_memory
+from analyst_crew.tools.memory import clear_namespace, seed_memory
 
 __all__ = [
     "AnalystAgent",
@@ -15,7 +15,6 @@ __all__ = [
     "ComparisonWindow",
     "MetricComparison",
     "clear_namespace",
-    "create_memory_tool",
     "run_sales_baseline",
     "seed_memory",
 ]
