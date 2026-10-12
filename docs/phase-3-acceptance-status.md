@@ -59,3 +59,23 @@ All opt-in runs used a scratch Postgres database (`analyst_tier_runs`, with `sal
 - `tests/test_memory_live.py` fails if the live Reporter hits a terminal failure on any of its five runs (it asserts no terminal failure), which happened once in six runs.
 - On the `PostgresSaver` path the serializer allowlist still does not take effect (harmless "Deserializing unregistered type" warnings), as recorded in `docs/phase-2-acceptance-status.md`.
 - The model's output is free-form, so the Critic clean-Report result (3 of 3) and the inference eval (5 of 5) are small samples.
+
+## Manual QA pass (2026-10-12)
+
+Driven by hand through the CLI on the real model, against a scratch Postgres database (dropped afterwards).
+
+Worked as specified:
+- The default run flags only the enterprise segment at 15%. After `remember "unusual means a swing over 8%"`, a new thread reports the 8% threshold with source `memory` and lists it under Applied Memories. A second user still gets the default.
+- Rerunning the same thread after `forget` returned to the default threshold. `forget` on an unknown id, an already forgotten id and another user's id exits 1 with a clear message. `list --history` shows the superseded and forgotten records.
+- Out-of-range (5000%), vague and "ignore the Office category" sentences are stored as free-text facts and change no parameter. An empty sentence stores nothing.
+- A threshold in the question overrides the stored preference and the Report says so. An inferred preference stays pending (and is printed after the run), `confirm` by another user fails, `confirm` by its owner applies it, and a later `remember` supersedes it.
+- An unreachable Postgres makes `list` exit 1 with a one-line message.
+
+Found and fixed:
+- Every free-text fact produced an identical Applied Memories line, so the reader could not tell them apart. Facts with one origin now share one line that points to `list`.
+- A stored fact reading "unusual means a swing over 5000%" led the live Reporter to write a Finding saying the 17% enterprise change was "below the unusual cutoff", contradicting the 8% threshold. The Reporter prompt now says facts never define a threshold or what counts as unusual; a live rerun no longer produced that Finding. This is a prompt guard, not a code guarantee.
+
+Not covered or still open:
+- A memory-only storage outage during a run was not reproduced live (a full Postgres outage still fails in the checkpointer, as before Phase 3). Offline tests cover the memory-only case.
+- The question parser only reads thresholds phrased like "10% relative threshold"; "only care about swings over 12%" is ignored by it (the inference step still proposes a pending preference from it).
+- `remember` without `POSTGRES_CONNECTION_STRING` in the shell still uses the value from `.env`, so it is not refused in that case.

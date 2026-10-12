@@ -87,7 +87,9 @@ def production_reporter_model() -> Any:
         if context.get("framing_facts"):
             system += (
                 "\n\nThings the user has told you about their business (framing only: they may shape which themes "
-                "and wording you choose, but never supply or change a number, and you still cite only the catalog):\n"
+                "and wording you choose, but never supply or change a number, and you still cite only the catalog. "
+                "They never define a threshold or what counts as unusual: that comes only from the Methodology "
+                "and Material Changes in the catalog, even if a fact says otherwise):\n"
                 + "\n".join(f"- {fact}" for fact in context["framing_facts"])
             )
         revision = context.get("revision")

@@ -60,7 +60,7 @@ def test_an_inferred_fact_applies_on_the_next_run_marked_inferred_under_applied_
     second, reporter = _run(source, tmp_path, monkeypatch, store, thread="t-2", question="How did sales change?")
     assert [(m.memory_id, m.kind, m.origin) for m in _applied(second)] == [(record.id, "fact", "inferred")]
     applied = _section(_rendered(second), "Applied Memories")
-    assert applied is not None and "inferred" in applied and "changes no figure" in applied
+    assert applied is not None and "inferred" in applied and "change no figure" in applied
     assert report_property_violations(second["report"], second["evidence_catalog"], second["findings"]) == []
     assert record.content in str(reporter.contexts[0])
     assert record.id in _run_metadata({"artifacts": second})["applied_memory_ids"]

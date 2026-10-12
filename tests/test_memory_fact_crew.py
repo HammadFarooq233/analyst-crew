@@ -113,6 +113,17 @@ def test_the_fact_is_listed_under_applied_memories_with_its_origin(source, tmp_p
     assert [(m.kind, m.origin) for m in artifacts["applied_memories"]] == [("fact", "stated")]
 
 
+def test_several_facts_with_one_origin_share_one_applied_memories_line(source, tmp_path, monkeypatch):
+    store = InMemoryStore()
+    _say(store)
+    _say(store, "our regions are organised as coastal and inland")
+    result, _ = _run(source, tmp_path, monkeypatch, store)
+    artifacts = result["artifacts"]
+    applied = _section(render_report(artifacts["report"], artifacts["evidence_catalog"]), "Applied Memories")
+    assert len(artifacts["applied_memories"]) == 2
+    assert applied is not None and applied.lower().count("free-text fact") == 1
+
+
 def test_no_fact_means_no_framing_context_for_the_reporter(source, tmp_path, monkeypatch):
     _, reporter = _run(source, tmp_path, monkeypatch, InMemoryStore())
     assert "framing_facts" not in reporter.contexts[0]

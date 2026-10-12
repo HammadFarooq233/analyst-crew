@@ -260,6 +260,7 @@ def assemble_applied_memories(catalog: EvidenceCatalog, applied: list[AppliedMem
     An applied threshold is shown through the Evidence Entry the Tools computed with, so it
     can never display a value other than the resolved parameter; memory ids and dates stay off the page."""
     lines: list[ReportLine] = []
+    fact_origins: set[str] = set()
     for item in applied or []:
         if item.kind == "summary":
             lines.append(template_line(f"Past-run Summary given to the Planner ({_ORIGINS.get(item.origin, item.origin)})."))
@@ -269,7 +270,12 @@ def assemble_applied_memories(catalog: EvidenceCatalog, applied: list[AppliedMem
         origin = _ORIGINS.get(item.origin, item.origin)
         if item.kind == "fact":
             # The fact's own words stay off the page: free text must never put a number in the Report.
-            lines.append(template_line(f"Free-text fact ({origin}): used to frame this Report; it changes no figure."))
+            # One line per origin, since identical lines for each fact tell the reader nothing (`list` names them).
+            if origin not in fact_origins:
+                fact_origins.add(origin)
+                lines.append(template_line(
+                    f"Free-text facts ({origin}): used to frame this Report; they change no figure. "
+                    "Run `list` to see them."))
             continue
         if item.status == "overridden":
             lines.append(template_line(
