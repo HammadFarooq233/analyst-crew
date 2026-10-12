@@ -13,6 +13,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from analyst_crew.memory.models import AppliedMemory
+from analyst_crew.memory.vocabulary import PREFERENCE_KEYS
 from analyst_crew.reporting.catalog import EvidenceCatalog, EvidenceEntry
 from analyst_crew.reporting.charts import ChartReference
 from analyst_crew.reporting.critique import CritiqueIssue, target_label
@@ -70,6 +72,10 @@ class Report(BaseModel):
     methodology: list[ReportLine]
     # Critique issues that remain; the section is absent when empty (set only by the Critic Step).
     reviewer_notes: list[CritiqueIssue] = Field(default_factory=list)
+    # True when Memory storage was down and defaults were used; the Caveat above states it.
+    memory_unavailable: bool = False
+    # Code-assembled from what the Crew actually applied; the section is absent when empty.
+    applied_memories: list[ReportLine] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def fallback_is_marked(self) -> "Report":
@@ -165,11 +171,18 @@ def _entry_placeholder(entry: EvidenceEntry) -> str:
     return "{" + entry.id + "}"
 
 
-def assemble_caveats(catalog: EvidenceCatalog) -> list[ReportLine]:
+MEMORY_UNAVAILABLE_CAVEAT = (
+    "Memory storage was unavailable for this run, so no saved memories were applied and defaults were used."
+)
+
+
+def assemble_caveats(catalog: EvidenceCatalog, memory_unavailable: bool = False) -> list[ReportLine]:
     """Every Findings limitation, every non-available optional source status,
     the CPI non-causality caveat when CPI is present, and the quarantine and
     duplicate disclosure. Mandatory: not selectable by the Reporter."""
     caveats: list[ReportLine] = []
+    if memory_unavailable:
+        caveats.append(template_line(MEMORY_UNAVAILABLE_CAVEAT))
     for entry in catalog.entries:
         if entry.source.startswith(("limitations.", "revenue_bridge.limitations.")):
             caveats.append(template_line("{" + entry.id + "}"))
@@ -235,24 +248,67 @@ def assemble_methodology(catalog: EvidenceCatalog) -> list[ReportLine]:
     return [template_line(line) for line in lines]
 
 
+_ORIGINS = {"stated": "stated by you", "inferred": "inferred from what you said", "run_record": "from a past run"}
+_PREFERENCE_VALUE_SOURCE = {
+    "materiality_relative_threshold_percent": "methodology.materiality.relative_change_percent",
+    "materiality_absolute_threshold_percent": "methodology.materiality.absolute_change_percent_of_prior_total",
+}
+
+
+def assemble_applied_memories(catalog: EvidenceCatalog, applied: list[AppliedMemory] | None) -> list[ReportLine]:
+    """One line per Memory the Crew consulted, built from the resolution, never by a model.
+    An applied threshold is shown through the Evidence Entry the Tools computed with, so it
+    can never display a value other than the resolved parameter; memory ids and dates stay off the page."""
+    lines: list[ReportLine] = []
+    fact_origins: set[str] = set()
+    for item in applied or []:
+        if item.kind == "summary":
+            lines.append(template_line(f"Past-run Summary given to the Planner ({_ORIGINS.get(item.origin, item.origin)})."))
+            continue
+        spec = PREFERENCE_KEYS.get(item.key or "")
+        label = spec.label if spec else "Memory"
+        origin = _ORIGINS.get(item.origin, item.origin)
+        if item.kind == "fact":
+            # The fact's own words stay off the page: free text must never put a number in the Report.
+            # One line per origin, since identical lines for each fact tell the reader nothing (`list` names them).
+            if origin not in fact_origins:
+                fact_origins.add(origin)
+                lines.append(template_line(
+                    f"Free-text facts ({origin}): used to frame this Report; they change no figure. "
+                    "Run `list` to see them."))
+            continue
+        if item.status == "overridden":
+            lines.append(template_line(
+                f"{label}: your stored preference was not used for this run because your question gave its own "
+                f"instruction ({origin})."))
+            continue
+        entry = catalog.find_source(_PREFERENCE_VALUE_SOURCE.get(item.key or "", ""))
+        shown = f" {{{entry.id}}}" if entry is not None else ""
+        lines.append(template_line(f"{label}:{shown} ({origin})."))
+    return lines
+
+
 def _chart_mode(charts: list[ChartReference] | None, chart_mode: str | None) -> str | None:
     """``chart_mode`` describes the charts, so a Report without charts carries none."""
     return chart_mode if charts else None
 
 
 def build_report(content: ReporterContent, catalog: EvidenceCatalog, question: str,
-                 charts: list[ChartReference] | None = None, chart_mode: str | None = None) -> Report:
+                 charts: list[ChartReference] | None = None, chart_mode: str | None = None,
+                 memory_unavailable: bool = False, applied: list[AppliedMemory] | None = None) -> Report:
     """An ``llm``-mode Report: model-written Summary and Claims, code-assembled rest.
     ``charts`` are the Chart Artifact references for the code-assembled Charts section."""
     return Report(
         report_mode="llm", question=question, summary=content.summary, findings=content.claims,
         charts=charts or [], chart_mode=_chart_mode(charts, chart_mode),
-        caveats=assemble_caveats(catalog), methodology=assemble_methodology(catalog),
+        caveats=assemble_caveats(catalog, memory_unavailable), methodology=assemble_methodology(catalog),
+        memory_unavailable=memory_unavailable, applied_memories=assemble_applied_memories(catalog, applied),
     )
 
 
 def build_fallback_report(catalog: EvidenceCatalog, question: str,
-                          charts: list[ChartReference] | None = None, chart_mode: str | None = None) -> Report:
+                          charts: list[ChartReference] | None = None, chart_mode: str | None = None,
+                          memory_unavailable: bool = False, applied: list[AppliedMemory] | None = None) -> Report:
     """Deterministic template Report: fixed Summary (window and net revenue
     change), Material Changes as templated Claims, plus the same code-assembled
     Caveats and Methodology. Visibly marked as generated without the Reporter."""
@@ -312,7 +368,8 @@ def build_fallback_report(catalog: EvidenceCatalog, question: str,
     return Report(
         report_mode="fallback", fallback_notice=FALLBACK_NOTICE, question=question, summary=summary,
         findings=claims, charts=charts or [], chart_mode=_chart_mode(charts, chart_mode),
-        caveats=assemble_caveats(catalog), methodology=assemble_methodology(catalog),
+        caveats=assemble_caveats(catalog, memory_unavailable), methodology=assemble_methodology(catalog),
+        memory_unavailable=memory_unavailable, applied_memories=assemble_applied_memories(catalog, applied),
     )
 
 
@@ -365,6 +422,9 @@ def render_report(report: Report, catalog: EvidenceCatalog) -> str:
         lines.append(f"_{CHARTS_NOTICE}_")
     lines += ["", "## Caveats", ""] + [f"- {substitute(claim.text, catalog)}" for claim in report.caveats]
     lines += ["", "## Methodology", ""] + [f"- {substitute(claim.text, catalog)}" for claim in report.methodology]
+
+    if report.applied_memories:
+        lines += ["", "## Applied Memories", ""] + [f"- {substitute(line.text, catalog)}" for line in report.applied_memories]
 
     if report.reviewer_notes:
         lines += ["", "## Reviewer Notes", ""]

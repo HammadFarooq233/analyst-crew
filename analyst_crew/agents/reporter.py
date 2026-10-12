@@ -14,6 +14,7 @@ from typing import Any
 from langchain_core.runnables import RunnableLambda
 from pydantic import ValidationError
 
+from analyst_crew.memory.node import applied_memories, effective_parameters, framing_facts
 from analyst_crew.agents.agent_support import (
     catalog_prompt, format_failure, named_span, run_validated, summarize_schema_error,
 )
@@ -83,6 +84,14 @@ def production_reporter_model() -> Any:
             REPORTER_SYSTEM_PROMPT + "\n\nCharts (chart_id | title):\n" + charts_text
             + "\n\nEvidence Catalog (id | label | display):\n" + catalog_prompt(context["evidence_catalog"])
         )
+        if context.get("framing_facts"):
+            system += (
+                "\n\nThings the user has told you about their business (framing only: they may shape which themes "
+                "and wording you choose, but never supply or change a number, and you still cite only the catalog. "
+                "They never define a threshold or what counts as unusual: that comes only from the Methodology "
+                "and Material Changes in the catalog, even if a fact says otherwise):\n"
+                + "\n".join(f"- {fact}" for fact in context["framing_facts"])
+            )
         revision = context.get("revision")
         revision_text = ""
         if revision:
@@ -137,12 +146,14 @@ class ReporterAgent:
         self.tool_retries = 0
         self.last_validation_error: str | None = None
 
-    def run(self, handoff: Handoff, catalog: EvidenceCatalog, *, config: Any = None) -> ReporterContent:
+    def run(self, handoff: Handoff, catalog: EvidenceCatalog, *, config: Any = None,
+            facts: list[str] | None = None) -> ReporterContent:
         context = {
             "step_objective": handoff.step.objective,
             "user_question": handoff.user_question,
             "evidence_catalog": [entry.model_dump() for entry in catalog.entries],
             "charts": _handoff_charts(handoff),
+            **({"framing_facts": list(facts)} if facts else {}),
         }
         chart_ids = {chart["chart_id"] for chart in context["charts"]}
 
@@ -166,7 +177,7 @@ REVISION_RUN_NAME = "Reporter (revision)"
 
 
 def revise_content(model: Any, handoff: Handoff, catalog: EvidenceCatalog, draft: Report, critique: Critique,
-                   *, config: Any = None) -> ReporterContent:
+                   *, config: Any = None, facts: list[str] | None = None) -> ReporterContent:
     """One Reporter revision of ``draft`` against ``critique`` (Crew-internal, not a Step).
 
     A single model call with no retry: the result is validated by exactly the rules the first draft meets
@@ -180,6 +191,7 @@ def revise_content(model: Any, handoff: Handoff, catalog: EvidenceCatalog, draft
         "evidence_catalog": [entry.model_dump() for entry in catalog.entries],
         "charts": [{"chart_id": chart.chart_id, "title": chart.title} for chart in draft.charts],
         "validation_feedback": "",
+        **({"framing_facts": list(facts)} if facts else {}),
         "revision": {
             "issues": [issue.model_dump() for issue in critique.issues],
             "draft": [
@@ -245,7 +257,8 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
         }
         analyst_step = next((step for step in plan.steps if step.agent == "Analyst"), None)
         findings_names = (analyst_step.declared_artifacts or [analyst_step.expected_output]) if analyst_step else []
-        analysis_parameters = dict(configurable.get("analysis_parameters", {}))
+        analysis_parameters = effective_parameters(artifacts, configurable)
+        applied = applied_memories(artifacts)
         # Charts come from the Visualizer Step (when the Plan has one); the Report only references them.
         visualizer_step = next((step for step in plan.steps if step.agent == "Visualizer"), None)
         charts = load_charts(artifacts.get("charts")) if visualizer_step is not None else []
@@ -267,8 +280,17 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
         except ValueError as exc:
             # The Findings and catalog are fine, so this still degrades to a Fallback Report below.
             handoff_error = exc
+        memory_unavailable = artifacts.get("memory_status") == "unavailable"
+        # A changed storage state must not reuse a Report that was written under the other state.
+        key_parameters = {
+            **analysis_parameters, **({"memory_unavailable": True} if memory_unavailable else {}),
+            # The Applied Memories section depends on which memories applied, not only on their values.
+            **({"framing_facts": sorted(item["id"] for item in artifacts["memory_facts"])}
+               if artifacts.get("memory_facts") else {}),
+            **({"applied_memories": sorted(f"{item.memory_id}:{item.status}" for item in applied)} if applied else {}),
+        }
         current_key = execution_key(
-            reporter_step, analysis_parameters=analysis_parameters,
+            reporter_step, analysis_parameters=key_parameters,
             input_artifact_hashes=[current_hash, *(chart.content_hash for chart in charts)],
         )
         resume_outcome, resume_reason = _resume_decision(state, reporter_step.step_id, current_key)
@@ -295,11 +317,11 @@ def reporter_node(state: CrewState, config: dict | None = None) -> dict[str, Any
                     raise handoff_error
                 model = configurable.get("reporter_model") or production_reporter_model()
                 agent = ReporterAgent(model)
-                content = agent.run(handoff, catalog, config=config)
-                report = build_report(content, catalog, plan.user_question, chart_refs, chart_mode)
+                content = agent.run(handoff, catalog, config=config, facts=framing_facts(artifacts))
+                report = build_report(content, catalog, plan.user_question, chart_refs, chart_mode, memory_unavailable, applied)
             except Exception as exc:  # noqa: BLE001 — any Reporter failure degrades visibly, never silently
                 failure = exc
-                report = build_fallback_report(catalog, plan.user_question, chart_refs, chart_mode)
+                report = build_fallback_report(catalog, plan.user_question, chart_refs, chart_mode, memory_unavailable, applied)
             retry_counts = {
                 "validation_retries": getattr(agent, "validation_retries", 0),
                 "tool_retries": getattr(agent, "tool_retries", 0),

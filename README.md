@@ -49,6 +49,28 @@ Add `--report-file report.md` to also save the rendered Report as Markdown, with
 
 Re-running the same command with the same `--thread-id` and unchanged inputs resumes the persisted CrewState from the Postgres checkpointer and reuses the prior Fetcher/Analyst Steps, Dataset Artifacts and the Report instead of recomputing them or calling the model again (issues #11 and #13). Changed Findings regenerate the Report.
 
+## 3. Memory: remember, list, forget, confirm
+
+The Crew keeps a persistent, per-user Memory in Postgres (`POSTGRES_CONNECTION_STRING` is required; without it the memory commands refuse rather than pretend to store). Memory changes framing and the parameters the Tools compute with, never which data is included. Terms are defined in `CONTEXT.md`; the design is `docs/adr/0005-deterministic-role-scoped-memory-and-crew-level-memory-update.md`.
+
+```bash
+# State a preference. The model proposes a typed preference or a free-text fact; code validates it
+# against the closed vocabulary. It applies from the next run, in any thread.
+python cli.py remember "for me, unusual means a swing over 8%" --user-id priya
+
+python cli.py list --user-id priya              # what the Crew will apply
+python cli.py list --user-id priya --history    # include superseded and forgotten memories
+python cli.py forget mem-1a2b3c4d --user-id priya
+python cli.py confirm mem-5e6f7a8b --user-id priya   # apply a pending inferred preference
+python cli.py reject  mem-5e6f7a8b --user-id priya   # discard it
+```
+
+- **Typed preferences** (closed vocabulary, range-checked): the Material Change relative threshold and the absolute-impact threshold. The latest statement wins and the older one stays in the history. A sentence that does not fit (for example "ignore the Office category") is kept as a free-text fact and never becomes a parameter or an exclusion.
+- **Free-text facts** shape how the Planner and Reporter frame a Report and never change a number. **Past-run summaries** are written after a successful run, go to the Planner, and expire when the source data changes.
+- **Inference**: after a run the Crew may propose memories from your own words and its run records (`--no-infer` turns this off). An inferred fact applies immediately and is marked inferred. An inferred preference waits as pending until you `confirm` it; the run output lists the pending ids.
+- **Applied Memories**: every Report a memory touched has an Applied Memories section (kind and origin, never the stored text), absent when nothing applied. A threshold in your question overrides a stored preference for that run and says so. If storage is down, the run continues with defaults and a Caveat says so. The applied memory ids are also on the Langfuse trace metadata (`applied_memory_ids`).
+- Changing or forgetting a memory invalidates exactly the Findings, Report and Critique that depended on it when you re-run a thread; an unchanged set reuses them.
+
 ## Tests
 
 ```bash
@@ -61,4 +83,6 @@ pytest -m integration
 pytest -m eval
 ```
 
-See `docs/phase-1-acceptance-status.md` (Findings) and `docs/phase-2-reporter-acceptance-status.md` (Reporter) for the current live-acceptance evidence and known upstream constraints.
+The opt-in Phase 3 acceptance test is `tests/test_memory_live.py` (`-m "llm and integration"`); it creates and drops its own scratch database, so it leaves the development database untouched.
+
+See `docs/phase-1-acceptance-status.md` (Findings), `docs/phase-2-reporter-acceptance-status.md` (Reporter), `docs/phase-2-acceptance-status.md` (orchestration) and `docs/phase-3-acceptance-status.md` (Memory) for the live-acceptance evidence and known constraints.

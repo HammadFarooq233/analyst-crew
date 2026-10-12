@@ -62,3 +62,27 @@ def chart_property_violations(charts, catalog) -> list[str]:
         if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != chart.content_hash:
             violations.append(f"{chart.chart_id}: stored PNG missing or not matching its content hash")
     return violations
+
+
+def displayed_values(artifacts) -> dict[str, str]:
+    """Every value a reader sees in a finished run: each Evidence Entry's display keyed by its source, and the
+    numbers in the rendered Report outside the Applied Memories section (which is about memory, not data)."""
+    catalog = artifacts["evidence_catalog"]
+    rendered = render_report(artifacts["report"], catalog)
+    rendered = rendered.replace(artifacts["report"].question, "")  # the user's own words, not a computed value
+    if "## Applied Memories" in rendered:
+        head, tail = rendered.split("## Applied Memories", 1)
+        rendered = head + ("## " + tail.split("\n## ", 1)[1] if "\n## " in tail else "")
+    # The materiality "source" entry only names where a parameter came from (memory, question, default).
+    values = {f"{entry.source} [{entry.group}]": entry.display
+              for entry in catalog.entries if entry.source != "methodology.materiality.source"}
+    values["rendered body numbers"] = " ".join(body_numbers(rendered))
+    return values
+
+
+def displayed_value_differences(baseline, other) -> list[str]:
+    """Where ``other`` shows a different value from ``baseline`` (both finished-run artifacts). Applying memory
+    must leave this empty except through the resolved analysis parameters: compare a free-text-memory run with a
+    memory-free run, and a preference run with a memory-free run given the same parameters explicitly."""
+    a, b = displayed_values(baseline), displayed_values(other)
+    return [f"{key}: {a.get(key)!r} -> {b.get(key)!r}" for key in sorted(a.keys() | b.keys()) if a.get(key) != b.get(key)]

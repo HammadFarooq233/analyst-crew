@@ -9,10 +9,8 @@ from deepeval.models import DeepEvalBaseLLM
 from deepeval.test_case import LLMTestCase, LLMTestCaseParams, SingleTurnParams
 from langchain_core.messages import HumanMessage
 from analyst_crew.llm import make_chat_model
-from langgraph.store.memory import InMemoryStore
 
 from analyst_crew.agents.planner import PlannerAgent
-from analyst_crew.tools.memory import clear_namespace, seed_memory
 from analyst_crew.tools.sales import sales_data_source
 
 
@@ -61,11 +59,11 @@ def test_golden_plan_structure():
     if not llm_credentials_available():
         pytest.skip("LLM credentials not set")
 
-    store = InMemoryStore()
-    clear_namespace(store)
-    seed_memory(store, "'unusual' means >15% swings by product category")
-
-    agent = PlannerAgent(store=store, data_sources=sales_data_source("data/sales.csv"))
+    # The Planner is handed its role-scoped Memory as text (ADR-0005); it no longer holds a store.
+    agent = PlannerAgent(
+        memory_context="'unusual' means >15% swings by product category",
+        data_sources=sales_data_source("data/sales.csv"),
+    )
     question = "Compare this month's sales to last month and flag anything unusual"
     plan = agent.generate_plan(question)
 

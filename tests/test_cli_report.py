@@ -22,7 +22,8 @@ def _engines():
     pytest.importorskip("pyarrow")
 
 
-def _run_cli(monkeypatch, tmp_path, capsys, *extra_args, reporter=None, plan=None, available_agents=None):
+def _run_cli(monkeypatch, tmp_path, capsys, *extra_args, reporter=None, plan=None, available_agents=None,
+             run_subcommand=False):
     source = write_sales(tmp_path / "sales.csv", base_rows())
     reporter = reporter or ScriptedReporterModel()
     monkeypatch.setenv("POSTGRES_CONNECTION_STRING", "")
@@ -41,7 +42,7 @@ def _run_cli(monkeypatch, tmp_path, capsys, *extra_args, reporter=None, plan=Non
 
     monkeypatch.setattr(cli, "invoke", scripted_invoke)
     monkeypatch.setattr("sys.argv", [
-        "cli", "--question", QUESTION, "--sales-csv", str(source), "--artifact-dir", str(tmp_path / "artifacts"),
+        "cli", *(["run"] if run_subcommand else []), "--question", QUESTION, "--sales-csv", str(source), "--artifact-dir", str(tmp_path / "artifacts"),
         "--as-of-date", "2025-06-30", *extra_args,
     ])
     exit_code = 0

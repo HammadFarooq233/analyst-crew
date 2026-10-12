@@ -2,6 +2,7 @@
 from collections.abc import Mapping
 from typing import Any
 
+from analyst_crew.memory.node import effective_parameters
 from analyst_crew.agents.contracts import CREW_AGENTS, Crew, Plan
 from analyst_crew.agents.resume import _resume_decision, execution_key
 from analyst_crew.state import CrewState
@@ -37,7 +38,7 @@ def analyst_node(state: CrewState, config: dict | None = None) -> dict[str, Any]
             available_agents=configurable.get("available_agents", CREW_AGENTS),
             data_sources=configurable.get("data_sources", {}),
         )
-        analysis_parameters = dict(configurable.get("analysis_parameters", {}))
+        analysis_parameters = effective_parameters(state.get("artifacts", {}), configurable)
         catalog = configurable.get("data_sources", {})
         as_of_date = analysis_parameters.get("as_of_date")
 

@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import os
 import shutil
 import sys
@@ -280,16 +281,20 @@ def format_material_changes(findings: BaselineFindings) -> str:
     return "\n".join(lines)
 
 
-def seed_memory_before_invoke(fact: str):
+def seed_memory_before_invoke(fact: str, user_id: str = "default"):
+    """Store a free-text fact for ``user_id`` in the persistent Memory store (a dev aid until `remember`)."""
     from analyst_crew.tools.memory import seed_memory
 
     conn_string = os.getenv("POSTGRES_CONNECTION_STRING")
     if conn_string:
         from langgraph.store.postgres import PostgresStore
 
-        with PostgresStore.from_conn_string(conn_string) as store:
-            store.setup()
-            seed_memory(store, fact)
+        try:
+            with PostgresStore.from_conn_string(conn_string) as store:
+                store.setup()
+                seed_memory(store, fact, user_id=user_id)
+        except Exception as exc:  # noqa: BLE001 — a storage outage is stated, never a crash
+            print(f"Warning: Memory storage is unavailable; the fact was not stored ({exc}).", file=sys.stderr)
     else:
         print(
             "Warning: POSTGRES_CONNECTION_STRING not set. "
@@ -299,18 +304,183 @@ def seed_memory_before_invoke(fact: str):
         )
 
 
-def main() -> None:
+COMMANDS = ("run", "remember", "list", "forget", "confirm", "reject")
+
+
+@contextlib.contextmanager
+def memory_store_context():
+    """The persistent Memory store for CLI commands: Postgres, or a clear error. Memory that would
+    vanish when the process exits is never pretended to be stored."""
+    conn_string = os.getenv("POSTGRES_CONNECTION_STRING")
+    if not conn_string:
+        raise RuntimeError("POSTGRES_CONNECTION_STRING is not set, so there is no persistent Memory storage.")
+    from langgraph.store.postgres import PostgresStore
+
+    with PostgresStore.from_conn_string(conn_string) as store:
+        store.setup()
+        yield store
+
+
+def production_memory_model():
+    from analyst_crew.memory.update import production_memory_model as build
+
+    return build()
+
+
+def remember_command(args) -> None:
+    from analyst_crew.memory import MemoryStore
+    from analyst_crew.memory.update import remember
+
+    try:
+        model = production_memory_model()
+        with memory_store_context() as store:
+            outcome = remember(args.sentence, args.user_id, MemoryStore(store), model)
+    except Exception as exc:  # noqa: BLE001 — nothing is stored on any failure, and the user is told
+        print(f"Error: Nothing was stored: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(outcome.message)
+    if not outcome.stored:
+        sys.exit(1)
+
+
+def format_memories(records, *, history: bool = False) -> str:
+    if not records:
+        return "No memories stored."
+    lines = []
+    for record in records:
+        stored = record.created_at[:19].replace("T", " ")
+        status = f"  [{record.status}]" if history else ""
+        lines.append(f"{record.id}  {record.kind:<10} {record.origin:<10} {stored}{status}  {record.content}")
+    return "\n".join(lines)
+
+
+def list_command(args) -> None:
+    from analyst_crew.memory import MemoryStore
+
+    try:
+        with memory_store_context() as store:
+            memory = MemoryStore(store)
+            records = memory.history(args.user_id) if args.history else memory.list(args.user_id)
+            pending = [] if args.history else memory.pending(args.user_id)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: Memory storage is unavailable ({exc}).", file=sys.stderr)
+        sys.exit(1)
+    print(format_memories(records, history=args.history))
+    if pending:
+        print("\nPending (inferred, not applied until you confirm; `confirm <id>` or `reject <id>`):")
+        print(format_memories(pending))
+
+
+def format_pending_notice(result) -> str:
+    """Tells the user which inferred preferences this run left waiting for confirmation."""
+    inference = (result.get("artifacts") or {}).get("inference")
+    ids = list(getattr(inference, "pending", None) or (inference.get("pending") if isinstance(inference, dict) else []) or [])
+    if not ids:
+        return ""
+    lines = ["", "Inferred preferences waiting for your confirmation (they change no number until you confirm):"]
+    lines += [f"  {memory_id}: `confirm {memory_id}` to apply or `reject {memory_id}` to discard" for memory_id in ids]
+    return "\n".join(lines)
+
+
+def _resolve_pending(args, action: str, done: str) -> None:
+    from analyst_crew.memory import MemoryNotFound, MemoryStore
+
+    try:
+        with memory_store_context() as store:
+            record = getattr(MemoryStore(store), action)(args.user_id, args.memory_id)
+    except MemoryNotFound as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: Memory storage is unavailable; nothing changed ({exc}).", file=sys.stderr)
+        sys.exit(1)
+    print(done.format(id=record.id, content=record.content))
+
+
+def confirm_command(args) -> None:
+    _resolve_pending(args, "confirm", "Confirmed {id}: {content}. It applies from your next run.")
+
+
+def reject_command(args) -> None:
+    _resolve_pending(args, "reject", "Rejected {id}: {content}. It will never be applied and is kept in the history.")
+
+
+def forget_command(args) -> None:
+    from analyst_crew.memory import MemoryNotFound, MemoryStore
+
+    try:
+        with memory_store_context() as store:
+            record = MemoryStore(store).forget(args.user_id, args.memory_id)
+    except MemoryNotFound as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: Memory storage is unavailable; nothing was forgotten ({exc}).", file=sys.stderr)
+        sys.exit(1)
+    print(f"Forgotten {record.id}: {record.content}. It no longer affects runs and stays in the history.")
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Analyst Crew CLI")
-    parser.add_argument("--question", type=str, default=None)
-    parser.add_argument("--thread-id", type=str, default=None)
-    parser.add_argument("--user-id", type=str, default="default")
-    parser.add_argument("--memory-seed", type=str, default=None)
-    parser.add_argument("--sales-csv", type=str, default=None)
-    parser.add_argument("--artifact-dir", type=str, default=".artifacts")
-    parser.add_argument("--as-of-date", type=str, required=True)
-    parser.add_argument("--report-file", type=str, default=None,
-                        help="also write the rendered Report to this Markdown file (nothing is written otherwise)")
-    args = parser.parse_args()
+    commands = parser.add_subparsers(dest="command")
+
+    run = commands.add_parser("run", help="run the Crew on a question (the default when no command is given)")
+    run.add_argument("--question", type=str, default=None)
+    run.add_argument("--thread-id", type=str, default=None)
+    run.add_argument("--user-id", type=str, default="default")
+    run.add_argument("--memory-seed", type=str, default=None)
+    run.add_argument("--sales-csv", type=str, default=None)
+    run.add_argument("--artifact-dir", type=str, default=".artifacts")
+    run.add_argument("--as-of-date", type=str, required=True)
+    run.add_argument("--no-infer", action="store_true",
+                     help="do not infer memories from your question and the run records after the run")
+    run.add_argument("--report-file", type=str, default=None,
+                     help="also write the rendered Report to this Markdown file (nothing is written otherwise)")
+
+    remember = commands.add_parser("remember", help="tell the Crew a preference or fact to remember")
+    remember.add_argument("sentence", type=str, help='e.g. "for me, unusual means a swing over 8%%"')
+    remember.add_argument("--user-id", type=str, default="default")
+
+    listing = commands.add_parser("list", help="list what the Crew remembers about a user")
+    listing.add_argument("--user-id", type=str, default="default")
+    listing.add_argument("--history", action="store_true", help="include superseded and forgotten memories")
+
+    forget = commands.add_parser("forget", help="forget one memory (it stays in the history)")
+    forget.add_argument("memory_id", type=str)
+    forget.add_argument("--user-id", type=str, default="default")
+
+    confirm = commands.add_parser("confirm", help="confirm a pending inferred preference so it applies")
+    confirm.add_argument("memory_id", type=str)
+    confirm.add_argument("--user-id", type=str, default="default")
+
+    reject = commands.add_parser("reject", help="reject a pending inferred preference")
+    reject.add_argument("memory_id", type=str)
+    reject.add_argument("--user-id", type=str, default="default")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # The original flat invocation (`cli.py --question ...`) is the `run` command.
+    if not argv or (argv[0] not in COMMANDS and argv[0] not in ("-h", "--help")):
+        argv = ["run", *argv]
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "remember":
+        remember_command(args)
+        return
+    if args.command == "list":
+        list_command(args)
+        return
+    if args.command == "forget":
+        forget_command(args)
+        return
+    if args.command == "confirm":
+        confirm_command(args)
+        return
+    if args.command == "reject":
+        reject_command(args)
+        return
 
     if not args.sales_csv:
         parser.error("--sales-csv is required for Phase 1 execution")
@@ -327,7 +497,7 @@ def main() -> None:
         sys.exit(1)
 
     if args.memory_seed is not None:
-        seed_memory_before_invoke(args.memory_seed)
+        seed_memory_before_invoke(args.memory_seed, args.user_id)
 
     invoke_config = {
         "configurable": {
@@ -335,6 +505,13 @@ def main() -> None:
             "user_id": args.user_id,
         }
     }
+    if not args.no_infer:
+        from analyst_crew.llm import credentials_available
+
+        if credentials_available():
+            from analyst_crew.memory.infer import production_inference_model
+
+            invoke_config["configurable"]["inference_model"] = production_inference_model()
     if args.sales_csv:
         from analyst_crew.tools.sales import sales_data_source
         from analyst_crew.tools.targets import sales_targets_data_source
@@ -356,6 +533,9 @@ def main() -> None:
         sys.exit(1)
 
     print(format_result(result))
+    notice = format_pending_notice(result)
+    if notice:
+        print(notice)
 
     artifacts = result.get("artifacts", {})
     if args.report_file:

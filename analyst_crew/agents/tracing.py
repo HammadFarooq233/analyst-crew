@@ -174,6 +174,32 @@ def _run_metadata(result: CrewState) -> dict[str, Any]:
     critic_failure = artifacts.get("critic_failure")
     if critic_failure:
         metadata["critic_failure"] = critic_failure
+    memory_status = artifacts.get("memory_status")
+    if memory_status:
+        metadata["memory_status"] = memory_status
+    def _field(item, name):
+        return item.get(name) if isinstance(item, dict) else getattr(item, name)
+
+    applied = artifacts.get("applied_memories") or []
+    applied_ids = [_field(item, "memory_id") for item in applied if _field(item, "status") == "applied"]
+    overridden_ids = [_field(item, "memory_id") for item in applied if _field(item, "status") == "overridden"]
+    if applied_ids:
+        metadata["applied_memory_ids"] = applied_ids
+    if overridden_ids:
+        metadata["overridden_memory_ids"] = overridden_ids
+    inference = artifacts.get("inference")
+    if inference is not None:
+        inferred = _field(inference, "facts")
+        pending = _field(inference, "pending")
+        if inferred:
+            metadata["inferred_memory_ids"] = list(inferred)
+        if pending:
+            metadata["pending_memory_ids"] = list(pending)
+    memory_update = artifacts.get("memory_update")
+    if memory_update:
+        metadata["memory_update"] = memory_update.get("status")
+        if memory_update.get("memory_id"):
+            metadata["memory_update_ids"] = [memory_update["memory_id"]]
     step_outcomes = artifacts.get("step_outcomes")
     if step_outcomes:
         metadata["step_outcomes"] = {

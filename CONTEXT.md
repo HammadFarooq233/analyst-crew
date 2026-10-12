@@ -118,6 +118,10 @@ _Avoid_: Note, context
 A Memory describing what the Crew found in an earlier run, tied to the source data it described. It is stale once that source data changes.
 _Avoid_: History, log
 
+**Pending Preference**:
+An inferred Typed Preference waiting for the user's confirmation. It changes no number until the user confirms it (`confirm`); rejecting it discards it. Superseded, forgotten and rejected Memories stay in the history but never reach a run.
+_Avoid_: Draft, suggestion
+
 **Memory Update**:
 The Crew-level step that writes Memory, from an explicit user statement or from inference over the user's own words and the Crew's run records. It is not an Agent.
 _Avoid_: Memory Agent, learning

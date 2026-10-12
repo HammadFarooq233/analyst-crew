@@ -8,8 +8,11 @@ import config
 from analyst_crew.agents.contracts import (  # noqa: F401 — re-exported for existing importers
     AGENTS, CREW_AGENTS, PHASE1_AGENTS, PHASE2_AGENTS, ArtifactBinding, Crew, Handoff, Plan, SourceReference, Step, resolve_handoff,
 )
-from analyst_crew.agents.resume import _resume_decision, _source_content_hash, execution_key  # noqa: F401
+from analyst_crew.agents.resume import _resume_decision, source_content_hash, execution_key  # noqa: F401
 from analyst_crew.llm import make_chat_model
+from analyst_crew.memory import MemoryStore, MemoryUnavailable
+from analyst_crew.memory.models import AppliedMemory
+from analyst_crew.memory.summary import applied_summaries, current_source_hashes, fresh_summaries
 from analyst_crew.state import CrewState
 from analyst_crew.tools.retry import invoke_with_optional_config
 
@@ -52,7 +55,7 @@ class PlannerAgent:
         model: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
-        store=None,
+        memory_context: str = "",
         available_agents: Sequence[str] | None = None,
         data_sources: Mapping[str, Any] | Sequence[str] = (),
         llm=None,
@@ -79,35 +82,13 @@ class PlannerAgent:
         self.validation_retries = 0
         self.last_validation_error: str | None = None
 
-        self._memory_tool = None
-        if store is not None:
-            from analyst_crew.tools.memory import create_memory_tool
-
-            self._memory_tool = create_memory_tool(store)
+        self.memory_context = memory_context
 
         self._chain = self._llm.with_structured_output(
             Plan,
             method="json_mode",
             include_raw=True,
         )
-
-    def _search_memory(self, question: str) -> str:
-        """Execute the search_memory Tool deterministically, application-side.
-
-        Structured-output ``json_mode`` forces the model into single-shot
-        JSON generation, which is incompatible with letting the model choose
-        to make a real tool call mid-response — free-tier models either
-        fabricate a fake tool-call JSON blob in place of a Plan, or emit a
-        genuine (but then silently dropped) tool_calls response and no
-        content at all. Retrieving memory here, before the Plan call, avoids
-        depending on model-driven tool selection for this step.
-        """
-        if self._memory_tool is None:
-            return ""
-        try:
-            return str(self._memory_tool.invoke({"query": question}))
-        except Exception:
-            return ""
 
     def generate_plan(self, question: str, available_agents: Sequence[str] | None = None,
                       data_sources: Mapping[str, Any] | Sequence[str] | None = None,
@@ -128,7 +109,7 @@ class PlannerAgent:
             + "\n\nValidated capabilities for this run (you MUST use only these Agents):\n"
             + "Agents: " + ", ".join(sorted(allowed_agents))
             + "\nData Sources: " + ", ".join(sorted(source_catalog))
-            + "\n\nRelevant memory:\n" + (self._search_memory(question) or "(none found)")
+            + "\n\nRelevant memory:\n" + (self.memory_context or "(none found)")
         )
         messages = [
             SystemMessage(content=capability_prompt),
@@ -260,7 +241,8 @@ def _extract_question(state: CrewState) -> str:
     return ""
 
 
-def _reusable_prior_plan(state: CrewState, question: str, agent: "PlannerAgent") -> Plan | None:
+def _reusable_prior_plan(state: CrewState, question: str, agent: "PlannerAgent",
+                         memory_ids: list[str] | None = None) -> Plan | None:
     """Return the Plan already in the checkpointed state when it is still valid.
 
     Resuming a thread must not re-plan: a live Planner words step ids and
@@ -276,37 +258,72 @@ def _reusable_prior_plan(state: CrewState, question: str, agent: "PlannerAgent")
         return None
     if {source for step in prior.steps for source in step.source_ids} - agent.data_sources:
         return None
+    # A Plan written under different Memory (a fact added or forgotten) is not reused; an outage (None) never invalidates.
+    if memory_ids is not None and state.get("artifacts", {}).get("plan_memory_ids", []) != memory_ids:
+        return None
     return prior
+
+
+def _planner_memory_ids(user_id: str) -> list[str] | None:
+    """Ids of the Memories that decide whether a checkpointed Plan is still valid, or None when storage
+    cannot be read. Past-run Summaries are excluded: every successful run writes one, so counting them
+    would re-plan (and recompute every Step) on each resume of the same thread."""
+    try:
+        records = MemoryStore(get_store()).read_for_role("Planner", user_id)
+    except (RuntimeError, MemoryUnavailable):
+        return None
+    return [record.id for record in records if record.kind != "summary"]
+
+
+def _planner_memory(user_id: str, source_hashes: set[str] = frozenset()) -> tuple[str, str, list[AppliedMemory]]:
+    """The user's Planner-scoped Memory as prompt text, whether storage was reachable, and the
+    Past-run Summaries applied.
+
+    Retrieval is deterministic and application-side (ADR-0005). A storage outage
+    degrades to no memory with status "unavailable"; it never fails the run. A Past-run
+    Summary whose source-data hash no longer matches the data is stale and is dropped."""
+    try:
+        store = get_store()
+    except RuntimeError:
+        return "", "available", []
+    try:
+        records = fresh_summaries(MemoryStore(store).read_for_role("Planner", user_id), source_hashes)
+    except MemoryUnavailable:
+        return "", "unavailable", []
+    return "\n".join(f"- {record.content}" for record in records), "available", applied_summaries(records)
 
 
 def planner_node(state: CrewState, config: dict | None = None) -> dict[str, Any]:
     question = _extract_question(state)
+    memory_status = "available"
 
     try:
         configurable = (config or {}).get("configurable", {})
         planner_model = configurable.get("planner_model")
-        try:
-            store = get_store()
-        except RuntimeError:
-            store = None
+        memory_context, memory_status, applied = _planner_memory(
+            configurable.get("user_id", "default"), current_source_hashes(configurable.get("data_sources")))
         agent = PlannerAgent(
-            store=None if planner_model is not None else store,
+            memory_context=memory_context,
             available_agents=configurable.get("available_agents"),
             data_sources=configurable.get("data_sources", ()),
             llm=planner_model,
         )
-        plan = _reusable_prior_plan(state, question, agent)
+        memory_ids = _planner_memory_ids(configurable.get("user_id", "default"))
+        plan = _reusable_prior_plan(state, question, agent, memory_ids)
         if plan is None:
             plan = agent.generate_plan(question, config=config)
+        else:
+            applied = []  # a reused Plan was not given any Memory this run
     except (RuntimeError, ValueError) as e:
         return {
             "current_step": "planner_node",
-            "artifacts": {"plan_error": str(e)},
+            "artifacts": {"plan_error": str(e), "memory_status": memory_status},
         }
 
     return {
         "current_step": "planner_node",
-        "artifacts": {"plan": plan},
+        "artifacts": {"plan": plan, "memory_status": memory_status, "planner_applied_memories": applied,
+                      "plan_memory_ids": memory_ids if memory_ids is not None else state.get("artifacts", {}).get("plan_memory_ids", [])},
     }
 
 

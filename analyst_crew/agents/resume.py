@@ -69,7 +69,7 @@ def execution_key(
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _source_content_hash(reference: Any) -> str | None:
+def source_content_hash(reference: Any) -> str | None:
     """Cheap identity hash for a catalogued CSV Data Source, computed before
     any expensive parse/validate work. This is the same byte hash the
     Fetcher Tool itself records as ``DatasetArtifact.input_hash`` once a
